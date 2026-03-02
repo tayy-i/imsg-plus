@@ -25,7 +25,6 @@ export function createBridge(customDylib?: string) {
     dylibPath,
     setTyping,
     markRead,
-    status,
     launch,
     kill,
   }
@@ -36,10 +35,6 @@ export function createBridge(customDylib?: string) {
 
   async function markRead(handle: string): Promise<void> {
     await command("read", { handle })
-  }
-
-  async function status(): Promise<Record<string, unknown>> {
-    return await command("status", {})
   }
 
   function launch(opts: { quiet?: boolean } = {}): void {

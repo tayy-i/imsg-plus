@@ -32,8 +32,7 @@ export function open(path = DEFAULT_PATH) {
   const db = new Database(path, { readonly: true, fileMustExist: true })
   db.pragma("busy_timeout = 5000")
 
-  const schema = detect(db)
-  const cols = columnMap(schema)
+  const cols = detectColumns(db)
   const msgColumns = `
             m.ROWID as id, m.handle_id as handleId, h.id as sender,
             IFNULL(m.text, '') as text, m.date as dateNanos, m.is_from_me as isFromMe,
@@ -43,9 +42,55 @@ export function open(path = DEFAULT_PATH) {
             ${cols.associatedType} as assocType,
             (SELECT COUNT(*) FROM message_attachment_join maj WHERE maj.message_id = m.ROWID) as attachCount,
             ${cols.body} as body`
-  const noReactions = schema.reactionColumns
-    ? " AND (m.associated_message_type IS NULL OR m.associated_message_type < 2000 OR m.associated_message_type > 3006)"
-    : ""
+
+  // --- Row parsing (closes over cols + db) ---
+
+  function parseRow(r: any, chatId: number): Message {
+    let sender: string = r.sender ?? ""
+    if (!sender && r.destCaller) sender = r.destCaller
+
+    let text: string = r.text
+    if (!text && r.body) text = parseAttributedBody(r.body)
+    if (r.isAudio && cols.hasAudioTranscription) {
+      const t = audioTranscription(r.id)
+      if (t) text = t
+    }
+
+    return {
+      id: r.id,
+      chatId,
+      guid: r.guid ?? "",
+      replyToGuid: extractReplyGuid(r.assocGuid, r.assocType),
+      sender,
+      text,
+      date: toDate(r.dateNanos),
+      isFromMe: !!r.isFromMe,
+      service: r.service ?? "",
+      attachments: r.attachCount ?? 0,
+    }
+  }
+
+  function audioTranscription(messageId: number): string | null {
+    const r: any = db
+      .prepare(
+        `SELECT a.user_info FROM message_attachment_join maj
+         JOIN attachment a ON a.ROWID = maj.attachment_id
+         WHERE maj.message_id = ? LIMIT 1`
+      )
+      .get(messageId)
+    if (!r?.user_info) return null
+    try {
+      const json = execFileSync("plutil", ["-convert", "json", "-o", "-", "-"], {
+        input: r.user_info,
+        encoding: "utf8",
+      })
+      return JSON.parse(json)["audio-transcription"] || null
+    } catch {
+      return null
+    }
+  }
+
+  // --- Public API ---
 
   return {
     path,
@@ -99,7 +144,7 @@ export function open(path = DEFAULT_PATH) {
   }
 
   function participants(chatId: number): string[] {
-    return db
+    const handles = db
       .prepare(
         `SELECT h.id as handle
          FROM chat_handle_join chj
@@ -109,7 +154,8 @@ export function open(path = DEFAULT_PATH) {
       )
       .all(chatId)
       .map((r: any) => r.handle as string)
-      .filter((h, i, arr) => h && arr.indexOf(h) === i)
+      .filter(Boolean)
+    return [...new Set(handles)]
   }
 
   function messages(chatId: number, opts: { limit?: number; filter?: Filter } = {}): Message[] {
@@ -128,7 +174,7 @@ export function open(path = DEFAULT_PATH) {
     }
     if (f?.participants?.length) {
       const ph = f.participants.map(() => "?").join(",")
-      where += ` AND COALESCE(NULLIF(h.id,''), ${schema.destinationCallerId ? "m.destination_caller_id" : "''"}) COLLATE NOCASE IN (${ph})`
+      where += ` AND COALESCE(NULLIF(h.id,''), ${cols.destCallerFilter}) COLLATE NOCASE IN (${ph})`
       bindings.push(...f.participants)
     }
     bindings.push(limit)
@@ -139,11 +185,11 @@ export function open(path = DEFAULT_PATH) {
          FROM message m
          JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
          LEFT JOIN handle h ON m.handle_id = h.ROWID
-         WHERE cmj.chat_id = ?${noReactions}${where}
+         WHERE cmj.chat_id = ?${cols.noReactions}${where}
          ORDER BY m.date DESC LIMIT ?`
       )
       .all(...bindings)
-      .map((r: any) => parseRow(r, chatId, schema, db))
+      .map((r: any) => parseRow(r, chatId))
   }
 
   function messagesAfter(afterRowId: number, opts: { chatId?: number; limit?: number } = {}): Message[] {
@@ -162,11 +208,11 @@ export function open(path = DEFAULT_PATH) {
          FROM message m
          LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
          LEFT JOIN handle h ON m.handle_id = h.ROWID
-         WHERE m.ROWID > ?${noReactions}${chatWhere}
+         WHERE m.ROWID > ?${cols.noReactions}${chatWhere}
          ORDER BY m.ROWID ASC LIMIT ?`
       )
       .all(...bindings)
-      .map((r: any) => parseRow(r, r.chatId ?? opts.chatId ?? 0, schema, db))
+      .map((r: any) => parseRow(r, r.chatId ?? opts.chatId ?? 0))
   }
 
   function attachments(messageId: number): Attachment[] {
@@ -200,100 +246,32 @@ export function open(path = DEFAULT_PATH) {
   }
 }
 
-// --- Schema detection ---
+// --- Column detection ---
 
-interface Schema {
-  attributedBody: boolean
-  reactionColumns: boolean
-  destinationCallerId: boolean
-  audioMessage: boolean
-  attachmentUserInfo: boolean
-}
+function detectColumns(db: Database.Database) {
+  const msg = columnNames(db, "message")
+  const att = columnNames(db, "attachment")
+  const hasReactions = msg.has("guid") && msg.has("associated_message_guid") && msg.has("associated_message_type")
+  const hasDestCaller = msg.has("destination_caller_id")
 
-function detect(db: Database.Database): Schema {
-  const msgCols = columnNames(db, "message")
-  const attCols = columnNames(db, "attachment")
   return {
-    attributedBody: msgCols.has("attributedbody"),
-    reactionColumns:
-      msgCols.has("guid") && msgCols.has("associated_message_guid") && msgCols.has("associated_message_type"),
-    destinationCallerId: msgCols.has("destination_caller_id"),
-    audioMessage: msgCols.has("is_audio_message"),
-    attachmentUserInfo: attCols.has("user_info"),
+    body: msg.has("attributedbody") ? "m.attributedBody" : "NULL",
+    guid: hasReactions ? "m.guid" : "NULL",
+    associatedGuid: hasReactions ? "m.associated_message_guid" : "NULL",
+    associatedType: hasReactions ? "m.associated_message_type" : "NULL",
+    destinationCallerId: hasDestCaller ? "m.destination_caller_id" : "NULL",
+    audioMessage: msg.has("is_audio_message") ? "m.is_audio_message" : "0",
+    noReactions: hasReactions
+      ? " AND (m.associated_message_type IS NULL OR m.associated_message_type < 2000 OR m.associated_message_type > 3006)"
+      : "",
+    destCallerFilter: hasDestCaller ? "m.destination_caller_id" : "''",
+    hasAudioTranscription: msg.has("is_audio_message") && att.has("user_info"),
   }
 }
 
 function columnNames(db: Database.Database, table: string): Set<string> {
   const rows: any[] = db.prepare(`PRAGMA table_info(${table})`).all()
   return new Set(rows.map((r) => (r.name as string).toLowerCase()))
-}
-
-function columnMap(s: Schema) {
-  return {
-    body: s.attributedBody ? "m.attributedBody" : "NULL",
-    guid: s.reactionColumns ? "m.guid" : "NULL",
-    associatedGuid: s.reactionColumns ? "m.associated_message_guid" : "NULL",
-    associatedType: s.reactionColumns ? "m.associated_message_type" : "NULL",
-    destinationCallerId: s.destinationCallerId ? "m.destination_caller_id" : "NULL",
-    audioMessage: s.audioMessage ? "m.is_audio_message" : "0",
-  }
-}
-
-// --- Row parsing ---
-
-function parseRow(r: any, chatId: number, schema: Schema, db: Database.Database): Message {
-  let sender: string = r.sender ?? ""
-  if (!sender && r.destCaller) sender = r.destCaller
-
-  let text: string = r.text
-  if (!text && r.body) text = parseAttributedBody(r.body)
-  if (r.isAudio && schema.attachmentUserInfo) {
-    const t = audioTranscription(db, r.id)
-    if (t) text = t
-  }
-
-  return {
-    id: r.id,
-    chatId,
-    guid: r.guid ?? "",
-    replyToGuid: extractReplyGuid(r.assocGuid, r.assocType),
-    sender,
-    text,
-    date: toDate(r.dateNanos),
-    isFromMe: !!r.isFromMe,
-    service: r.service ?? "",
-    attachments: r.attachCount ?? 0,
-  }
-}
-
-function extractReplyGuid(guid: string | null, type: number | null): string | null {
-  if (!guid) return null
-  const slash = guid.lastIndexOf("/")
-  const normalized = slash >= 0 && slash < guid.length - 1 ? guid.slice(slash + 1) : guid
-  if (!normalized) return null
-  if (type != null && type >= 2000 && type <= 3006) return null
-  return normalized
-}
-
-function audioTranscription(db: Database.Database, messageId: number): string | null {
-  const r: any = db
-    .prepare(
-      `SELECT a.user_info FROM message_attachment_join maj
-       JOIN attachment a ON a.ROWID = maj.attachment_id
-       WHERE maj.message_id = ? LIMIT 1`
-    )
-    .get(messageId)
-  if (!r?.user_info) return null
-  try {
-    const json = execFileSync("plutil", ["-convert", "json", "-o", "-", "-"], {
-      input: r.user_info,
-      encoding: "utf8",
-    })
-    const data = JSON.parse(json)
-    return data["audio-transcription"] || null
-  } catch {
-    return null
-  }
 }
 
 // --- TypedStream parser (attributedBody column) ---
@@ -317,4 +295,13 @@ function parseAttributedBody(blob: Buffer | null): string {
   }
 
   return best || blob.toString("utf8").replace(/[\x00-\x1f]/g, "").trim()
+}
+
+function extractReplyGuid(guid: string | null, type: number | null): string | null {
+  if (!guid) return null
+  const slash = guid.lastIndexOf("/")
+  const normalized = slash >= 0 && slash < guid.length - 1 ? guid.slice(slash + 1) : guid
+  if (!normalized) return null
+  if (type != null && type >= 2000 && type <= 3006) return null
+  return normalized
 }
