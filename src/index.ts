@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import arg from "arg"
 import { readFileSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -10,69 +11,73 @@ import { createBridge } from "./bridge.js"
 import { serve } from "./rpc.js"
 import type { Message, Attachment, Filter } from "./types.js"
 
-// --- Flag parsing ---
+// --- Args ---
 
-function parseFlags(args: string[]): Record<string, string | true> {
-  const flags: Record<string, string | true> = {}
-  for (let i = 0; i < args.length; i++) {
-    if (!args[i].startsWith("--")) continue
-    const key = args[i].slice(2)
-    const next = args[i + 1]
-    if (!next || next.startsWith("--")) {
-      flags[key] = true
-    } else {
-      flags[key] = next
-      i++
-    }
-  }
-  return flags
-}
+const args = arg(
+  {
+    "--help": Boolean,
+    "--version": Boolean,
+    "--json": Boolean,
+    "--db": String,
+    "--limit": Number,
+    "--chat-id": Number,
+    "--attachments": Boolean,
+    "--participants": String,
+    "--start": String,
+    "--end": String,
+    "--since-rowid": Number,
+    "--debounce": String,
+    "--to": String,
+    "--text": String,
+    "--file": String,
+    "--service": String,
+    "--region": String,
+    "--chat-identifier": String,
+    "--chat-guid": String,
+    "--handle": String,
+    "--state": String,
+    "--dylib": String,
+    "--kill-only": Boolean,
+    "--quiet": Boolean,
+    "--verbose": Boolean,
+    "--no-auto-read": Boolean,
+    "--no-auto-typing": Boolean,
+    "-h": "--help",
+    "-V": "--version",
+  },
+  { permissive: true }
+)
 
-type Flags = Record<string, string | true>
-function flag(f: Flags, key: string): boolean { return f[key] === true }
-function str(f: Flags, key: string): string | undefined { const v = f[key]; return typeof v === "string" ? v : undefined }
-function num(f: Flags, key: string): number | undefined { const v = str(f, key); return v ? Number(v) : undefined }
+const [command] = args._
+const json = args["--json"] ?? false
 
-// --- Output helpers ---
+// --- Output ---
 
-function iso(date: Date): string {
-  return date.toISOString()
-}
-
-function jsonl(obj: unknown) {
-  console.log(JSON.stringify(obj))
-}
+const jsonl = (obj: unknown) => console.log(JSON.stringify(obj))
+const iso = (d: Date) => d.toISOString()
 
 // --- Main ---
 
-const args = process.argv.slice(2)
-const command = args[0]
-const flags_ = parseFlags(args.slice(1))
-const json = flag(flags_, "json")
-
 main().catch((err) => {
-  if (json) {
-    jsonl({ error: err.message })
-  } else {
-    console.error(err.message ?? err)
-  }
+  if (json) jsonl({ error: err.message })
+  else console.error(err.message ?? err)
   process.exit(1)
 })
 
 async function main() {
-  if (!command || command === "--help" || command === "-h") return help()
-  if (command === "--version" || command === "-V") return version()
+  if (args["--help"] || !command) return help()
+  if (args["--version"]) return version()
 
   switch (command) {
-    case "chats": return await chatsCmd()
-    case "history": return await historyCmd()
-    case "watch": return await watchCmd()
-    case "send": return await sendCmd()
-    case "typing": return await typingCmd()
-    case "read": return await readCmd()
+    case "chats": return chatsCmd()
+    case "history": return historyCmd()
+    case "watch": return watchCmd()
+    case "send": return sendCmd()
+    case "typing": return typingCmd()
+    case "read": return readCmd()
     case "status": return statusCmd()
     case "launch": return launchCmd()
-    case "rpc": return await rpcCmd()
+    case "rpc": return rpcCmd()
     default:
       console.error(`Unknown command: ${command}\n`)
       help()
@@ -84,35 +89,30 @@ async function main() {
 
 async function chatsCmd() {
   const db = openDB()
-  const limit = num(flags_, "limit") ?? 20
-  const chats = db.chats(limit)
+  const chats = db.chats(args["--limit"] ?? 20)
 
   if (json) {
-    for (const chat of chats) jsonl({ id: chat.id, name: chat.name, identifier: chat.identifier, service: chat.service, last_message_at: iso(chat.lastMessageAt) })
+    for (const c of chats) jsonl({ id: c.id, name: c.name, identifier: c.identifier, service: c.service, last_message_at: iso(c.lastMessageAt) })
   } else {
-    for (const chat of chats) console.log(`[${chat.id}] ${chat.name} (${chat.identifier}) last=${iso(chat.lastMessageAt)}`)
+    for (const c of chats) console.log(`[${c.id}] ${c.name} (${c.identifier}) last=${iso(c.lastMessageAt)}`)
   }
 }
 
 async function historyCmd() {
-  const chatId = num(flags_, "chat-id")
+  const chatId = args["--chat-id"]
   if (chatId == null) bail("--chat-id is required")
 
   const db = openDB()
-  const limit = num(flags_, "limit") ?? 50
-  const showAttachments = flag(flags_, "attachments")
-  const filter = buildFilter()
-  const messages = db.messages(chatId, { limit, filter })
+  const messages = db.messages(chatId, { limit: args["--limit"] ?? 50, filter: buildFilter() })
 
   for (const msg of messages) {
     if (json) {
-      const atts = db.attachments(msg.id)
-      jsonl(messageJson(msg, atts))
+      jsonl(messageJson(msg, db.attachments(msg.id)))
     } else {
       const dir = msg.isFromMe ? "sent" : "recv"
       console.log(`${iso(msg.date)} [${dir}] ${msg.sender}: ${msg.text}`)
       if (msg.attachments > 0) {
-        if (showAttachments) {
+        if (args["--attachments"]) {
           for (const a of db.attachments(msg.id)) {
             console.log(`  attachment: name=${a.transferName || a.filename || "(unknown)"} mime=${a.mimeType} missing=${a.missing} path=${a.path}`)
           }
@@ -126,20 +126,20 @@ async function historyCmd() {
 
 async function watchCmd() {
   const db = openDB()
-  const chatId = num(flags_, "chat-id")
-  const sinceRowId = num(flags_, "since-rowid")
-  const debounce = parseDebounce(str(flags_, "debounce") ?? "250ms")
-  const showAttachments = flag(flags_, "attachments")
-  const filter = buildFilter()
+  const opts = {
+    chatId: args["--chat-id"] ?? undefined,
+    sinceRowId: args["--since-rowid"] ?? undefined,
+    debounce: parseDebounce(args["--debounce"] ?? "250ms"),
+    filter: buildFilter(),
+  }
 
-  for await (const msg of watch(db, { chatId, sinceRowId, debounce, filter })) {
+  for await (const msg of watch(db, opts)) {
     if (json) {
-      const atts = showAttachments ? db.attachments(msg.id) : []
-      jsonl(messageJson(msg, atts))
+      jsonl(messageJson(msg, args["--attachments"] ? db.attachments(msg.id) : []))
     } else {
       const dir = msg.isFromMe ? "sent" : "recv"
       console.log(`${iso(msg.date)} [${dir}] ${msg.sender}: ${msg.text}`)
-      if (msg.attachments > 0 && showAttachments) {
+      if (msg.attachments > 0 && args["--attachments"]) {
         for (const a of db.attachments(msg.id)) {
           console.log(`  attachment: name=${a.transferName || a.filename || "(unknown)"} mime=${a.mimeType} missing=${a.missing} path=${a.path}`)
         }
@@ -151,14 +151,14 @@ async function watchCmd() {
 async function sendCmd() {
   const db = openDB()
   await send({
-    to: str(flags_, "to"),
-    chatId: num(flags_, "chat-id"),
-    chatIdentifier: str(flags_, "chat-identifier"),
-    chatGuid: str(flags_, "chat-guid"),
-    text: str(flags_, "text"),
-    file: str(flags_, "file"),
-    service: str(flags_, "service") as any,
-    region: str(flags_, "region"),
+    to: args["--to"] ?? undefined,
+    chatId: args["--chat-id"] ?? undefined,
+    chatIdentifier: args["--chat-identifier"] ?? undefined,
+    chatGuid: args["--chat-guid"] ?? undefined,
+    text: args["--text"] ?? undefined,
+    file: args["--file"] ?? undefined,
+    service: args["--service"] as any,
+    region: args["--region"] ?? undefined,
   }, db)
 
   if (json) jsonl({ status: "sent" })
@@ -166,37 +166,31 @@ async function sendCmd() {
 }
 
 async function typingCmd() {
-  const handle = str(flags_, "handle")
+  const handle = args["--handle"]
   if (!handle) bail("--handle is required")
-  const state = str(flags_, "state")
+  const state = args["--state"]
   if (state !== "on" && state !== "off") bail("--state must be 'on' or 'off'")
 
   const bridge = createBridge()
-  if (!bridge.available) return bail("dylib not found — run: make build-dylib")
+  if (!bridge.available) bail("dylib not found — run: make build-dylib")
 
   await bridge.setTyping(handle, state === "on")
 
-  if (json) {
-    jsonl({ success: true, handle, typing: state === "on" })
-  } else {
-    console.log(`Typing indicator ${state === "on" ? "enabled" : "disabled"} for ${handle}`)
-  }
+  if (json) jsonl({ success: true, handle, typing: state === "on" })
+  else console.log(`Typing indicator ${state === "on" ? "enabled" : "disabled"} for ${handle}`)
 }
 
 async function readCmd() {
-  const handle = str(flags_, "handle")
+  const handle = args["--handle"]
   if (!handle) bail("--handle is required")
 
   const bridge = createBridge()
-  if (!bridge.available) return bail("dylib not found — run: make build-dylib")
+  if (!bridge.available) bail("dylib not found — run: make build-dylib")
 
   await bridge.markRead(handle)
 
-  if (json) {
-    jsonl({ success: true, handle, marked_as_read: true })
-  } else {
-    console.log(`Marked messages as read for ${handle}`)
-  }
+  if (json) jsonl({ success: true, handle, marked_as_read: true })
+  else console.log(`Marked messages as read for ${handle}`)
 }
 
 function statusCmd() {
@@ -226,14 +220,13 @@ function statusCmd() {
 }
 
 function launchCmd() {
-  const bridge = createBridge(str(flags_, "dylib"))
-  const killOnly = flag(flags_, "kill-only")
-  const quiet = flag(flags_, "quiet")
+  const bridge = createBridge(args["--dylib"] ?? undefined)
+  const quiet = args["--quiet"] ?? false
 
   if (!quiet && !json) console.log("Killing Messages.app...")
   bridge.kill()
 
-  if (killOnly) {
+  if (args["--kill-only"]) {
     if (json) jsonl({ success: true, action: "kill" })
     else if (!quiet) console.log("Messages.app terminated")
     return
@@ -257,22 +250,22 @@ async function rpcCmd() {
   const db = openDB()
   const bridge = createBridge()
   await serve(db, bridge, {
-    verbose: flag(flags_, "verbose"),
-    autoRead: flag(flags_, "no-auto-read") ? false : undefined,
-    autoTyping: flag(flags_, "no-auto-typing") ? false : undefined,
+    verbose: args["--verbose"] ?? false,
+    autoRead: args["--no-auto-read"] ? false : undefined,
+    autoTyping: args["--no-auto-typing"] ? false : undefined,
   })
 }
 
 // --- Helpers ---
 
 function openDB(): DB {
-  return open(str(flags_, "db"))
+  return open(args["--db"] ?? undefined)
 }
 
 function buildFilter(): Filter | undefined {
-  const participants = str(flags_, "participants")?.split(",").map(s => s.trim()).filter(Boolean)
-  const after = str(flags_, "start") ? new Date(str(flags_, "start")!) : undefined
-  const before = str(flags_, "end") ? new Date(str(flags_, "end")!) : undefined
+  const participants = args["--participants"]?.split(",").map((s) => s.trim()).filter(Boolean)
+  const after = args["--start"] ? new Date(args["--start"]) : undefined
+  const before = args["--end"] ? new Date(args["--end"]) : undefined
   if (!participants?.length && !after && !before) return undefined
   return { participants, after, before }
 }
@@ -287,7 +280,7 @@ function messageJson(msg: Message, attachments: Attachment[]) {
     is_from_me: msg.isFromMe,
     text: msg.text,
     created_at: iso(msg.date),
-    attachments: attachments.map(a => ({
+    attachments: attachments.map((a) => ({
       filename: a.filename,
       transfer_name: a.transferName,
       uti: a.uti,
@@ -301,15 +294,11 @@ function messageJson(msg: Message, attachments: Attachment[]) {
 }
 
 function parseDebounce(value: string): number {
-  const units: [string, number][] = [["ms", 1], ["s", 1000], ["m", 60000], ["h", 3600000]]
+  const units: [string, number][] = [["ms", 1], ["s", 1000], ["m", 60000]]
   for (const [suffix, mult] of units) {
-    if (value.endsWith(suffix)) {
-      const n = Number(value.slice(0, -suffix.length))
-      return isNaN(n) ? 250 : n * mult
-    }
+    if (value.endsWith(suffix)) return (Number(value.slice(0, -suffix.length)) || 250) * mult
   }
-  const n = Number(value)
-  return isNaN(n) ? 250 : n
+  return Number(value) || 250
 }
 
 function bail(msg: string): never {
@@ -318,8 +307,7 @@ function bail(msg: string): never {
 }
 
 function help() {
-  const v = version(true)
-  console.log(`imsg-plus ${v}
+  console.log(`imsg-plus ${version(true)}
 Send and read iMessage / SMS from the terminal
 
 Usage:

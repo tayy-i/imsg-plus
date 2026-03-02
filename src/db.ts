@@ -1,4 +1,5 @@
 import Database from "better-sqlite3"
+import { execFileSync } from "node:child_process"
 import { existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -300,7 +301,6 @@ function audioTranscription(db: Database.Database, messageId: number): string | 
   if (!r?.user_info) return null
   try {
     // user_info is a binary plist — use macOS plutil to parse it
-    const { execFileSync } = require("node:child_process")
     const json = execFileSync("plutil", ["-convert", "json", "-o", "-", "-"], {
       input: r.user_info,
       encoding: "utf8",
