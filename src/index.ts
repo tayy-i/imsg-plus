@@ -10,7 +10,7 @@ import { watch } from "./watch.js"
 import { createBridge } from "./bridge.js"
 import { serve } from "./rpc.js"
 import { messageToJSON } from "./json.js"
-import type { Filter } from "./types.js"
+import type { Message, Filter } from "./types.js"
 
 // --- Args ---
 
@@ -55,16 +55,20 @@ const json = args["--json"] ?? false
 // --- Output ---
 
 const jsonl = (obj: unknown) => console.log(JSON.stringify(obj))
-const iso = (d: Date) => d.toISOString()
 
-// --- Version ---
-
-function getVersion(): string {
-  try {
-    const pkg = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8"))
-    return process.env.IMSG_VERSION || pkg.version || "0.0.0"
-  } catch {
-    return process.env.IMSG_VERSION || "0.0.0"
+function printMessage(msg: Message, db: DB) {
+  if (json) {
+    jsonl(messageToJSON(msg, args["--attachments"] ? db.attachments(msg.id) : []))
+  } else {
+    const dir = msg.isFromMe ? "sent" : "recv"
+    console.log(`${msg.date.toISOString()} [${dir}] ${msg.sender}: ${msg.text}`)
+    if (msg.attachments > 0 && args["--attachments"]) {
+      for (const a of db.attachments(msg.id)) {
+        console.log(`  ${a.transferName || a.filename || "(unknown)"} — ${a.mimeType}${a.missing ? " (missing)" : ""}`)
+      }
+    } else if (msg.attachments > 0 && !json) {
+      console.log(`  (${msg.attachments} attachment${msg.attachments === 1 ? "" : "s"})`)
+    }
   }
 }
 
@@ -101,12 +105,9 @@ async function main() {
 
 function chatsCmd() {
   const db = openDB()
-  const chats = db.chats(args["--limit"] ?? 20)
-
-  if (json) {
-    for (const c of chats) jsonl({ id: c.id, name: c.name, identifier: c.identifier, service: c.service, last_message_at: iso(c.lastMessageAt) })
-  } else {
-    for (const c of chats) console.log(`[${c.id}] ${c.name} (${c.identifier}) last=${iso(c.lastMessageAt)}`)
+  for (const c of db.chats(args["--limit"] ?? 20)) {
+    if (json) jsonl({ id: c.id, name: c.name, identifier: c.identifier, service: c.service, last_message_at: c.lastMessageAt.toISOString() })
+    else console.log(`[${c.id}] ${c.name} (${c.identifier}) last=${c.lastMessageAt.toISOString()}`)
   }
 }
 
@@ -115,63 +116,37 @@ function historyCmd() {
   if (chatId == null) bail("--chat-id is required")
 
   const db = openDB()
-  const messages = db.messages(chatId, { limit: args["--limit"] ?? 50, filter: buildFilter() })
-
-  for (const msg of messages) {
-    if (json) {
-      jsonl(messageToJSON(msg, db.attachments(msg.id)))
-    } else {
-      const dir = msg.isFromMe ? "sent" : "recv"
-      console.log(`${iso(msg.date)} [${dir}] ${msg.sender}: ${msg.text}`)
-      if (msg.attachments > 0) {
-        if (args["--attachments"]) {
-          for (const a of db.attachments(msg.id)) {
-            console.log(`  attachment: name=${a.transferName || a.filename || "(unknown)"} mime=${a.mimeType} missing=${a.missing} path=${a.path}`)
-          }
-        } else {
-          console.log(`  (${msg.attachments} attachment${msg.attachments === 1 ? "" : "s"})`)
-        }
-      }
-    }
+  for (const msg of db.messages(chatId, { limit: args["--limit"] ?? 50, filter: buildFilter() })) {
+    printMessage(msg, db)
   }
 }
 
 async function watchCmd() {
   const db = openDB()
-
   for await (const msg of watch(db, {
     chatId: args["--chat-id"] ?? undefined,
     sinceRowId: args["--since-rowid"] ?? undefined,
     debounce: parseDebounce(args["--debounce"] ?? "250ms"),
     filter: buildFilter(),
   })) {
-    if (json) {
-      jsonl(messageToJSON(msg, args["--attachments"] ? db.attachments(msg.id) : []))
-    } else {
-      const dir = msg.isFromMe ? "sent" : "recv"
-      console.log(`${iso(msg.date)} [${dir}] ${msg.sender}: ${msg.text}`)
-      if (msg.attachments > 0 && args["--attachments"]) {
-        for (const a of db.attachments(msg.id)) {
-          console.log(`  attachment: name=${a.transferName || a.filename || "(unknown)"} mime=${a.mimeType} missing=${a.missing} path=${a.path}`)
-        }
-      }
-    }
+    printMessage(msg, db)
   }
 }
 
 async function sendCmd() {
-  const db = openDB()
-  await send({
-    to: args["--to"] ?? undefined,
-    chatId: args["--chat-id"] ?? undefined,
-    chatIdentifier: args["--chat-identifier"] ?? undefined,
-    chatGuid: args["--chat-guid"] ?? undefined,
-    text: args["--text"] ?? undefined,
-    file: args["--file"] ?? undefined,
-    service: args["--service"] as any,
-    region: args["--region"] ?? undefined,
-  }, db)
-
+  await send(
+    {
+      to: args["--to"] ?? undefined,
+      chatId: args["--chat-id"] ?? undefined,
+      chatIdentifier: args["--chat-identifier"] ?? undefined,
+      chatGuid: args["--chat-guid"] ?? undefined,
+      text: args["--text"] ?? undefined,
+      file: args["--file"] ?? undefined,
+      service: args["--service"] as any,
+      region: args["--region"] ?? undefined,
+    },
+    openDB()
+  )
   if (json) jsonl({ status: "sent" })
   else console.log("sent")
 }
@@ -184,7 +159,6 @@ async function typingCmd() {
 
   const bridge = createBridge()
   if (!bridge.available) bail("dylib not found — run: make build-dylib")
-
   await bridge.setTyping(handle, state === "on")
 
   if (json) jsonl({ success: true, handle, typing: state === "on" })
@@ -197,7 +171,6 @@ async function readCmd() {
 
   const bridge = createBridge()
   if (!bridge.available) bail("dylib not found — run: make build-dylib")
-
   await bridge.markRead(handle)
 
   if (json) jsonl({ success: true, handle, marked_as_read: true })
@@ -206,14 +179,8 @@ async function readCmd() {
 
 function statusCmd() {
   const bridge = createBridge()
-
   if (json) {
-    jsonl({
-      basic_features: true,
-      advanced_features: bridge.available,
-      typing_indicators: bridge.available,
-      read_receipts: bridge.available,
-    })
+    jsonl({ basic_features: true, advanced_features: bridge.available, typing_indicators: bridge.available, read_receipts: bridge.available })
   } else {
     console.log("imsg-plus Status Report")
     console.log("========================")
@@ -292,6 +259,15 @@ function parseDebounce(value: string): number {
 function bail(msg: string): never {
   console.error(msg)
   process.exit(1)
+}
+
+function getVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8"))
+    return process.env.IMSG_VERSION || pkg.version || "0.0.0"
+  } catch {
+    return process.env.IMSG_VERSION || "0.0.0"
+  }
 }
 
 function help() {

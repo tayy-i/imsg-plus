@@ -18,81 +18,68 @@ export interface SendOptions {
 }
 
 export async function send(opts: SendOptions, db?: DB): Promise<void> {
-  const to = opts.to ?? ""
-  let chatId = opts.chatId ?? null
-  let chatIdentifier = opts.chatIdentifier ?? ""
-  let chatGuid = opts.chatGuid ?? ""
-  const text = opts.text ?? ""
-  const file = opts.file ?? ""
-  const service = opts.service ?? "auto"
-  const region = opts.region ?? "US"
+  if (!opts.text && !opts.file) throw new Error("--text or --file is required")
 
-  const hasChat = chatId != null || chatIdentifier !== "" || chatGuid !== ""
-  if (hasChat && to) throw new Error("Use --to or --chat-*, not both")
-  if (!hasChat && !to) throw new Error("--to is required for direct sends")
-  if (!text && !file) throw new Error("--text or --file is required")
+  const { recipient, chatTarget, service } = resolveTarget(opts, db)
+  const attachment = opts.file ? stage(opts.file) : ""
 
-  // Resolve chat target from chat-id
-  if (chatId != null && db) {
-    const info = db.chatInfo(chatId)
-    if (!info) throw new Error(`Unknown chat id ${chatId}`)
-    chatIdentifier = info.identifier
-    chatGuid = info.guid
-  }
-
-  // Figure out routing: chat-based or direct send
-  let recipient = to
-  let useChat = false
-  let target = ""
-
-  if (hasChat) {
-    if (chatIdentifier && looksLikeHandle(chatIdentifier)) {
-      // It's really a direct handle, not a group chat
-      recipient = recipient || chatIdentifier
-    } else if (chatGuid) {
-      useChat = true
-      target = chatGuid
-    } else if (chatIdentifier) {
-      useChat = true
-      target = chatIdentifier
-    } else {
-      throw new Error("Missing chat identifier or guid")
-    }
-  }
-
-  // Normalize phone number for direct sends
-  if (!useChat) {
-    recipient = normalize(recipient, region)
-  }
-
-  // Stage attachment
-  const attachment = file ? stage(file) : ""
-
-  // Build and run AppleScript
   await osascript(SEND_SCRIPT, [
     recipient,
-    text.trim(),
-    useChat ? service : service === "auto" ? "imessage" : service,
+    (opts.text ?? "").trim(),
+    service,
     attachment,
     attachment ? "1" : "0",
-    target,
-    useChat ? "1" : "0",
+    chatTarget,
+    chatTarget ? "1" : "0",
   ])
+}
+
+// Pure function: options in → exactly one of recipient/chatTarget out
+
+function resolveTarget(opts: SendOptions, db?: DB) {
+  const service = opts.service ?? "auto"
+  const region = opts.region ?? "US"
+  const directService = service === "auto" ? "imessage" : service
+  const hasChat = opts.chatId != null || opts.chatIdentifier || opts.chatGuid
+
+  if (opts.to && hasChat) throw new Error("Use --to or --chat-*, not both")
+  if (!opts.to && !hasChat) throw new Error("--to or --chat-id is required")
+
+  // Direct send to a phone/email
+  if (opts.to) {
+    return { recipient: normalize(opts.to, region), chatTarget: "", service: directService }
+  }
+
+  // Look up chat by numeric ID
+  let identifier = opts.chatIdentifier ?? ""
+  let guid = opts.chatGuid ?? ""
+  if (opts.chatId != null) {
+    const info = db?.chatInfo(opts.chatId)
+    if (!info) throw new Error(`Unknown chat id ${opts.chatId}`)
+    identifier = info.identifier
+    guid = info.guid
+  }
+
+  // If the identifier is really just a phone/email, send directly
+  if (identifier && looksLikeHandle(identifier)) {
+    return { recipient: normalize(identifier, region), chatTarget: "", service: directService }
+  }
+
+  // Chat-based send (group chats, named chats)
+  const target = guid || identifier
+  if (!target) throw new Error("Missing chat identifier or guid")
+  return { recipient: "", chatTarget: target, service }
 }
 
 function normalize(input: string, region: string): string {
   try {
-    const parsed = parsePhoneNumber(input, region as any)
-    return parsed?.format("E.164") ?? input
+    return parsePhoneNumber(input, region as any)?.format("E.164") ?? input
   } catch {
     return input
   }
 }
 
 function looksLikeHandle(value: string): boolean {
-  if (!value) return false
-  const lower = value.toLowerCase()
-  if (lower.startsWith("imessage:") || lower.startsWith("sms:") || lower.startsWith("auto:")) return true
   if (value.includes("@")) return true
   return /^[+\d\s()\-]+$/.test(value)
 }
