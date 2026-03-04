@@ -3,19 +3,19 @@ import { execFileSync } from "node:child_process"
 import { existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
-import type { Chat, ChatInfo, Message, Attachment, Filter } from "./types.js"
+import type { Chat, Message, Attachment, Filter } from "./types.js"
 
 const APPLE_EPOCH = 978307200
-const NANOS = 1e9
+const NANOS_PER_SEC = 1e9
 const DEFAULT_PATH = join(homedir(), "Library/Messages/chat.db")
 
-function toDate(nanos: number | null): Date {
+export function nanosToDate(nanos: number | null): Date {
   if (!nanos) return new Date(APPLE_EPOCH * 1000)
-  return new Date((nanos / NANOS + APPLE_EPOCH) * 1000)
+  return new Date((nanos / NANOS_PER_SEC + APPLE_EPOCH) * 1000)
 }
 
-function toNanos(date: Date): number {
-  return (date.getTime() / 1000 - APPLE_EPOCH) * NANOS
+export function dateToNanos(date: Date): number {
+  return (date.getTime() / 1000 - APPLE_EPOCH) * NANOS_PER_SEC
 }
 
 export type DB = ReturnType<typeof open>
@@ -32,62 +32,93 @@ export function open(path = DEFAULT_PATH) {
   const db = new Database(path, { readonly: true, fileMustExist: true })
   db.pragma("busy_timeout = 5000")
 
-  const cols = detectColumns(db)
+  const schema = detectColumns(db)
   const msgColumns = `
             m.ROWID as id, m.handle_id as handleId, h.id as sender,
             IFNULL(m.text, '') as text, m.date as dateNanos, m.is_from_me as isFromMe,
-            m.service, ${cols.audioMessage} as isAudio,
-            ${cols.destinationCallerId} as destCaller,
-            ${cols.guid} as guid, ${cols.associatedGuid} as assocGuid,
-            ${cols.associatedType} as assocType,
+            m.service, ${schema.audioMessage} as isAudio,
+            ${schema.destinationCallerId} as destCaller,
+            ${schema.guid} as guid, ${schema.associatedGuid} as assocGuid,
+            ${schema.associatedType} as assocType,
             (SELECT COUNT(*) FROM message_attachment_join maj WHERE maj.message_id = m.ROWID) as attachCount,
-            ${cols.body} as body`
+            ${schema.body} as body`
 
-  // --- Row parsing (closes over cols + db) ---
+  // --- Row parsing ---
 
-  function parseRow(r: any, chatId: number): Message {
-    let sender: string = r.sender ?? ""
-    if (!sender && r.destCaller) sender = r.destCaller
+  function parseRow(row: any, chatId: number): Message {
+    let sender: string = row.sender ?? ""
+    if (!sender && row.destCaller) sender = row.destCaller
 
-    let text: string = r.text
-    if (!text && r.body) text = parseAttributedBody(r.body)
-    if (r.isAudio && cols.hasAudioTranscription) {
-      const t = audioTranscription(r.id)
+    let text: string = row.text
+    if (!text && row.body) text = parseAttributedBody(row.body)
+    if (row.isAudio && schema.hasAudioTranscription) {
+      const t = audioTranscription(row.id)
       if (t) text = t
     }
 
     return {
-      id: r.id,
+      id: row.id,
       chatId,
-      guid: r.guid ?? "",
-      replyToGuid: extractReplyGuid(r.assocGuid, r.assocType),
+      guid: row.guid ?? "",
+      replyToGuid: extractReplyGuid(row.assocGuid, row.assocType),
       sender,
       text,
-      date: toDate(r.dateNanos),
-      isFromMe: !!r.isFromMe,
-      service: r.service ?? "",
-      attachments: r.attachCount ?? 0,
+      date: nanosToDate(row.dateNanos),
+      isFromMe: !!row.isFromMe,
+      service: row.service ?? "",
+      attachments: row.attachCount ?? 0,
     }
   }
 
   function audioTranscription(messageId: number): string | null {
-    const r: any = db
+    const row: any = db
       .prepare(
         `SELECT a.user_info FROM message_attachment_join maj
          JOIN attachment a ON a.ROWID = maj.attachment_id
          WHERE maj.message_id = ? LIMIT 1`
       )
       .get(messageId)
-    if (!r?.user_info) return null
+    if (!row?.user_info) return null
     try {
       const json = execFileSync("plutil", ["-convert", "json", "-o", "-", "-"], {
-        input: r.user_info,
+        input: row.user_info,
         encoding: "utf8",
       })
       return JSON.parse(json)["audio-transcription"] || null
-    } catch {
+    } catch (err: any) {
+      process.stderr.write(`[audio-transcription] error for message ${messageId}: ${err.message}\n`)
       return null
     }
+  }
+
+  // --- Filter application (DRY for messages/messagesAfter) ---
+
+  function applyFilter(
+    filter: Filter | undefined,
+    bindings: any[],
+  ): string {
+    if (!filter) return ""
+    let where = ""
+    if (filter.after) {
+      where += " AND m.date >= ?"
+      bindings.push(dateToNanos(filter.after))
+    }
+    if (filter.before) {
+      where += " AND m.date < ?"
+      bindings.push(dateToNanos(filter.before))
+    }
+    if (filter.participants?.length) {
+      const ph = filter.participants.map(() => "?").join(",")
+      where += ` AND COALESCE(NULLIF(h.id,''), ${schema.destCallerFilter}) COLLATE NOCASE IN (${ph})`
+      bindings.push(...filter.participants)
+    }
+    return where
+  }
+
+  // --- Chat helpers ---
+
+  function isGroup(identifier: string, guid: string): boolean {
+    return identifier.includes(";+;") || guid.includes(";+;")
   }
 
   // --- Public API ---
@@ -95,7 +126,7 @@ export function open(path = DEFAULT_PATH) {
   return {
     path,
     chats,
-    chatInfo,
+    chat,
     participants,
     messages,
     messagesAfter,
@@ -108,6 +139,7 @@ export function open(path = DEFAULT_PATH) {
     return db
       .prepare(
         `SELECT c.ROWID as id,
+            IFNULL(c.guid, '') as guid,
             IFNULL(c.display_name, c.chat_identifier) as name,
             c.chat_identifier as identifier,
             c.service_name as service,
@@ -120,17 +152,19 @@ export function open(path = DEFAULT_PATH) {
          LIMIT ?`
       )
       .all(limit)
-      .map((r: any) => ({
-        id: r.id,
-        identifier: r.identifier,
-        name: r.name,
-        service: r.service,
-        lastMessageAt: toDate(r.lastDate),
+      .map((row: any) => ({
+        id: row.id,
+        guid: row.guid,
+        identifier: row.identifier,
+        name: row.name,
+        service: row.service,
+        isGroup: isGroup(row.identifier, row.guid),
+        lastMessageAt: nanosToDate(row.lastDate),
       }))
   }
 
-  function chatInfo(chatId: number): ChatInfo | null {
-    const r: any = db
+  function chat(chatId: number): Chat | null {
+    const row: any = db
       .prepare(
         `SELECT c.ROWID as id,
             IFNULL(c.chat_identifier, '') as identifier,
@@ -140,7 +174,15 @@ export function open(path = DEFAULT_PATH) {
          FROM chat c WHERE c.ROWID = ? LIMIT 1`
       )
       .get(chatId)
-    return r ? { id: r.id, identifier: r.identifier, guid: r.guid, name: r.name, service: r.service } : null
+    if (!row) return null
+    return {
+      id: row.id,
+      identifier: row.identifier,
+      guid: row.guid,
+      name: row.name,
+      service: row.service,
+      isGroup: isGroup(row.identifier, row.guid),
+    }
   }
 
   function participants(chatId: number): string[] {
@@ -153,30 +195,15 @@ export function open(path = DEFAULT_PATH) {
          ORDER BY h.id ASC`
       )
       .all(chatId)
-      .map((r: any) => r.handle as string)
+      .map((row: any) => row.handle as string)
       .filter(Boolean)
     return [...new Set(handles)]
   }
 
   function messages(chatId: number, opts: { limit?: number; filter?: Filter } = {}): Message[] {
     const limit = opts.limit ?? 50
-    const f = opts.filter
     const bindings: any[] = [chatId]
-
-    let where = ""
-    if (f?.after) {
-      where += " AND m.date >= ?"
-      bindings.push(toNanos(f.after))
-    }
-    if (f?.before) {
-      where += " AND m.date < ?"
-      bindings.push(toNanos(f.before))
-    }
-    if (f?.participants?.length) {
-      const ph = f.participants.map(() => "?").join(",")
-      where += ` AND COALESCE(NULLIF(h.id,''), ${cols.destCallerFilter}) COLLATE NOCASE IN (${ph})`
-      bindings.push(...f.participants)
-    }
+    const filterWhere = applyFilter(opts.filter, bindings)
     bindings.push(limit)
 
     return db
@@ -185,35 +212,22 @@ export function open(path = DEFAULT_PATH) {
          FROM message m
          JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
          LEFT JOIN handle h ON m.handle_id = h.ROWID
-         WHERE cmj.chat_id = ?${cols.noReactions}${where}
+         WHERE cmj.chat_id = ?${schema.noReactions}${filterWhere}
          ORDER BY m.date DESC LIMIT ?`
       )
       .all(...bindings)
-      .map((r: any) => parseRow(r, chatId))
+      .map((row: any) => parseRow(row, chatId))
   }
 
   function messagesAfter(afterRowId: number, opts: { chatId?: number; limit?: number; filter?: Filter } = {}): Message[] {
     const limit = opts.limit ?? 100
-    const f = opts.filter
     const bindings: any[] = [afterRowId]
     let chatWhere = ""
     if (opts.chatId != null) {
       chatWhere = " AND cmj.chat_id = ?"
       bindings.push(opts.chatId)
     }
-    if (f?.after) {
-      chatWhere += " AND m.date >= ?"
-      bindings.push(toNanos(f.after))
-    }
-    if (f?.before) {
-      chatWhere += " AND m.date < ?"
-      bindings.push(toNanos(f.before))
-    }
-    if (f?.participants?.length) {
-      const ph = f.participants.map(() => "?").join(",")
-      chatWhere += ` AND COALESCE(NULLIF(h.id,''), ${cols.destCallerFilter}) COLLATE NOCASE IN (${ph})`
-      bindings.push(...f.participants)
-    }
+    chatWhere += applyFilter(opts.filter, bindings)
     bindings.push(limit)
 
     return db
@@ -222,11 +236,11 @@ export function open(path = DEFAULT_PATH) {
          FROM message m
          LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
          LEFT JOIN handle h ON m.handle_id = h.ROWID
-         WHERE m.ROWID > ?${cols.noReactions}${chatWhere}
+         WHERE m.ROWID > ?${schema.noReactions}${chatWhere}
          ORDER BY m.ROWID ASC LIMIT ?`
       )
       .all(...bindings)
-      .map((r: any) => parseRow(r, r.chatId ?? opts.chatId ?? 0))
+      .map((row: any) => parseRow(row, row.chatId ?? opts.chatId ?? 0))
   }
 
   function attachments(messageId: number): Attachment[] {
@@ -239,15 +253,15 @@ export function open(path = DEFAULT_PATH) {
          WHERE maj.message_id = ?`
       )
       .all(messageId)
-      .map((r: any) => {
-        const path = r.filename ? r.filename.replace(/^~/, homedir()) : ""
+      .map((row: any) => {
+        const path = row.filename ? row.filename.replace(/^~/, homedir()) : ""
         return {
-          filename: r.filename ?? "",
-          transferName: r.transferName ?? "",
-          uti: r.uti ?? "",
-          mimeType: r.mimeType ?? "",
-          totalBytes: Number(r.totalBytes ?? 0),
-          isSticker: !!r.isSticker,
+          filename: row.filename ?? "",
+          transferName: row.transferName ?? "",
+          uti: row.uti ?? "",
+          mimeType: row.mimeType ?? "",
+          totalBytes: Number(row.totalBytes ?? 0),
+          isSticker: !!row.isSticker,
           path,
           missing: !path || !existsSync(path),
         }
@@ -255,8 +269,8 @@ export function open(path = DEFAULT_PATH) {
   }
 
   function maxRowId(): number {
-    const r: any = db.prepare("SELECT MAX(ROWID) as id FROM message").get()
-    return Number(r?.id ?? 0)
+    const row: any = db.prepare("SELECT MAX(ROWID) as id FROM message").get()
+    return Number(row?.id ?? 0)
   }
 }
 
@@ -285,12 +299,15 @@ function detectColumns(db: Database.Database) {
 
 function columnNames(db: Database.Database, table: string): Set<string> {
   const rows: any[] = db.prepare(`PRAGMA table_info(${table})`).all()
-  return new Set(rows.map((r) => (r.name as string).toLowerCase()))
+  return new Set(rows.map((row) => (row.name as string).toLowerCase()))
 }
 
 // --- TypedStream parser (attributedBody column) ---
+// Apple's TypedStream format uses 0x01 0x2b as a string marker
+// and 0x86 0x84 as a segment terminator. We scan for these
+// magic bytes to extract the longest readable text segment.
 
-function parseAttributedBody(blob: Buffer | null): string {
+export function parseAttributedBody(blob: Buffer | null): string {
   if (!blob || !blob.length) return ""
   let best = ""
 
@@ -311,7 +328,7 @@ function parseAttributedBody(blob: Buffer | null): string {
   return best || blob.toString("utf8").replace(/[\x00-\x1f]/g, "").trim()
 }
 
-function extractReplyGuid(guid: string | null, type: number | null): string | null {
+export function extractReplyGuid(guid: string | null, type: number | null): string | null {
   if (!guid) return null
   const slash = guid.lastIndexOf("/")
   const normalized = slash >= 0 && slash < guid.length - 1 ? guid.slice(slash + 1) : guid

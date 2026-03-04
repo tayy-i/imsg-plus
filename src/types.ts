@@ -1,17 +1,11 @@
 export interface Chat {
   id: number
-  identifier: string
-  name: string
-  service: string
-  lastMessageAt: Date
-}
-
-export interface ChatInfo {
-  id: number
-  identifier: string
   guid: string
+  identifier: string
   name: string
   service: string
+  isGroup: boolean
+  lastMessageAt?: Date
 }
 
 export interface Message {
@@ -42,4 +36,12 @@ export interface Filter {
   participants?: string[]
   after?: Date
   before?: Date
+}
+
+export type Service = "imessage" | "sms" | "auto"
+
+export function parseService(value: string | undefined): Service {
+  if (value === "imessage" || value === "sms" || value === "auto") return value
+  if (!value) return "auto"
+  throw new Error(`Invalid service: ${value}. Must be imessage, sms, or auto`)
 }

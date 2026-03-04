@@ -1,8 +1,9 @@
 import { createInterface } from "node:readline"
 import type { DB } from "./db.js"
 import type { Bridge } from "./bridge.js"
-import type { ChatInfo } from "./types.js"
-import { messageToJSON, isGroupChat } from "./json.js"
+import type { Chat, Service } from "./types.js"
+import { serializeMessage } from "./json.js"
+import { parseFilter } from "./filter.js"
 import { watch } from "./watch.js"
 import { send, react, type TapbackType } from "./send.js"
 
@@ -12,6 +13,29 @@ interface RPCOptions {
   autoTyping?: boolean
 }
 
+// Simple TTL cache: entries expire after 5 minutes
+const CACHE_TTL = 5 * 60 * 1000
+
+interface CacheEntry<T> {
+  value: T
+  expiresAt: number
+}
+
+function ttlCache<K, V>() {
+  const store = new Map<K, CacheEntry<V>>()
+  return {
+    get(key: K): V | undefined {
+      const entry = store.get(key)
+      if (!entry) return undefined
+      if (Date.now() > entry.expiresAt) { store.delete(key); return undefined }
+      return entry.value
+    },
+    set(key: K, value: V): void {
+      store.set(key, { value, expiresAt: Date.now() + CACHE_TTL })
+    },
+  }
+}
+
 export async function serve(db: DB, bridge: Bridge, opts: RPCOptions = {}): Promise<void> {
   const autoRead = opts.autoRead ?? bridge.available
   const autoTyping = opts.autoTyping ?? bridge.available
@@ -19,56 +43,59 @@ export async function serve(db: DB, bridge: Bridge, opts: RPCOptions = {}): Prom
 
   // --- Caches ---
 
-  const infoCache = new Map<number, ChatInfo | null>()
-  const partCache = new Map<number, string[]>()
+  const chatCache = ttlCache<number, Chat | null>()
+  const participantCache = ttlCache<number, string[]>()
 
-  function cachedInfo(id: number) {
-    if (!infoCache.has(id)) infoCache.set(id, db.chatInfo(id))
-    return infoCache.get(id)!
+  function cachedChat(id: number): Chat | null {
+    let c = chatCache.get(id)
+    if (c === undefined) {
+      c = db.chat(id)
+      chatCache.set(id, c)
+    }
+    return c
   }
 
-  function cachedParticipants(id: number) {
-    if (!partCache.has(id)) partCache.set(id, db.participants(id))
-    return partCache.get(id)!
+  function cachedParticipants(id: number): string[] {
+    let p = participantCache.get(id)
+    if (p === undefined) {
+      p = db.participants(id)
+      participantCache.set(id, p)
+    }
+    return p
   }
 
   // --- Wire format ---
 
-  function enrichMessage(msg: ReturnType<DB["messages"]>[number], attachments: ReturnType<DB["attachments"]> = []) {
-    const info = cachedInfo(msg.chatId)
-    const identifier = info?.identifier ?? ""
-    const guid = info?.guid ?? ""
+  function toWireMessage(msg: ReturnType<DB["messages"]>[number], attachments: ReturnType<DB["attachments"]> = []) {
+    const chat = cachedChat(msg.chatId)
     return {
-      ...messageToJSON(msg, attachments),
-      chat_identifier: identifier,
-      chat_guid: guid,
-      chat_name: info?.name ?? "",
+      ...serializeMessage(msg, attachments),
+      chat_identifier: chat?.identifier ?? "",
+      chat_guid: chat?.guid ?? "",
+      chat_name: chat?.name ?? "",
       participants: cachedParticipants(msg.chatId),
-      is_group: isGroupChat(identifier, guid),
+      is_group: chat?.isGroup ?? false,
     }
   }
 
-  function enrichChat(chat: { id: number; identifier: string; name: string; service: string; lastMessageAt: Date }) {
-    const info = cachedInfo(chat.id)
-    const identifier = info?.identifier ?? chat.identifier
-    const guid = info?.guid ?? ""
+  function toWireChat(chat: Chat) {
     return {
       id: chat.id,
-      identifier,
-      guid,
-      name: (info?.name && info.name !== info.identifier ? info.name : null) ?? chat.name,
-      service: info?.service ?? chat.service,
-      last_message_at: chat.lastMessageAt.toISOString(),
+      identifier: chat.identifier,
+      guid: chat.guid,
+      name: chat.name,
+      service: chat.service,
+      last_message_at: chat.lastMessageAt?.toISOString() ?? null,
       participants: cachedParticipants(chat.id),
-      is_group: isGroupChat(identifier, guid),
+      is_group: chat.isGroup,
     }
   }
 
-  // --- Auto-behaviors ---
+  // --- Auto-behaviors (bridge handles availability check) ---
 
   function autoMarkRead(msg: ReturnType<DB["messages"]>[number]) {
-    if (!autoRead || !bridge.available || msg.isFromMe) return
-    const handle = cachedInfo(msg.chatId)?.identifier ?? msg.sender
+    if (!autoRead || msg.isFromMe) return
+    const handle = cachedChat(msg.chatId)?.identifier ?? msg.sender
     if (!handle) return
     setTimeout(() => {
       bridge.markRead(handle).catch((err) => log(`[auto-read] error: ${err.message}`))
@@ -76,7 +103,7 @@ export async function serve(db: DB, bridge: Bridge, opts: RPCOptions = {}): Prom
   }
 
   async function autoType(handle: string, textLength: number) {
-    if (!autoTyping || !bridge.available || !handle) return
+    if (!autoTyping || !handle) return
     try {
       await bridge.setTyping(handle, true)
       await new Promise((r) => setTimeout(r, Math.min(1.5 + (textLength / 80) * 2.5, 4) * 1000))
@@ -86,7 +113,7 @@ export async function serve(db: DB, bridge: Bridge, opts: RPCOptions = {}): Prom
   }
 
   function autoTypeOff(handle: string) {
-    if (!autoTyping || !bridge.available || !handle) return
+    if (!autoTyping || !handle) return
     bridge.setTyping(handle, false).catch((err) => log(`[auto-typing] off: ${err.message}`))
   }
 
@@ -95,11 +122,16 @@ export async function serve(db: DB, bridge: Bridge, opts: RPCOptions = {}): Prom
   let nextSubId = 1
   const subs = new Map<number, AbortController>()
 
+  function abortAllSubscriptions() {
+    for (const ac of subs.values()) ac.abort()
+    subs.clear()
+  }
+
   function startSubscription(subId: number, ac: AbortController, watchOpts: Parameters<typeof watch>[1], includeAttachments: boolean) {
     ;(async () => {
       for await (const msg of watch(db, watchOpts)) {
         if (ac.signal.aborted) return
-        notify("message", { subscription: subId, message: enrichMessage(msg, includeAttachments ? db.attachments(msg.id) : []) })
+        notify("message", { subscription: subId, message: toWireMessage(msg, includeAttachments ? db.attachments(msg.id) : []) })
         autoMarkRead(msg)
       }
     })().catch((err) => {
@@ -131,11 +163,11 @@ export async function serve(db: DB, bridge: Bridge, opts: RPCOptions = {}): Prom
 
   // --- Method map ---
 
-  type P = Record<string, any>
+  type Params = Record<string, any>
 
-  const methods: Record<string, (p: P) => unknown> = {
+  const methods: Record<string, (p: Params) => unknown> = {
     "chats.list"(p) {
-      return { chats: db.chats(Math.max(int(p.limit) ?? 20, 1)).map(enrichChat) }
+      return { chats: db.chats(Math.max(int(p.limit) ?? 20, 1)).map(toWireChat) }
     },
 
     "messages.history"(p) {
@@ -144,7 +176,7 @@ export async function serve(db: DB, bridge: Bridge, opts: RPCOptions = {}): Prom
       return {
         messages: db
           .messages(chatId, { limit: Math.max(int(p.limit) ?? 50, 1), filter: parseFilter(p) })
-          .map((m) => enrichMessage(m, atts ? db.attachments(m.id) : [])),
+          .map((m) => toWireMessage(m, atts ? db.attachments(m.id) : [])),
       }
     },
 
@@ -182,7 +214,7 @@ export async function serve(db: DB, bridge: Bridge, opts: RPCOptions = {}): Prom
           chatGuid: str(p.chat_guid) ?? undefined,
           text,
           file: str(p.file) ?? undefined,
-          service: (str(p.service) ?? "auto") as any,
+          service: (str(p.service) ?? "auto") as Service,
           region: str(p.region) ?? undefined,
         },
         db
@@ -206,14 +238,12 @@ export async function serve(db: DB, bridge: Bridge, opts: RPCOptions = {}): Prom
       const handle = need(str(p.handle), "handle")
       const state = need(str(p.state), "state")
       if (state !== "on" && state !== "off") throw new InvalidParams("state must be 'on' or 'off'")
-      if (!bridge.available) throw new Error("IMCoreBridge not available")
       await bridge.setTyping(handle, state === "on")
       return { ok: true }
     },
 
     async "messages.markRead"(p) {
       const handle = need(str(p.handle), "handle")
-      if (!bridge.available) throw new Error("IMCoreBridge not available")
       await bridge.markRead(handle)
       return { ok: true }
     },
@@ -223,10 +253,13 @@ export async function serve(db: DB, bridge: Bridge, opts: RPCOptions = {}): Prom
 
   const rl = createInterface({ input: process.stdin, terminal: false })
 
+  // Abort all subscriptions when stdin closes
+  process.stdin.on("end", abortAllSubscriptions)
+
   for await (const line of rl) {
     if (!line.trim()) continue
 
-    let req: P
+    let req: Params
     try {
       req = JSON.parse(line)
     } catch {
@@ -253,25 +286,25 @@ export async function serve(db: DB, bridge: Bridge, opts: RPCOptions = {}): Prom
     }
   }
 
-  for (const ac of subs.values()) ac.abort()
+  abortAllSubscriptions()
 }
 
 // --- Helpers ---
 
-class InvalidParams extends Error {}
+export class InvalidParams extends Error {}
 
-function need<T>(value: T | null | undefined, name: string): NonNullable<T> {
+export function need<T>(value: T | null | undefined, name: string): NonNullable<T> {
   if (value == null) throw new InvalidParams(`${name} is required`)
   return value!
 }
 
-function str(v: unknown): string | null {
+export function str(v: unknown): string | null {
   if (typeof v === "string") return v
   if (typeof v === "number") return String(v)
   return null
 }
 
-function int(v: unknown): number | null {
+export function int(v: unknown): number | null {
   if (typeof v === "number") return Math.floor(v)
   if (typeof v === "string") {
     const n = parseInt(v, 10)
@@ -280,23 +313,9 @@ function int(v: unknown): number | null {
   return null
 }
 
-function bool(v: unknown): boolean | null {
+export function bool(v: unknown): boolean | null {
   if (typeof v === "boolean") return v
   if (v === "true") return true
   if (v === "false") return false
   return null
-}
-
-function parseFilter(p: Record<string, any>) {
-  const participants = stringArray(p.participants)
-  const after = p.start ? new Date(p.start) : undefined
-  const before = p.end ? new Date(p.end) : undefined
-  if (!participants.length && !after && !before) return undefined
-  return { participants: participants.length ? participants : undefined, after, before }
-}
-
-function stringArray(v: unknown): string[] {
-  if (Array.isArray(v)) return v.filter((x): x is string => typeof x === "string")
-  if (typeof v === "string") return v.split(",").map((s) => s.trim()).filter(Boolean)
-  return []
 }

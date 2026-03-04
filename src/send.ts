@@ -1,10 +1,11 @@
 import { execFile } from "node:child_process"
-import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync, rmSync } from "node:fs"
+import { copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, statSync, rmSync } from "node:fs"
 import { homedir } from "node:os"
 import { basename, join, resolve } from "node:path"
 import { randomUUID } from "node:crypto"
 import { parsePhoneNumber } from "libphonenumber-js"
 import type { DB } from "./db.js"
+import type { Service } from "./types.js"
 
 export interface SendOptions {
   to?: string
@@ -13,14 +14,14 @@ export interface SendOptions {
   chatGuid?: string
   text?: string
   file?: string
-  service?: "imessage" | "sms" | "auto"
+  service?: Service
   region?: string
 }
 
 export async function send(opts: SendOptions, db?: DB): Promise<void> {
   if (!opts.text && !opts.file) throw new Error("--text or --file is required")
 
-  const { recipient, chatTarget, service } = resolveTarget(opts, db)
+  const { recipient, chatTarget, service } = pickRecipient(opts, db)
   const attachment = opts.file ? stage(opts.file) : ""
 
   // Clean up old staged attachments in the background (don't block the send)
@@ -55,8 +56,8 @@ export async function cleanStagedAttachments(maxAgeMs = 3600000): Promise<number
         rmSync(dirPath, { recursive: true, force: true })
         removed++
       }
-    } catch {
-      // Directory may have been removed between listing and stat — that's fine
+    } catch (err: any) {
+      process.stderr.write(`[cleanup] failed to remove ${dirPath}: ${err.message}\n`)
     }
   }
 
@@ -115,7 +116,7 @@ end run
 
 // Pure function: options in → exactly one of recipient/chatTarget out
 
-function resolveTarget(opts: SendOptions, db?: DB) {
+export function pickRecipient(opts: SendOptions, db?: DB) {
   const service = opts.service ?? "auto"
   const region = opts.region ?? "US"
   const directService = service === "auto" ? "imessage" : service
@@ -133,7 +134,7 @@ function resolveTarget(opts: SendOptions, db?: DB) {
   let identifier = opts.chatIdentifier ?? ""
   let guid = opts.chatGuid ?? ""
   if (opts.chatId != null) {
-    const info = db?.chatInfo(opts.chatId)
+    const info = db?.chat(opts.chatId)
     if (!info) throw new Error(`Unknown chat id ${opts.chatId}`)
     identifier = info.identifier
     guid = info.guid
@@ -150,7 +151,7 @@ function resolveTarget(opts: SendOptions, db?: DB) {
   return { recipient: "", chatTarget: target, service }
 }
 
-function normalize(input: string, region: string): string {
+export function normalize(input: string, region: string): string {
   try {
     return parsePhoneNumber(input, region as any)?.format("E.164") ?? input
   } catch {
@@ -158,7 +159,7 @@ function normalize(input: string, region: string): string {
   }
 }
 
-function looksLikeHandle(value: string): boolean {
+export function looksLikeHandle(value: string): boolean {
   if (value.includes("@")) return true
   return /^[+\d\s()\-]+$/.test(value)
 }
@@ -169,9 +170,21 @@ function stage(filePath: string): string {
 
   const dir = join(homedir(), "Library/Messages/Attachments/imsg", randomUUID())
   mkdirSync(dir, { recursive: true })
+  const tmpDest = join(dir, `.tmp-${basename(src)}`)
   const dest = join(dir, basename(src))
-  copyFileSync(src, dest)
+
+  // Stage atomically: copy to .tmp path first, rename on success
+  copyFileSync(src, tmpDest)
+  renameSync(tmpDest, dest)
   return dest
+}
+
+// Parse AppleScript error numbers from stderr into readable messages
+const APPLESCRIPT_ERRORS: Record<number, string> = {
+  [-1728]: "Messages.app cannot find the specified recipient",
+  [-1712]: "AppleScript timed out waiting for Messages.app",
+  [-10004]: "Messages.app is not available or not responding",
+  [-1708]: "Messages.app does not understand the command (may need a newer macOS version)",
 }
 
 function osascript(script: string, args: string[]): Promise<void> {
@@ -180,8 +193,16 @@ function osascript(script: string, args: string[]): Promise<void> {
     let stderr = ""
     child.stderr?.on("data", (d: Buffer) => (stderr += d))
     child.on("close", (code) => {
-      if (code === 0) resolve()
-      else reject(new Error(stderr.trim() || `osascript exited with code ${code}`))
+      if (code === 0) return resolve()
+
+      const trimmed = stderr.trim()
+      const match = trimmed.match(/\((-?\d+)\)/)
+      if (match) {
+        const errorNum = parseInt(match[1], 10)
+        const readable = APPLESCRIPT_ERRORS[errorNum]
+        if (readable) return reject(new Error(`${readable} (error ${errorNum})`))
+      }
+      reject(new Error(trimmed || `osascript exited with code ${code}`))
     })
     child.stdin?.end(script)
   })

@@ -18,7 +18,11 @@ const DYLIB_SEARCH = [
 export type Bridge = ReturnType<typeof createBridge>
 
 export function createBridge(customDylib?: string) {
-  const dylibPath = customDylib ?? findDylib()
+  const dylibPath = customDylib
+    ? (existsSync(customDylib) ? customDylib : null)
+    : findDylib()
+  let launching = false
+  let requestId = 0
 
   return {
     available: dylibPath !== null,
@@ -29,31 +33,41 @@ export function createBridge(customDylib?: string) {
     kill,
   }
 
+  // Bridge methods become no-ops when unavailable (no-throw, just return)
+
   async function setTyping(handle: string, typing: boolean): Promise<void> {
+    if (!dylibPath) return
     await command("typing", { handle, typing })
   }
 
   async function markRead(handle: string): Promise<void> {
+    if (!dylibPath) return
     await command("read", { handle })
   }
 
-  function launch(opts: { quiet?: boolean } = {}): void {
-    kill()
+  async function launch(opts: { quiet?: boolean } = {}): Promise<void> {
+    if (launching) return
+    launching = true
+    try {
+      kill()
 
-    if (!dylibPath || !existsSync(dylibPath)) {
-      throw new Error("imsg-plus-helper.dylib not found. Run: make build-dylib")
+      if (!dylibPath || !existsSync(dylibPath)) {
+        throw new Error("imsg-plus-helper.dylib not found. Run: make build-dylib")
+      }
+
+      for (const f of [COMMAND_FILE, RESPONSE_FILE, LOCK_FILE]) {
+        try { unlinkSync(f) } catch {}
+      }
+
+      const child = execFile(MESSAGES_BIN, [], {
+        env: { ...process.env, DYLD_INSERT_LIBRARIES: resolve(dylibPath) },
+      })
+      child.unref()
+
+      if (!opts.quiet) await waitForReady(15000)
+    } finally {
+      launching = false
     }
-
-    for (const f of [COMMAND_FILE, RESPONSE_FILE, LOCK_FILE]) {
-      try { unlinkSync(f) } catch {}
-    }
-
-    const child = execFile(MESSAGES_BIN, [], {
-      env: { ...process.env, DYLD_INSERT_LIBRARIES: resolve(dylibPath) },
-    })
-    child.unref()
-
-    if (!opts.quiet) waitForReady(15000)
   }
 
   function kill(): void {
@@ -66,13 +80,13 @@ export function createBridge(customDylib?: string) {
 
   async function command(action: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
     // If the lock file is missing, the dylib isn't loaded — launch first
-    if (!existsSync(LOCK_FILE)) launch()
+    if (!existsSync(LOCK_FILE)) await launch()
 
     const response = await sendAndWait(action, params)
     if (response) return response
 
     // Timed out — maybe the dylib died. Relaunch once and retry.
-    launch()
+    await launch()
     const retry = await sendAndWait(action, params)
     if (retry) return retry
 
@@ -80,7 +94,8 @@ export function createBridge(customDylib?: string) {
   }
 
   async function sendAndWait(action: string, params: Record<string, unknown>): Promise<Record<string, unknown> | null> {
-    writeFileSync(COMMAND_FILE, JSON.stringify({ id: Date.now(), action, params }))
+    const id = ++requestId
+    writeFileSync(COMMAND_FILE, JSON.stringify({ id, action, params }))
 
     const deadline = Date.now() + 10000
     while (Date.now() < deadline) {
@@ -93,8 +108,17 @@ export function createBridge(customDylib?: string) {
       const data = safeRead(RESPONSE_FILE)
       if (!data) continue
 
+      // Only accept responses whose id matches our request
+      let response: any
+      try {
+        response = JSON.parse(data)
+      } catch {
+        continue
+      }
+
+      if (response.id !== undefined && response.id !== id) continue
+
       writeFileSync(RESPONSE_FILE, "")
-      const response = JSON.parse(data)
       if (response.success) return response
       throw new Error(response.error ?? "Unknown dylib error")
     }
@@ -102,24 +126,27 @@ export function createBridge(customDylib?: string) {
     return null
   }
 
-  function waitForReady(timeout: number): void {
+  async function waitForReady(timeout: number): Promise<void> {
     const deadline = Date.now() + timeout
     while (Date.now() < deadline) {
-      if (existsSync(LOCK_FILE)) { sleepSync(500); return }
-      sleepSync(500)
+      if (existsSync(LOCK_FILE)) {
+        await sleep(500)
+        return
+      }
+      await sleep(500)
     }
     throw new Error("Timeout waiting for Messages.app. Ensure SIP is disabled.")
   }
 }
 
 // "Has meaningful JSON content?" — empty string, whitespace, or "{}" don't count
-function safeRead(path: string): string | null {
+export function safeRead(path: string): string | null {
   if (!existsSync(path)) return null
   const data = readFileSync(path, "utf8").trim()
   return data.length > 2 ? data : null
 }
 
-function findDylib(): string | null {
+export function findDylib(): string | null {
   for (const p of DYLIB_SEARCH) {
     if (existsSync(p)) return p
   }
@@ -130,8 +157,4 @@ function findDylib(): string | null {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
-}
-
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
 }

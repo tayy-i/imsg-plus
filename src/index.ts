@@ -9,8 +9,10 @@ import { send, react, cleanStagedAttachments, type TapbackType } from "./send.js
 import { watch } from "./watch.js"
 import { createBridge } from "./bridge.js"
 import { serve } from "./rpc.js"
-import { messageToJSON } from "./json.js"
-import type { Message, Filter } from "./types.js"
+import { serializeMessage } from "./json.js"
+import { parseFilter } from "./filter.js"
+import { parseService } from "./types.js"
+import type { Message, Attachment } from "./types.js"
 
 // --- Args ---
 
@@ -27,7 +29,7 @@ const args = arg(
     "--start": String,
     "--end": String,
     "--since-rowid": Number,
-    "--debounce": String,
+    "--debounce": Number,
     "--to": String,
     "--text": String,
     "--file": String,
@@ -56,19 +58,22 @@ const json = args["--json"] ?? false
 
 // --- Output ---
 
-const jsonl = (obj: unknown) => console.log(JSON.stringify(obj))
+function output(data: unknown, text: string) {
+  if (json) console.log(JSON.stringify(data))
+  else console.log(text)
+}
 
-function printMessage(msg: Message, db: DB) {
+function printMessage(msg: Message, attachments: Attachment[]) {
   if (json) {
-    jsonl(messageToJSON(msg, args["--attachments"] ? db.attachments(msg.id) : []))
+    console.log(JSON.stringify(serializeMessage(msg, attachments)))
   } else {
     const dir = msg.isFromMe ? "sent" : "recv"
     console.log(`${msg.date.toISOString()} [${dir}] ${msg.sender}: ${msg.text}`)
-    if (msg.attachments > 0 && args["--attachments"]) {
-      for (const a of db.attachments(msg.id)) {
+    if (attachments.length) {
+      for (const a of attachments) {
         console.log(`  ${a.transferName || a.filename || "(unknown)"} — ${a.mimeType}${a.missing ? " (missing)" : ""}`)
       }
-    } else if (msg.attachments > 0 && !json) {
+    } else if (msg.attachments > 0) {
       console.log(`  (${msg.attachments} attachment${msg.attachments === 1 ? "" : "s"})`)
     }
   }
@@ -77,7 +82,7 @@ function printMessage(msg: Message, db: DB) {
 // --- Main ---
 
 main().catch((err) => {
-  if (json) jsonl({ error: err.message })
+  if (json) console.log(JSON.stringify({ error: err.message }))
   else console.error(err.message ?? err)
   process.exit(1)
 })
@@ -110,8 +115,10 @@ async function main() {
 function chatsCmd() {
   const db = openDB()
   for (const c of db.chats(args["--limit"] ?? 20)) {
-    if (json) jsonl({ id: c.id, name: c.name, identifier: c.identifier, service: c.service, last_message_at: c.lastMessageAt.toISOString() })
-    else console.log(`[${c.id}] ${c.name} (${c.identifier}) last=${c.lastMessageAt.toISOString()}`)
+    output(
+      { id: c.id, name: c.name, identifier: c.identifier, guid: c.guid, service: c.service, is_group: c.isGroup, last_message_at: c.lastMessageAt?.toISOString() ?? null },
+      `[${c.id}] ${c.name} (${c.identifier}) last=${c.lastMessageAt?.toISOString() ?? "unknown"}`
+    )
   }
 }
 
@@ -120,39 +127,41 @@ function historyCmd() {
   if (chatId == null) bail("--chat-id is required")
 
   const db = openDB()
+  const showAttachments = args["--attachments"] ?? false
   for (const msg of db.messages(chatId, { limit: args["--limit"] ?? 50, filter: buildFilter() })) {
-    printMessage(msg, db)
+    printMessage(msg, showAttachments ? db.attachments(msg.id) : [])
   }
 }
 
 async function watchCmd() {
   const db = openDB()
+  const showAttachments = args["--attachments"] ?? false
   for await (const msg of watch(db, {
-    chatId: args["--chat-id"] ?? undefined,
-    sinceRowId: args["--since-rowid"] ?? undefined,
-    debounce: parseDebounce(args["--debounce"] ?? "250ms"),
+    chatId: args["--chat-id"],
+    sinceRowId: args["--since-rowid"],
+    debounce: args["--debounce"] ?? 250,
     filter: buildFilter(),
   })) {
-    printMessage(msg, db)
+    printMessage(msg, showAttachments ? db.attachments(msg.id) : [])
   }
 }
 
 async function sendCmd() {
+  const service = parseService(args["--service"])
   await send(
     {
-      to: args["--to"] ?? undefined,
-      chatId: args["--chat-id"] ?? undefined,
-      chatIdentifier: args["--chat-identifier"] ?? undefined,
-      chatGuid: args["--chat-guid"] ?? undefined,
-      text: args["--text"] ?? undefined,
-      file: args["--file"] ?? undefined,
-      service: args["--service"] as any,
-      region: args["--region"] ?? undefined,
+      to: args["--to"],
+      chatId: args["--chat-id"],
+      chatIdentifier: args["--chat-identifier"],
+      chatGuid: args["--chat-guid"],
+      text: args["--text"],
+      file: args["--file"],
+      service,
+      region: args["--region"],
     },
     openDB()
   )
-  if (json) jsonl({ status: "sent" })
-  else console.log("sent")
+  output({ status: "sent" }, "sent")
 }
 
 async function typingCmd() {
@@ -165,8 +174,10 @@ async function typingCmd() {
   if (!bridge.available) bail("dylib not found — run: make build-dylib")
   await bridge.setTyping(handle, state === "on")
 
-  if (json) jsonl({ success: true, handle, typing: state === "on" })
-  else console.log(`Typing indicator ${state === "on" ? "enabled" : "disabled"} for ${handle}`)
+  output(
+    { success: true, handle, typing: state === "on" },
+    `Typing indicator ${state === "on" ? "enabled" : "disabled"} for ${handle}`
+  )
 }
 
 async function readCmd() {
@@ -177,14 +188,16 @@ async function readCmd() {
   if (!bridge.available) bail("dylib not found — run: make build-dylib")
   await bridge.markRead(handle)
 
-  if (json) jsonl({ success: true, handle, marked_as_read: true })
-  else console.log(`Marked messages as read for ${handle}`)
+  output(
+    { success: true, handle, marked_as_read: true },
+    `Marked messages as read for ${handle}`
+  )
 }
 
 function statusCmd() {
   const bridge = createBridge()
   if (json) {
-    jsonl({ basic_features: true, advanced_features: bridge.available, typing_indicators: bridge.available, read_receipts: bridge.available })
+    console.log(JSON.stringify({ basic_features: true, advanced_features: bridge.available, typing_indicators: bridge.available, read_receipts: bridge.available }))
   } else {
     console.log("imsg-plus Status Report")
     console.log("========================")
@@ -201,16 +214,15 @@ function statusCmd() {
   }
 }
 
-function launchCmd() {
-  const bridge = createBridge(args["--dylib"] ?? undefined)
+async function launchCmd() {
+  const bridge = createBridge(args["--dylib"])
   const quiet = args["--quiet"] ?? false
 
   if (!quiet && !json) console.log("Killing Messages.app...")
   bridge.kill()
 
   if (args["--kill-only"]) {
-    if (json) jsonl({ success: true, action: "kill" })
-    else if (!quiet) console.log("Messages.app terminated")
+    output({ success: true, action: "kill" }, quiet ? "" : "Messages.app terminated")
     return
   }
 
@@ -218,12 +230,14 @@ function launchCmd() {
   if (!quiet && !json) console.log("Launching Messages.app with injection...")
 
   try {
-    bridge.launch({ quiet })
-    if (json) jsonl({ success: true, action: "launch", dylib: bridge.dylibPath })
-    else if (!quiet) console.log("Messages.app launched with dylib injection")
+    await bridge.launch({ quiet })
+    output(
+      { success: true, action: "launch", dylib: bridge.dylibPath },
+      quiet ? "" : "Messages.app launched with dylib injection"
+    )
   } catch (err: any) {
-    if (json) jsonl({ success: false, error: err.message })
-    else if (!quiet) console.error(`Failed to launch: ${err.message}`)
+    output({ success: false, error: err.message }, "")
+    if (!json && !quiet) console.error(`Failed to launch: ${err.message}`)
     process.exit(1)
   }
 }
@@ -236,22 +250,21 @@ async function reactCmd() {
   const type = args["--type"] as TapbackType
   if (!type) bail("--type is required (love, like, dislike, laugh, emphasis, question)")
 
+  const service = parseService(args["--service"])
   await react({
     to,
     guid,
     type,
-    service: args["--service"] as any,
-    region: args["--region"] ?? undefined,
+    service: service === "auto" ? undefined : service,
+    region: args["--region"],
   })
 
-  if (json) jsonl({ status: "reacted", type })
-  else console.log(`Sent ${type} reaction`)
+  output({ status: "reacted", type }, `Sent ${type} reaction`)
 }
 
 async function cleanupCmd() {
   const removed = await cleanStagedAttachments()
-  if (json) jsonl({ removed })
-  else console.log(`Removed ${removed} old staged attachment${removed === 1 ? "" : "s"}`)
+  output({ removed }, `Removed ${removed} old staged attachment${removed === 1 ? "" : "s"}`)
 }
 
 async function rpcCmd() {
@@ -267,23 +280,15 @@ async function rpcCmd() {
 // --- Helpers ---
 
 function openDB(): DB {
-  return open(args["--db"] ?? undefined)
+  return open(args["--db"])
 }
 
-function buildFilter(): Filter | undefined {
-  const participants = args["--participants"]?.split(",").map((s) => s.trim()).filter(Boolean)
-  const after = args["--start"] ? new Date(args["--start"]) : undefined
-  const before = args["--end"] ? new Date(args["--end"]) : undefined
-  if (!participants?.length && !after && !before) return undefined
-  return { participants, after, before }
-}
-
-function parseDebounce(value: string): number {
-  const units: [string, number][] = [["ms", 1], ["s", 1000], ["m", 60000]]
-  for (const [suffix, mult] of units) {
-    if (value.endsWith(suffix)) return (Number(value.slice(0, -suffix.length)) || 250) * mult
-  }
-  return Number(value) || 250
+function buildFilter() {
+  return parseFilter({
+    participants: args["--participants"],
+    start: args["--start"],
+    end: args["--end"],
+  })
 }
 
 function bail(msg: string): never {

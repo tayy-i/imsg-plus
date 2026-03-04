@@ -1,20 +1,20 @@
 import type { Message, Attachment } from "./types.js"
 
-export function messageToJSON(msg: Message, attachments: Attachment[] = []) {
+export function serializeMessage(msg: Message, attachments: Attachment[] = []) {
   return {
     id: msg.id,
     chat_id: msg.chatId,
     guid: msg.guid,
-    ...(msg.replyToGuid ? { reply_to_guid: msg.replyToGuid } : {}),
+    reply_to_guid: msg.replyToGuid,
     sender: msg.sender,
     is_from_me: msg.isFromMe,
     text: msg.text,
     created_at: msg.date.toISOString(),
-    attachments: attachments.map(attachmentToJSON),
+    attachments: attachments.map(serializeAttachment),
   }
 }
 
-export function attachmentToJSON(a: Attachment) {
+export function serializeAttachment(a: Attachment) {
   return {
     filename: a.filename,
     transfer_name: a.transferName,
@@ -25,8 +25,4 @@ export function attachmentToJSON(a: Attachment) {
     original_path: a.path,
     missing: a.missing,
   }
-}
-
-export function isGroupChat(identifier: string, guid: string): boolean {
-  return identifier.includes(";+;") || guid.includes(";+;")
 }
