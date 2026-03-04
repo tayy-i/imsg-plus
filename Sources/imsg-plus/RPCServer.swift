@@ -17,6 +17,7 @@ final class RPCServer {
   private let autoRead: Bool
   private let autoTyping: Bool
   private let bridgeAvailable: Bool
+  private let contactResolver: ContactResolving?
   private var nextSubscriptionID = 1
   private var subscriptions: [Int: Task<Void, Never>] = [:]
 
@@ -26,7 +27,8 @@ final class RPCServer {
     autoRead: Bool? = nil,
     autoTyping: Bool? = nil,
     output: RPCOutput = RPCWriter(),
-    sendMessage: @escaping (MessageSendOptions) throws -> Void = { try MessageSender().send($0) }
+    sendMessage: @escaping (MessageSendOptions) throws -> Void = { try MessageSender().send($0) },
+    contactResolver: ContactResolving? = ContactResolver()
   ) {
     self.store = store
     self.watcher = MessageWatcher(store: store)
@@ -34,6 +36,7 @@ final class RPCServer {
     self.verbose = verbose
     self.output = output
     self.sendMessage = sendMessage
+    self.contactResolver = contactResolver
     let available = IMCoreBridge.shared.isAvailable
     self.bridgeAvailable = available
     self.autoRead = autoRead ?? available
@@ -95,6 +98,16 @@ final class RPCServer {
           let guid = info?.guid ?? ""
           let name = (info?.name.isEmpty == false ? info?.name : nil) ?? chat.name
           let service = info?.service ?? chat.service
+          var participantNames: [String: String]? = nil
+          if let resolver = self.contactResolver {
+            var names: [String: String] = [:]
+            for handle in participants {
+              if let resolved = resolver.resolve(handle: handle) {
+                names[handle] = resolved
+              }
+            }
+            if !names.isEmpty { participantNames = names }
+          }
           return chatPayload(
             id: chat.id,
             identifier: identifier,
@@ -102,7 +115,8 @@ final class RPCServer {
             name: name,
             service: service,
             lastMessageAt: chat.lastMessageAt,
-            participants: participants
+            participants: participants,
+            participantNames: participantNames
           )
         }
         respond(id: id, result: ["chats": payloads])
@@ -121,12 +135,14 @@ final class RPCServer {
           endISO: endISO
         )
         let filtered = try store.messages(chatID: chatID, limit: max(limit, 1), filter: filter)
+        let localResolver = contactResolver
         let payloads = try filtered.map { message in
           try buildMessagePayload(
             store: store,
             cache: cache,
             message: message,
-            includeAttachments: includeAttachments
+            includeAttachments: includeAttachments,
+            contactResolver: localResolver
           )
         }
         respond(id: id, result: ["messages": payloads])
@@ -157,6 +173,7 @@ final class RPCServer {
         let localAutoRead = autoRead
         let localBridgeAvailable = bridgeAvailable
         let localVerbose = verbose
+        let localResolver = contactResolver
         let task = Task {
           do {
             for try await message in localWatcher.stream(
@@ -170,7 +187,8 @@ final class RPCServer {
                 store: localStore,
                 cache: localCache,
                 message: message,
-                includeAttachments: localIncludeAttachments
+                includeAttachments: localIncludeAttachments,
+                contactResolver: localResolver
               )
               localWriter.sendNotification(
                 method: "message",
@@ -229,6 +247,10 @@ final class RPCServer {
         try await handleMarkRead(params: params, id: id)
       case "tapback.send":
         try await handleTapbackSend(params: params, id: id)
+      case "group.create":
+        try await handleGroupCreate(params: params, id: id)
+      case "group.rename":
+        try await handleGroupRename(params: params, id: id)
       default:
         output.sendError(id: id, error: RPCError.methodNotFound(method))
       }
@@ -319,17 +341,39 @@ final class RPCServer {
       }
     }
 
-    try sendMessage(
-      MessageSendOptions(
-        recipient: recipient,
-        text: text,
-        attachmentPath: file,
-        service: service,
-        region: region,
-        chatIdentifier: resolvedChatIdentifier,
-        chatGUID: resolvedChatGUID
+    // Check for markdown_text param — try rich text send via bridge
+    let markdownText = stringParam(params["markdown_text"])
+    var sentViaRichText = false
+    if let markdownText, !markdownText.isEmpty, bridgeAvailable {
+      if let attrData = MarkdownComposer.compose(markdownText) {
+        let handle = resolveTypingHandle(
+          recipient: recipient,
+          chatIdentifier: resolvedChatIdentifier,
+          chatGUID: resolvedChatGUID
+        )
+        if let handle {
+          try await IMCoreBridge.shared.sendRichMessage(handle: handle, attributedText: attrData)
+          sentViaRichText = true
+        }
+      }
+    }
+
+    if !sentViaRichText {
+      let sendText =
+        markdownText != nil
+        ? MarkdownComposer.stripMarkdown(markdownText ?? text) : text
+      try sendMessage(
+        MessageSendOptions(
+          recipient: recipient,
+          text: sendText,
+          attachmentPath: file,
+          service: service,
+          region: region,
+          chatIdentifier: resolvedChatIdentifier,
+          chatGUID: resolvedChatGUID
+        )
       )
-    )
+    }
 
     // Turn off typing after send (fire-and-forget)
     if autoTyping && bridgeAvailable {
@@ -415,6 +459,40 @@ final class RPCServer {
       ])
   }
 
+  private func handleGroupCreate(params: [String: Any], id: Any?) async throws {
+    let addresses = stringArrayParam(params["addresses"])
+    if addresses.isEmpty {
+      throw RPCError.invalidParams("addresses is required (array of phone/email)")
+    }
+    guard bridgeAvailable else {
+      throw RPCError.internalError("IMCoreBridge not available")
+    }
+    let name = stringParam(params["name"])
+    let text = stringParam(params["text"])
+    let service = stringParam(params["service"]) ?? "imessage"
+    let result = try await IMCoreBridge.shared.createChat(
+      addresses: addresses,
+      name: name,
+      message: text,
+      service: service
+    )
+    respond(id: id, result: result)
+  }
+
+  private func handleGroupRename(params: [String: Any], id: Any?) async throws {
+    guard let handle = stringParam(params["handle"]), !handle.isEmpty else {
+      throw RPCError.invalidParams("handle is required")
+    }
+    guard let name = stringParam(params["name"]), !name.isEmpty else {
+      throw RPCError.invalidParams("name is required")
+    }
+    guard bridgeAvailable else {
+      throw RPCError.internalError("IMCoreBridge not available")
+    }
+    try await IMCoreBridge.shared.renameChat(handle: handle, name: name)
+    respond(id: id, result: ["ok": true, "handle": handle, "name": name])
+  }
+
   /// Resolve the best handle for typing/read from send params
   private func resolveTypingHandle(recipient: String, chatIdentifier: String, chatGUID: String)
     -> String?
@@ -431,18 +509,22 @@ private func buildMessagePayload(
   store: MessageStore,
   cache: ChatCache,
   message: Message,
-  includeAttachments: Bool
+  includeAttachments: Bool,
+  contactResolver: ContactResolving? = nil
 ) throws -> [String: Any] {
   let chatInfo = try cache.info(chatID: message.chatID)
   let participants = try cache.participants(chatID: message.chatID)
   let attachments = includeAttachments ? try store.attachments(for: message.rowID) : []
   let reactions = includeAttachments ? try store.reactions(for: message.rowID) : []
+  let senderName = message.isFromMe ? nil : contactResolver?.resolve(handle: message.sender)
   return messagePayload(
     message: message,
     chatInfo: chatInfo,
     participants: participants,
     attachments: attachments,
-    reactions: reactions
+    reactions: reactions,
+    senderName: senderName,
+    markdownText: message.markdownText
   )
 }
 

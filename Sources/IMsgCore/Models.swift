@@ -223,6 +223,7 @@ public struct Message: Sendable, Equatable {
   public let replyToGUID: String?
   public let sender: String
   public let text: String
+  public let markdownText: String?
   public let date: Date
   public let isFromMe: Bool
   public let service: String
@@ -240,7 +241,8 @@ public struct Message: Sendable, Equatable {
     handleID: Int64?,
     attachmentsCount: Int,
     guid: String = "",
-    replyToGUID: String? = nil
+    replyToGUID: String? = nil,
+    markdownText: String? = nil
   ) {
     self.rowID = rowID
     self.chatID = chatID
@@ -248,6 +250,7 @@ public struct Message: Sendable, Equatable {
     self.replyToGUID = replyToGUID
     self.sender = sender
     self.text = text
+    self.markdownText = markdownText
     self.date = date
     self.isFromMe = isFromMe
     self.service = service

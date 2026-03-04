@@ -220,4 +220,53 @@ public final class IMCoreBridge: @unchecked Sendable {
   public func getStatus() async throws -> [String: Any] {
     return try await sendCommand(action: "status", params: [:])
   }
+
+  /// Create a new chat with the given addresses
+  public func createChat(
+    addresses: [String],
+    name: String? = nil,
+    message: String? = nil,
+    service: String = "imessage"
+  ) async throws -> [String: Any] {
+    var params: [String: Any] = [
+      "addresses": addresses,
+      "service": service,
+    ]
+    if let name, !name.isEmpty {
+      params["name"] = name
+    }
+    if let message, !message.isEmpty {
+      params["text"] = message
+    }
+    return try await sendCommand(action: "create_chat", params: params)
+  }
+
+  /// Rename an existing chat
+  public func renameChat(handle: String, name: String) async throws {
+    let params: [String: Any] = [
+      "handle": handle,
+      "name": name,
+    ]
+    _ = try await sendCommand(action: "rename_chat", params: params)
+  }
+
+  /// Remove participants from a group chat
+  public func removeParticipant(
+    handle: String, addresses: [String]
+  ) async throws {
+    let params: [String: Any] = [
+      "handle": handle,
+      "addresses": addresses,
+    ]
+    _ = try await sendCommand(action: "remove_participant", params: params)
+  }
+
+  /// Send a rich text message (with attributed text)
+  public func sendRichMessage(handle: String, attributedText: Data) async throws {
+    let params: [String: Any] = [
+      "handle": handle,
+      "attributed_text": attributedText.base64EncodedString(),
+    ]
+    _ = try await sendCommand(action: "send_message", params: params)
+  }
 }

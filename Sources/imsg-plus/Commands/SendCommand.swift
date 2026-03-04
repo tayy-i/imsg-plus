@@ -23,6 +23,11 @@ enum SendCommand {
           .make(
             label: "region", names: [.long("region")],
             help: "default region for phone normalization"),
+        ],
+        flags: [
+          .make(
+            label: "markdown", names: [.long("markdown")],
+            help: "Parse text as markdown and send with formatting")
         ]
       )
     ),
@@ -79,16 +84,54 @@ enum SendCommand {
       throw IMsgError.invalidChatTarget("Missing chat identifier or guid")
     }
 
-    try sendMessage(
-      MessageSendOptions(
-        recipient: recipient,
-        text: text,
-        attachmentPath: file,
-        service: service,
-        region: region,
-        chatIdentifier: resolvedChatIdentifier,
-        chatGUID: resolvedChatGUID
-      ))
+    let useMarkdown = values.flag("markdown")
+
+    // If markdown flag is set and bridge is available, try rich text send
+    if useMarkdown && !text.isEmpty {
+      let bridge = IMCoreBridge.shared
+
+      if bridge.isAvailable,
+        let attrData = MarkdownComposer.compose(text)
+      {
+        let handle =
+          resolvedChatGUID.isEmpty
+          ? (resolvedChatIdentifier.isEmpty ? recipient : resolvedChatIdentifier)
+          : resolvedChatGUID
+        if !handle.isEmpty {
+          try await bridge.sendRichMessage(handle: handle, attributedText: attrData)
+          if runtime.jsonOutput {
+            try JSONLines.print(["status": "sent", "markdown": "true"])
+          } else {
+            Swift.print("sent (with formatting)")
+          }
+          return
+        }
+      }
+
+      // Fallback: strip markdown and send as plain text
+      let plainText = MarkdownComposer.stripMarkdown(text)
+      try sendMessage(
+        MessageSendOptions(
+          recipient: recipient,
+          text: plainText,
+          attachmentPath: file,
+          service: service,
+          region: region,
+          chatIdentifier: resolvedChatIdentifier,
+          chatGUID: resolvedChatGUID
+        ))
+    } else {
+      try sendMessage(
+        MessageSendOptions(
+          recipient: recipient,
+          text: text,
+          attachmentPath: file,
+          service: service,
+          region: region,
+          chatIdentifier: resolvedChatIdentifier,
+          chatGUID: resolvedChatGUID
+        ))
+    }
 
     if runtime.jsonOutput {
       try JSONLines.print(["status": "sent"])
