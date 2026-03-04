@@ -342,6 +342,18 @@ final class RPCServer {
       }
     }
 
+    // Parse optional effect
+    let effectStr = stringParam(params["effect"])
+    var effect: MessageEffect? = nil
+    if let effectStr, !effectStr.isEmpty {
+      guard let parsed = MessageEffect.from(string: effectStr) else {
+        throw RPCError.invalidParams(
+          "invalid effect: '\(effectStr)'. Valid: gentle, loud, slam, invisibleink, confetti, balloons, fireworks, heart, lasers, echo, spotlight, sparkles, shootingstar"
+        )
+      }
+      effect = parsed
+    }
+
     // Check for markdown_text param — try rich text send via bridge
     var sentViaRichText = false
     if let markdownText, !markdownText.isEmpty, bridgeAvailable {
@@ -352,9 +364,23 @@ final class RPCServer {
           chatGUID: resolvedChatGUID
         )
         if let handle {
-          try await IMCoreBridge.shared.sendRichMessage(handle: handle, attributedText: attrData)
+          try await IMCoreBridge.shared.sendRichMessage(
+            handle: handle, attributedText: attrData, effect: effect)
           sentViaRichText = true
         }
+      }
+    }
+
+    // Plain text with effect — send via bridge
+    if !sentViaRichText && effect != nil && bridgeAvailable {
+      let handle = resolveTypingHandle(
+        recipient: recipient,
+        chatIdentifier: resolvedChatIdentifier,
+        chatGUID: resolvedChatGUID
+      )
+      if let handle {
+        try await IMCoreBridge.shared.sendMessage(handle: handle, text: text, effect: effect)
+        sentViaRichText = true
       }
     }
 
@@ -399,7 +425,11 @@ final class RPCServer {
       }
     }
 
-    respond(id: id, result: ["ok": true])
+    var result: [String: Any] = ["ok": true]
+    if let effect {
+      result["effect"] = effect.displayName
+    }
+    respond(id: id, result: result)
   }
 
   private func handleTypingSet(params: [String: Any], id: Any?) async throws {

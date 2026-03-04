@@ -23,6 +23,11 @@ enum SendCommand {
           .make(
             label: "region", names: [.long("region")],
             help: "default region for phone normalization"),
+          .make(
+            label: "effect", names: [.long("effect")],
+            help:
+              "Send effect: gentle, loud, slam, invisibleink, confetti, balloons, fireworks, heart, lasers, echo, spotlight, sparkles, shootingstar"
+          ),
         ],
         flags: [
           .make(
@@ -35,6 +40,7 @@ enum SendCommand {
       "imsg send --to +14155551212 --text \"hi\"",
       "imsg send --to +14155551212 --text \"hi\" --file ~/Desktop/pic.jpg --service imessage",
       "imsg send --chat-id 1 --text \"hi\"",
+      "imsg send --to +14155551212 --text \"happy birthday!\" --effect balloons",
     ]
   ) { values, runtime in
     try await run(values: values, runtime: runtime)
@@ -85,41 +91,71 @@ enum SendCommand {
     }
 
     let useMarkdown = values.flag("markdown")
+    let effectStr = values.option("effect") ?? ""
+    var effect: MessageEffect? = nil
+    if !effectStr.isEmpty {
+      guard let parsed = MessageEffect.from(string: effectStr) else {
+        throw IMsgError.invalidArgument(
+          "Unknown effect '\(effectStr)'. Valid: gentle, loud, slam, invisibleink, confetti, balloons, fireworks, heart, lasers, echo, spotlight, sparkles, shootingstar"
+        )
+      }
+      effect = parsed
+    }
 
-    // If markdown flag is set and bridge is available, try rich text send
-    if useMarkdown && !text.isEmpty {
+    // Effects require the IMCore bridge
+    if effect != nil || (useMarkdown && !text.isEmpty) {
       let bridge = IMCoreBridge.shared
+      let handle =
+        resolvedChatGUID.isEmpty
+        ? (resolvedChatIdentifier.isEmpty ? recipient : resolvedChatIdentifier)
+        : resolvedChatGUID
 
-      if bridge.isAvailable,
-        let attrData = MarkdownComposer.compose(text)
-      {
-        let handle =
-          resolvedChatGUID.isEmpty
-          ? (resolvedChatIdentifier.isEmpty ? recipient : resolvedChatIdentifier)
-          : resolvedChatGUID
-        if !handle.isEmpty {
-          try await bridge.sendRichMessage(handle: handle, attributedText: attrData)
-          if runtime.jsonOutput {
-            try JSONLines.print(["status": "sent", "markdown": "true"])
-          } else {
-            Swift.print("sent (with formatting)")
-          }
-          return
+      if bridge.isAvailable && !handle.isEmpty {
+        if useMarkdown, let attrData = MarkdownComposer.compose(text) {
+          try await bridge.sendRichMessage(
+            handle: handle, attributedText: attrData, effect: effect)
+        } else {
+          try await bridge.sendMessage(handle: handle, text: text, effect: effect)
         }
+        if runtime.jsonOutput {
+          var result: [String: String] = ["status": "sent"]
+          if useMarkdown { result["markdown"] = "true" }
+          if let effect { result["effect"] = effect.displayName }
+          try JSONLines.print(result)
+        } else {
+          var parts = ["sent"]
+          if useMarkdown { parts.append("with formatting") }
+          if let effect { parts.append("with \(effect.displayName) effect") }
+          Swift.print(parts.joined(separator: " "))
+        }
+        return
       }
 
-      // Fallback: strip markdown and send as plain text
-      let plainText = MarkdownComposer.stripMarkdown(text)
-      try sendMessage(
-        MessageSendOptions(
-          recipient: recipient,
-          text: plainText,
-          attachmentPath: file,
-          service: service,
-          region: region,
-          chatIdentifier: resolvedChatIdentifier,
-          chatGUID: resolvedChatGUID
-        ))
+      // Fallback when bridge unavailable: strip markdown, skip effect
+      if useMarkdown {
+        let plainText = MarkdownComposer.stripMarkdown(text)
+        try sendMessage(
+          MessageSendOptions(
+            recipient: recipient,
+            text: plainText,
+            attachmentPath: file,
+            service: service,
+            region: region,
+            chatIdentifier: resolvedChatIdentifier,
+            chatGUID: resolvedChatGUID
+          ))
+      } else {
+        try sendMessage(
+          MessageSendOptions(
+            recipient: recipient,
+            text: text,
+            attachmentPath: file,
+            service: service,
+            region: region,
+            chatIdentifier: resolvedChatIdentifier,
+            chatGUID: resolvedChatGUID
+          ))
+      }
     } else {
       try sendMessage(
         MessageSendOptions(

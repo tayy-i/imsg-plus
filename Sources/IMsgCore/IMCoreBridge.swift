@@ -148,6 +148,73 @@ public enum TapbackType: Sendable, Equatable {
   }
 }
 
+/// iMessage send effects (bubble and screen animations)
+///
+/// These values correspond to Apple's `expressive_send_style_id` column in the Messages database.
+/// Bubble effects animate the individual message bubble; screen effects fill the entire screen.
+public enum MessageEffect: String, Sendable, Equatable, CaseIterable {
+  // Bubble effects
+  case gentle, slam, loud, invisibleInk
+  // Screen effects
+  case confetti, balloons, fireworks, heart, lasers, echo, spotlight, sparkles, shootingStar
+
+  public var expressiveSendStyleId: String {
+    switch self {
+    case .gentle: return "com.apple.MobileSMS.expressivesend.gentle"
+    case .slam: return "com.apple.MobileSMS.expressivesend.impact"
+    case .loud: return "com.apple.MobileSMS.expressivesend.loud"
+    case .invisibleInk: return "com.apple.MobileSMS.expressivesend.invisibleink"
+    case .confetti: return "com.apple.messages.effect.CKConfettiEffect"
+    case .balloons: return "com.apple.messages.effect.CKHappyBirthdayEffect"
+    case .fireworks: return "com.apple.messages.effect.CKFireworksEffect"
+    case .heart: return "com.apple.messages.effect.CKHeartEffect"
+    case .lasers: return "com.apple.messages.effect.CKLasersEffect"
+    case .echo: return "com.apple.messages.effect.CKEchoEffect"
+    case .spotlight: return "com.apple.messages.effect.CKSpotlightEffect"
+    case .sparkles: return "com.apple.messages.effect.CKSparklesEffect"
+    case .shootingStar: return "com.apple.messages.effect.CKShootingStarEffect"
+    }
+  }
+
+  public var displayName: String {
+    switch self {
+    case .gentle: return "gentle"
+    case .slam: return "slam"
+    case .loud: return "loud"
+    case .invisibleInk: return "invisibleink"
+    case .confetti: return "confetti"
+    case .balloons: return "balloons"
+    case .fireworks: return "fireworks"
+    case .heart: return "heart"
+    case .lasers: return "lasers"
+    case .echo: return "echo"
+    case .spotlight: return "spotlight"
+    case .sparkles: return "sparkles"
+    case .shootingStar: return "shootingstar"
+    }
+  }
+
+  public static func from(string: String) -> MessageEffect? {
+    let lower = string.lowercased()
+    switch lower {
+    case "gentle": return .gentle
+    case "slam": return .slam
+    case "loud": return .loud
+    case "invisibleink": return .invisibleInk
+    case "confetti": return .confetti
+    case "balloons": return .balloons
+    case "fireworks": return .fireworks
+    case "heart": return .heart
+    case "lasers": return .lasers
+    case "echo": return .echo
+    case "spotlight": return .spotlight
+    case "sparkles": return .sparkles
+    case "shootingstar": return .shootingStar
+    default: return nil
+    }
+  }
+}
+
 public enum IMCoreBridgeError: Error, CustomStringConvertible {
   case frameworkNotAvailable
   case dylibNotFound
@@ -363,12 +430,26 @@ public final class IMCoreBridge: @unchecked Sendable {
     _ = try await sendCommand(action: "remove_participant", params: params)
   }
 
-  /// Send a rich text message (with attributed text)
-  public func sendRichMessage(handle: String, attributedText: Data) async throws {
-    let params: [String: Any] = [
+  /// Send a rich text message (with attributed text and optional effect)
+  public func sendRichMessage(handle: String, attributedText: Data, effect: MessageEffect? = nil)
+    async throws
+  {
+    var params: [String: Any] = [
       "handle": handle,
       "attributed_text": attributedText.base64EncodedString(),
     ]
+    if let effect {
+      params["effect_id"] = effect.expressiveSendStyleId
+    }
+    _ = try await sendCommand(action: "send_message", params: params)
+  }
+
+  /// Send a plain text message with an effect via IMCore bridge
+  public func sendMessage(handle: String, text: String, effect: MessageEffect? = nil) async throws {
+    var params: [String: Any] = ["handle": handle, "text": text]
+    if let effect {
+      params["effect_id"] = effect.expressiveSendStyleId
+    }
     _ = try await sendCommand(action: "send_message", params: params)
   }
 }

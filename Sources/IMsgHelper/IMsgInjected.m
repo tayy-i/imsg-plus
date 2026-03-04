@@ -1097,6 +1097,16 @@ static NSDictionary* handleSendRichMessage(NSInteger requestId, NSDictionary *pa
             return errorResponse(requestId, @"Failed to create IMMessage");
         }
 
+        // Set expressive send effect if provided
+        NSString *effectId = params[@"effect_id"];
+        if (effectId) {
+            @try {
+                [msg setValue:effectId forKey:@"expressiveSendStyleID"];
+            } @catch (NSException *e) {
+                NSLog(@"[imsg-plus] Could not set expressiveSendStyleID: %@", e.reason);
+            }
+        }
+
         SEL sendSel = @selector(sendMessage:);
         if (![chat respondsToSelector:sendSel]) {
             return errorResponse(requestId, @"Chat does not respond to sendMessage:");
