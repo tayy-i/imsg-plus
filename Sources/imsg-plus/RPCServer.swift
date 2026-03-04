@@ -280,7 +280,7 @@ final class RPCServer {
     let text = stringParam(params["text"]) ?? ""
     let file = stringParam(params["file"]) ?? ""
     let serviceRaw = stringParam(params["service"]) ?? "auto"
-    guard let service = MessageService(rawValue: serviceRaw) else {
+    guard let service = MessageService(rawValue: serviceRaw.lowercased()) else {
       throw RPCError.invalidParams("invalid service")
     }
     let region = stringParam(params["region"]) ?? "US"
@@ -297,8 +297,9 @@ final class RPCServer {
       throw RPCError.invalidParams("to is required for direct sends")
     }
 
-    if text.isEmpty && file.isEmpty {
-      throw RPCError.invalidParams("text or file is required")
+    let markdownText = stringParam(params["markdown_text"])
+    if text.isEmpty && file.isEmpty && (markdownText ?? "").isEmpty {
+      throw RPCError.invalidParams("text, markdown_text, or file is required")
     }
 
     var resolvedChatIdentifier = chatIdentifier
@@ -342,7 +343,6 @@ final class RPCServer {
     }
 
     // Check for markdown_text param — try rich text send via bridge
-    let markdownText = stringParam(params["markdown_text"])
     var sentViaRichText = false
     if let markdownText, !markdownText.isEmpty, bridgeAvailable {
       if let attrData = MarkdownComposer.compose(markdownText) {
