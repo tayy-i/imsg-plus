@@ -436,27 +436,29 @@ final class RPCServer {
     }
     guard let typeStr = stringParam(params["type"]), !typeStr.isEmpty else {
       throw RPCError.invalidParams(
-        "type is required (love, thumbsup, thumbsdown, haha, emphasis, question)")
+        "type is required (love, thumbsup, thumbsdown, haha, emphasis, question, or any emoji)")
     }
     let remove = boolParam(params["remove"]) ?? false
     guard let tapbackType = TapbackType.from(string: typeStr, remove: remove) else {
       throw RPCError.invalidParams(
-        "invalid reaction type: '\(typeStr)'. Valid: love, thumbsup, thumbsdown, haha, emphasis, question"
+        "invalid reaction type: '\(typeStr)'. Valid: love, thumbsup, thumbsdown, haha, emphasis, question, or any emoji"
       )
     }
     guard bridgeAvailable else {
       throw RPCError.internalError("IMCoreBridge not available")
     }
     try await IMCoreBridge.shared.sendTapback(to: handle, messageGUID: guid, type: tapbackType)
-    respond(
-      id: id,
-      result: [
-        "ok": true,
-        "handle": handle,
-        "guid": guid,
-        "type": tapbackType.displayName,
-        "action": remove ? "removed" : "added",
-      ])
+    var result: [String: Any] = [
+      "ok": true,
+      "handle": handle,
+      "guid": guid,
+      "type": tapbackType.displayName,
+      "action": remove ? "removed" : "added",
+    ]
+    if tapbackType.isCustom {
+      result["emoji"] = tapbackType.emoji
+    }
+    respond(id: id, result: result)
   }
 
   private func handleGroupCreate(params: [String: Any], id: Any?) async throws {

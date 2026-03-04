@@ -3,25 +3,47 @@ import Foundation
 /// Tapback reaction types for iMessage
 ///
 /// These values correspond to Apple's IMCore framework's `associatedMessageType` field.
-/// - 2000-2005: Add tapback reactions (love, thumbsup, thumbsdown, haha, emphasis, question)
-/// - 3000-3005: Remove tapback reactions (add 1000 to the base type)
+/// - 2000-2005: Add standard tapback reactions (love, thumbsup, thumbsdown, haha, emphasis, question)
+/// - 2006: Add custom emoji reaction
+/// - 3000-3006: Remove tapback reactions (add 1000 to the base type)
 ///
 /// Source: BlueBubbles IMCore documentation
 /// https://docs.bluebubbles.app/private-api/imcore-documentation
-public enum TapbackType: Int, Sendable {
-  case love = 2000
-  case thumbsUp = 2001
-  case thumbsDown = 2002
-  case haha = 2003
-  case emphasis = 2004
-  case question = 2005
+public enum TapbackType: Sendable, Equatable {
+  case love
+  case thumbsUp
+  case thumbsDown
+  case haha
+  case emphasis
+  case question
+  case customEmoji(String)
 
-  case removeLove = 3000
-  case removeThumbsUp = 3001
-  case removeThumbsDown = 3002
-  case removeHaha = 3003
-  case removeEmphasis = 3004
-  case removeQuestion = 3005
+  case removeLove
+  case removeThumbsUp
+  case removeThumbsDown
+  case removeHaha
+  case removeEmphasis
+  case removeQuestion
+  case removeCustomEmoji(String)
+
+  public var rawValue: Int {
+    switch self {
+    case .love: return 2000
+    case .thumbsUp: return 2001
+    case .thumbsDown: return 2002
+    case .haha: return 2003
+    case .emphasis: return 2004
+    case .question: return 2005
+    case .customEmoji: return 2006
+    case .removeLove: return 3000
+    case .removeThumbsUp: return 3001
+    case .removeThumbsDown: return 3002
+    case .removeHaha: return 3003
+    case .removeEmphasis: return 3004
+    case .removeQuestion: return 3005
+    case .removeCustomEmoji: return 3006
+    }
+  }
 
   public var displayName: String {
     switch self {
@@ -31,20 +53,98 @@ public enum TapbackType: Int, Sendable {
     case .haha, .removeHaha: return "haha"
     case .emphasis, .removeEmphasis: return "emphasis"
     case .question, .removeQuestion: return "question"
+    case .customEmoji(let emoji), .removeCustomEmoji(let emoji): return emoji
     }
   }
 
-  public static func from(string: String, remove: Bool = false) -> TapbackType? {
-    let offset = remove ? 1000 : 0
-    switch string.lowercased() {
-    case "love", "heart": return TapbackType(rawValue: 2000 + offset)
-    case "thumbsup", "like": return TapbackType(rawValue: 2001 + offset)
-    case "thumbsdown", "dislike": return TapbackType(rawValue: 2002 + offset)
-    case "haha", "laugh": return TapbackType(rawValue: 2003 + offset)
-    case "emphasis", "exclaim", "!!": return TapbackType(rawValue: 2004 + offset)
-    case "question", "?": return TapbackType(rawValue: 2005 + offset)
+  /// Emoji representation of this tapback
+  public var emoji: String {
+    switch self {
+    case .love, .removeLove: return "❤️"
+    case .thumbsUp, .removeThumbsUp: return "👍"
+    case .thumbsDown, .removeThumbsDown: return "👎"
+    case .haha, .removeHaha: return "😂"
+    case .emphasis, .removeEmphasis: return "‼️"
+    case .question, .removeQuestion: return "❓"
+    case .customEmoji(let emoji), .removeCustomEmoji(let emoji): return emoji
+    }
+  }
+
+  /// Whether this is a custom emoji tapback (not one of the 6 standard types)
+  public var isCustom: Bool {
+    switch self {
+    case .customEmoji, .removeCustomEmoji: return true
+    default: return false
+    }
+  }
+
+  /// The custom emoji string, or nil for standard tapbacks
+  public var customEmojiString: String? {
+    switch self {
+    case .customEmoji(let emoji), .removeCustomEmoji(let emoji): return emoji
     default: return nil
     }
+  }
+
+  /// Whether this is a removal tapback
+  public var isRemoval: Bool {
+    return rawValue >= 3000
+  }
+
+  public static func from(string: String, remove: Bool = false) -> TapbackType? {
+    // Check standard type names first (case-insensitive)
+    let lower = string.lowercased()
+    switch lower {
+    case "love", "heart":
+      return remove ? .removeLove : .love
+    case "thumbsup", "like":
+      return remove ? .removeThumbsUp : .thumbsUp
+    case "thumbsdown", "dislike":
+      return remove ? .removeThumbsDown : .thumbsDown
+    case "haha", "laugh":
+      return remove ? .removeHaha : .haha
+    case "emphasis", "exclaim", "!!":
+      return remove ? .removeEmphasis : .emphasis
+    case "question", "?":
+      return remove ? .removeQuestion : .question
+    default:
+      break
+    }
+
+    // Check standard emoji characters → map to standard types
+    let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+    switch trimmed {
+    case "❤️", "❤":
+      return remove ? .removeLove : .love
+    case "👍":
+      return remove ? .removeThumbsUp : .thumbsUp
+    case "👎":
+      return remove ? .removeThumbsDown : .thumbsDown
+    case "😂":
+      return remove ? .removeHaha : .haha
+    case "‼️", "‼":
+      return remove ? .removeEmphasis : .emphasis
+    case "❓":
+      return remove ? .removeQuestion : .question
+    default:
+      break
+    }
+
+    // Fall through to custom emoji check
+    if containsEmoji(trimmed) {
+      return remove ? .removeCustomEmoji(trimmed) : .customEmoji(trimmed)
+    }
+
+    return nil
+  }
+
+  private static func containsEmoji(_ value: String) -> Bool {
+    for scalar in value.unicodeScalars {
+      if scalar.properties.isEmojiPresentation || scalar.properties.isEmoji {
+        return true
+      }
+    }
+    return false
   }
 }
 
@@ -152,12 +252,14 @@ public final class IMCoreBridge: @unchecked Sendable {
     messageGUID: String,
     type: TapbackType
   ) async throws {
-    let params =
-      [
-        "handle": handle,
-        "guid": messageGUID,
-        "type": type.rawValue,
-      ] as [String: Any]
+    var params: [String: Any] = [
+      "handle": handle,
+      "guid": messageGUID,
+      "type": type.rawValue,
+    ]
+    if let emoji = type.customEmojiString {
+      params["emoji"] = emoji
+    }
 
     _ = try await sendCommand(action: "react", params: params)
   }

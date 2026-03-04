@@ -7,16 +7,18 @@ enum ReactCommand {
     name: "react",
     abstract: "Send tapback reactions to messages",
     discussion: """
-      Add or remove tapback reactions (love, like, dislike, laugh, emphasis, question)
-      to specific messages. Use the message GUID from history or watch commands.
+      Add or remove tapback reactions to specific messages. Use the message GUID
+      from history or watch commands.
 
-      Reaction types:
+      Standard reaction types:
       • love/heart - ❤️
       • thumbsup/like - 👍
       • thumbsdown/dislike - 👎
       • haha/laugh - 😂
       • emphasis/!! - ‼️
       • question/? - ❓
+
+      You can also use any emoji as a custom reaction (e.g. 🎉, 🔥, 👀).
 
       Add --remove flag to remove an existing reaction.
 
@@ -31,7 +33,7 @@ enum ReactCommand {
           .make(label: "guid", names: [.long("guid")], help: "Message GUID to react to"),
           .make(
             label: "type", names: [.long("type")],
-            help: "Reaction type: love, thumbsup, thumbsdown, haha, emphasis, question"),
+            help: "Reaction type: love, thumbsup, thumbsdown, haha, emphasis, question, or any emoji"),
         ],
         flags: [
           .make(
@@ -45,6 +47,7 @@ enum ReactCommand {
       "imsg-plus react --handle john@example.com --guid XYZ789 --type thumbsup",
       "imsg-plus react --handle +14155551234 --guid ABC123-456 --type haha --remove",
       "imsg-plus react --handle chat123456789 --guid MSG-001 --type question",
+      "imsg-plus react --handle +14155551234 --guid ABC123-456 --type 🎉",
     ]
   ) { values, runtime in
     try await run(values: values, runtime: runtime)
@@ -66,7 +69,7 @@ enum ReactCommand {
       throw IMsgError.invalidArgument(
         """
         Invalid reaction type: '\(typeStr)'
-        Valid types: love, thumbsup, thumbsdown, haha, emphasis, question
+        Valid types: love, thumbsup, thumbsdown, haha, emphasis, question, or any emoji
         """)
     }
 
@@ -84,7 +87,7 @@ enum ReactCommand {
       try await bridge.sendTapback(to: handle, messageGUID: guid, type: tapbackType)
 
       let action = remove ? "removed" : "added"
-      let emoji = emojiForTapback(tapbackType)
+      let emoji = tapbackType.emoji
 
       if runtime.jsonOutput {
         let output: [String: Any] = [
@@ -117,14 +120,4 @@ enum ReactCommand {
     }
   }
 
-  private static func emojiForTapback(_ type: TapbackType) -> String {
-    switch type {
-    case .love, .removeLove: return "❤️"
-    case .thumbsUp, .removeThumbsUp: return "👍"
-    case .thumbsDown, .removeThumbsDown: return "👎"
-    case .haha, .removeHaha: return "😂"
-    case .emphasis, .removeEmphasis: return "‼️"
-    case .question, .removeQuestion: return "❓"
-    }
-  }
 }

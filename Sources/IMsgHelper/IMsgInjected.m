@@ -371,6 +371,7 @@ static NSDictionary* handleReact(NSInteger requestId, NSDictionary *params) {
     NSString *handle = params[@"handle"];
     NSString *messageGUID = params[@"guid"];
     NSNumber *type = params[@"type"];
+    NSString *emoji = params[@"emoji"];  // Custom emoji string (for type 2006/3006)
     NSNumber *partIndexNum = params[@"partIndex"];
     int partIndex = partIndexNum ? [partIndexNum intValue] : 0;
 
@@ -490,12 +491,22 @@ static NSDictionary* handleReact(NSInteger requestId, NSDictionary *params) {
                 NSLog(@"[imsg-plus] associatedGuid: %@", associatedGuid);
 
                 // Build message summary info
-                NSDictionary *messageSummary = @{@"amc": @1, @"ams": summaryText};
+                NSMutableDictionary *messageSummary = [@{@"amc": @1, @"ams": summaryText} mutableCopy];
+                if (emoji && (reactionType == 2006 || reactionType == 3006)) {
+                    messageSummary[@"ame"] = emoji;
+                }
 
-                // Build the reaction text: "Loved "message text""
-                NSString *verb = reactionVerb(reactionType);
-                NSString *reactionString = [verb stringByAppendingString:
-                    [NSString stringWithFormat:@"\u201c%@\u201d", summaryText]];
+                // Build the reaction text
+                NSString *reactionString;
+                if (emoji && (reactionType == 2006 || reactionType == 3006)) {
+                    // Custom emoji: "Reacted 🎉 to "message text""
+                    reactionString = [NSString stringWithFormat:@"Reacted %@ to \u201c%@\u201d", emoji, summaryText];
+                } else {
+                    // Standard tapback: "Loved "message text""
+                    NSString *verb = reactionVerb(reactionType);
+                    reactionString = [verb stringByAppendingString:
+                        [NSString stringWithFormat:@"\u201c%@\u201d", summaryText]];
+                }
                 NSMutableAttributedString *reactionText =
                     [[NSMutableAttributedString alloc] initWithString:reactionString];
 
@@ -589,6 +600,23 @@ static NSDictionary* handleReact(NSInteger requestId, NSDictionary *params) {
 
                 NSLog(@"[imsg-plus] Created reaction message: %@ (class: %@)", reactionMessage, [reactionMessage class]);
 
+                // Set associated emoji for custom emoji reactions (type 2006/3006)
+                if (emoji && (reactionType == 2006 || reactionType == 3006)) {
+                    @try {
+                        [reactionMessage setValue:emoji forKey:@"associatedMessageEmoji"];
+                        NSLog(@"[imsg-plus] Set associatedMessageEmoji = %@", emoji);
+                    } @catch (NSException *e) {
+                        NSLog(@"[imsg-plus] ⚠️ Could not set associatedMessageEmoji via KVC: %@", e.reason);
+                        // Try underscore-prefixed ivar as fallback
+                        @try {
+                            [reactionMessage setValue:emoji forKey:@"_associatedMessageEmoji"];
+                            NSLog(@"[imsg-plus] Set _associatedMessageEmoji = %@", emoji);
+                        } @catch (NSException *e2) {
+                            NSLog(@"[imsg-plus] ⚠️ Could not set _associatedMessageEmoji either: %@", e2.reason);
+                        }
+                    }
+                }
+
                 // Send the reaction message
                 SEL sendSel = @selector(sendMessage:);
                 if (![chat respondsToSelector:sendSel]) {
@@ -599,14 +627,18 @@ static NSDictionary* handleReact(NSInteger requestId, NSDictionary *params) {
                 [chat performSelector:sendSel withObject:reactionMessage];
                 NSLog(@"[imsg-plus] ✅ Sent reaction message via sendMessage:");
 
-                writeResponseToFile(successResponse(requestId, @{
+                NSMutableDictionary *resultDict = [@{
                     @"handle": handle,
                     @"guid": messageGUID,
                     @"type": type,
                     @"partIndex": @(partIndex),
                     @"action": reactionType >= 3000 ? @"removed" : @"added",
                     @"method": @"createMessage_BlueBubbles"
-                }));
+                } mutableCopy];
+                if (emoji) {
+                    resultDict[@"emoji"] = emoji;
+                }
+                writeResponseToFile(successResponse(requestId, resultDict));
             } @catch (NSException *exception) {
                 NSLog(@"[imsg-plus] ❌ Exception in react completion: %@\n%@", exception.reason, exception.callStackSymbols);
                 writeResponseToFile(errorResponse(requestId,

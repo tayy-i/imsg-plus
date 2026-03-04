@@ -77,6 +77,9 @@ install: build-dylib
 	@mkdir -p /usr/local/bin /usr/local/lib
 	@cp .build/release/imsg-plus /usr/local/bin/imsg-plus
 	@cp .build/release/imsg-plus-helper.dylib /usr/local/lib/imsg-plus-helper.dylib
+	@echo "Re-signing binaries (required after copy to avoid macOS killing them)..."
+	@codesign -f -s - /usr/local/bin/imsg-plus
+	@codesign -f -s - /usr/local/lib/imsg-plus-helper.dylib
 	@echo "✅ Installed! You can now run 'imsg-plus' from anywhere"
 	@echo ""
 	@echo "To enable advanced features (typing, read receipts, tapbacks):"
