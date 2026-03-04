@@ -8,9 +8,10 @@ func chatPayload(
   name: String,
   service: String,
   lastMessageAt: Date,
-  participants: [String]
+  participants: [String],
+  participantNames: [String: String]? = nil
 ) -> [String: Any] {
-  return [
+  var payload: [String: Any] = [
     "id": id,
     "identifier": identifier,
     "guid": guid,
@@ -20,6 +21,10 @@ func chatPayload(
     "participants": participants,
     "is_group": isGroupHandle(identifier: identifier, guid: guid),
   ]
+  if let participantNames, !participantNames.isEmpty {
+    payload["participant_names"] = participantNames
+  }
+  return payload
 }
 
 func messagePayload(
@@ -27,7 +32,9 @@ func messagePayload(
   chatInfo: ChatInfo?,
   participants: [String],
   attachments: [AttachmentMeta],
-  reactions: [Reaction]
+  reactions: [Reaction],
+  senderName: String? = nil,
+  markdownText: String? = nil
 ) -> [String: Any] {
   let identifier = chatInfo?.identifier ?? ""
   let guid = chatInfo?.guid ?? ""
@@ -41,7 +48,7 @@ func messagePayload(
     "text": message.text,
     "created_at": CLIISO8601.format(message.date),
     "attachments": attachments.map { attachmentPayload($0) },
-    "reactions": reactions.map { reactionPayload($0) },
+    "reactions": reactions.map { reactionPayload($0, senderName: nil) },
     "chat_identifier": identifier,
     "chat_guid": guid,
     "chat_name": name,
@@ -50,6 +57,12 @@ func messagePayload(
   ]
   if let replyToGUID = message.replyToGUID, !replyToGUID.isEmpty {
     payload["reply_to_guid"] = replyToGUID
+  }
+  if let senderName, !senderName.isEmpty {
+    payload["sender_name"] = senderName
+  }
+  if let markdownText, !markdownText.isEmpty {
+    payload["markdown_text"] = markdownText
   }
   return payload
 }
@@ -67,8 +80,8 @@ func attachmentPayload(_ meta: AttachmentMeta) -> [String: Any] {
   ]
 }
 
-func reactionPayload(_ reaction: Reaction) -> [String: Any] {
-  return [
+func reactionPayload(_ reaction: Reaction, senderName: String? = nil) -> [String: Any] {
+  var payload: [String: Any] = [
     "id": reaction.rowID,
     "type": reaction.reactionType.name,
     "emoji": reaction.reactionType.emoji,
@@ -76,6 +89,10 @@ func reactionPayload(_ reaction: Reaction) -> [String: Any] {
     "is_from_me": reaction.isFromMe,
     "created_at": CLIISO8601.format(reaction.date),
   ]
+  if let senderName, !senderName.isEmpty {
+    payload["sender_name"] = senderName
+  }
+  return payload
 }
 
 func isGroupHandle(identifier: String, guid: String) -> Bool {

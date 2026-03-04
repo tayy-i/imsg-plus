@@ -30,6 +30,9 @@ enum StatusCommand {
         "typing_indicators": availability.available,
         "read_receipts": availability.available,
         "tapback_reactions": availability.available,
+        "create_chat": availability.available,
+        "rename_chat": availability.available,
+        "rich_text_send": availability.available,
         "message": availability.message,
       ]
       print(JSONSerialization.string(from: output))

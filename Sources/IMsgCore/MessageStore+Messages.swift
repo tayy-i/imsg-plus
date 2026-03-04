@@ -74,9 +74,16 @@ extension MessageStore {
         let associatedType = intValue(row[11])
         let attachments = intValue(row[12]) ?? 0
         let body = dataValue(row[13])
-        var resolvedText = text.isEmpty ? TypedStreamParser.parseAttributedBody(body) : text
+        var resolvedText = text
+        var markdownText: String?
+        if text.isEmpty {
+          let parsed = AttributedBodyParser.parse(body)
+          resolvedText = parsed.plainText
+          markdownText = parsed.markdown != parsed.plainText ? parsed.markdown : nil
+        }
         if isAudioMessage, let transcription = try audioTranscription(for: rowID) {
           resolvedText = transcription
+          markdownText = nil
         }
         let replyToGUID = replyToGUID(
           associatedGuid: associatedGuid,
@@ -94,7 +101,8 @@ extension MessageStore {
             handleID: handleID,
             attachmentsCount: attachments,
             guid: guid,
-            replyToGUID: replyToGUID
+            replyToGUID: replyToGUID,
+            markdownText: markdownText
           ))
       }
       return messages
@@ -152,9 +160,16 @@ extension MessageStore {
         let associatedType = intValue(row[12])
         let attachments = intValue(row[13]) ?? 0
         let body = dataValue(row[14])
-        var resolvedText = text.isEmpty ? TypedStreamParser.parseAttributedBody(body) : text
+        var resolvedText = text
+        var markdownText: String?
+        if text.isEmpty {
+          let parsed = AttributedBodyParser.parse(body)
+          resolvedText = parsed.plainText
+          markdownText = parsed.markdown != parsed.plainText ? parsed.markdown : nil
+        }
         if isAudioMessage, let transcription = try audioTranscription(for: rowID) {
           resolvedText = transcription
+          markdownText = nil
         }
         let replyToGUID = replyToGUID(
           associatedGuid: associatedGuid,
@@ -172,7 +187,8 @@ extension MessageStore {
             handleID: handleID,
             attachmentsCount: attachments,
             guid: guid,
-            replyToGUID: replyToGUID
+            replyToGUID: replyToGUID,
+            markdownText: markdownText
           ))
       }
       return messages

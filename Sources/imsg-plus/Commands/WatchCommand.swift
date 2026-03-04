@@ -70,6 +70,7 @@ enum WatchCommand {
     )
 
     let store = try storeFactory(dbPath)
+    let resolver = ContactResolver()
     let watcher = MessageWatcher(store: store)
     let config = MessageWatcherConfiguration(
       debounceInterval: debounceInterval,
@@ -84,17 +85,26 @@ enum WatchCommand {
       if runtime.jsonOutput {
         let attachments = try store.attachments(for: message.rowID)
         let reactions = try store.reactions(for: message.rowID)
+        let senderName = message.isFromMe ? nil : resolver.resolve(handle: message.sender)
         let payload = MessagePayload(
           message: message,
           attachments: attachments,
-          reactions: reactions
+          reactions: reactions,
+          senderName: senderName,
+          markdownText: message.markdownText
         )
         try JSONLines.print(payload)
         continue
       }
       let direction = message.isFromMe ? "sent" : "recv"
       let timestamp = CLIISO8601.format(message.date)
-      Swift.print("\(timestamp) [\(direction)] \(message.sender): \(message.text)")
+      let senderDisplay: String
+      if let name = resolver.resolve(handle: message.sender) {
+        senderDisplay = "\(name) (\(message.sender))"
+      } else {
+        senderDisplay = message.sender
+      }
+      Swift.print("\(timestamp) [\(direction)] \(senderDisplay): \(message.text)")
       if message.attachmentsCount > 0 {
         if showAttachments {
           let metas = try store.attachments(for: message.rowID)

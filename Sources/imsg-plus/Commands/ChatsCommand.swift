@@ -25,8 +25,16 @@ enum ChatsCommand {
     let chats = try store.listChats(limit: limit)
 
     if runtime.jsonOutput {
+      let resolver = ContactResolver()
       for chat in chats {
-        try JSONLines.print(ChatPayload(chat: chat))
+        let participants = (try? store.participants(chatID: chat.id)) ?? []
+        var names: [String: String] = [:]
+        for handle in participants {
+          if let name = resolver.resolve(handle: handle) {
+            names[handle] = name
+          }
+        }
+        try JSONLines.print(ChatPayload(chat: chat, participantNames: names.isEmpty ? nil : names))
       }
       return
     }

@@ -46,16 +46,20 @@ enum HistoryCommand {
     )
 
     let store = try MessageStore(path: dbPath)
+    let resolver = ContactResolver()
     let filtered = try store.messages(chatID: chatID, limit: limit, filter: filter)
 
     if runtime.jsonOutput {
       for message in filtered {
         let attachments = try store.attachments(for: message.rowID)
         let reactions = try store.reactions(for: message.rowID)
+        let senderName = message.isFromMe ? nil : resolver.resolve(handle: message.sender)
         let payload = MessagePayload(
           message: message,
           attachments: attachments,
-          reactions: reactions
+          reactions: reactions,
+          senderName: senderName,
+          markdownText: message.markdownText
         )
         try JSONLines.print(payload)
       }
@@ -65,7 +69,13 @@ enum HistoryCommand {
     for message in filtered {
       let direction = message.isFromMe ? "sent" : "recv"
       let timestamp = CLIISO8601.format(message.date)
-      Swift.print("\(timestamp) [\(direction)] \(message.sender): \(message.text)")
+      let senderDisplay: String
+      if let name = resolver.resolve(handle: message.sender) {
+        senderDisplay = "\(name) (\(message.sender))"
+      } else {
+        senderDisplay = message.sender
+      }
+      Swift.print("\(timestamp) [\(direction)] \(senderDisplay): \(message.text)")
       if message.attachmentsCount > 0 {
         if showAttachments {
           let metas = try store.attachments(for: message.rowID)

@@ -22,20 +22,30 @@ struct MessageEvent: WatchEvent {
   let guid: String
   let replyToGUID: String?
   let sender: String
+  let senderName: String?
   let isFromMe: Bool
   let text: String
+  let markdownText: String?
   let attachments: [AttachmentPayload]
   let reactions: [ReactionPayload]
 
-  init(message: Message, attachments: [AttachmentMeta], reactions: [Reaction]) {
+  init(
+    message: Message,
+    attachments: [AttachmentMeta],
+    reactions: [Reaction],
+    senderName: String? = nil,
+    markdownText: String? = nil
+  ) {
     self.timestamp = CLIISO8601.format(Date())
     self.id = message.rowID
     self.chatID = message.chatID
     self.guid = message.guid
     self.replyToGUID = message.replyToGUID
     self.sender = message.sender
+    self.senderName = senderName
     self.isFromMe = message.isFromMe
     self.text = message.text
+    self.markdownText = markdownText
     self.attachments = attachments.map { AttachmentPayload(meta: $0) }
     self.reactions = reactions.map { ReactionPayload(reaction: $0) }
   }
@@ -48,8 +58,10 @@ struct MessageEvent: WatchEvent {
     case guid
     case replyToGUID = "reply_to_guid"
     case sender
+    case senderName = "sender_name"
     case isFromMe = "is_from_me"
     case text
+    case markdownText = "markdown_text"
     case attachments
     case reactions
   }

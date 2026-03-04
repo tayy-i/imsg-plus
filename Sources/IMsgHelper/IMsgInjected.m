@@ -39,19 +39,37 @@ static void initFilePaths(void) {
 - (id)existingChatWithGUID:(NSString *)guid;
 - (id)existingChatWithChatIdentifier:(NSString *)identifier;
 - (NSArray *)allExistingChats;
+- (id)chatForIMHandles:(NSArray *)handles;
 @end
 
 @interface IMChat : NSObject
 - (void)setLocalUserIsTyping:(BOOL)typing;
 - (void)markAllMessagesAsRead;
 - (id)messageForGUID:(NSString *)guid;
+- (void)sendMessage:(id)message;
 - (NSArray *)participants;
 - (NSString *)guid;
 - (NSString *)chatIdentifier;
+- (NSString *)displayName;
+- (void)_setDisplayName:(NSString *)name;
 @end
 
 @interface IMHandle : NSObject
 - (NSString *)ID;
+@end
+
+@interface IMServiceImpl : NSObject
++ (instancetype)iMessageService;
++ (instancetype)smsService;
+@end
+
+@interface IMAccount : NSObject
+- (id)imHandleWithID:(NSString *)handleID;
+@end
+
+@interface IMAccountController : NSObject
++ (instancetype)sharedInstance;
+- (id)bestAccountForService:(id)service;
 @end
 
 #pragma mark - Runtime Method Injection
@@ -635,13 +653,20 @@ static NSDictionary* handleStatus(NSInteger requestId, NSDictionary *params) {
         }
     }
 
+    BOOL hasAccountController = (NSClassFromString(@"IMAccountController") != nil);
+    BOOL hasServiceImpl = (NSClassFromString(@"IMServiceImpl") != nil);
+    BOOL canCreateChat = hasRegistry && hasAccountController && hasServiceImpl;
+
     return successResponse(requestId, @{
         @"injected": @YES,
         @"registry_available": @(hasRegistry),
         @"chat_count": @(chatCount),
         @"typing_available": @(hasRegistry),
         @"read_available": @(hasRegistry),
-        @"tapback_available": @(hasRegistry)
+        @"tapback_available": @(hasRegistry),
+        @"create_chat_available": @(canCreateChat),
+        @"rename_chat_available": @(hasRegistry),
+        @"send_message_available": @(hasRegistry)
     });
 }
 
@@ -690,6 +715,373 @@ static NSDictionary* handleListChats(NSInteger requestId, NSDictionary *params) 
     });
 }
 
+static NSDictionary* handleCreateChat(NSInteger requestId, NSDictionary *params) {
+    NSArray *addresses = params[@"addresses"];
+    NSString *name = params[@"name"];
+    NSString *text = params[@"text"];
+    NSString *serviceHint = params[@"service"] ?: @"imessage";
+
+    if (!addresses || ![addresses isKindOfClass:[NSArray class]] || addresses.count == 0) {
+        return errorResponse(requestId, @"Missing required parameter: addresses (array of phone/email)");
+    }
+
+    @try {
+        // Get the appropriate service
+        Class serviceClass = NSClassFromString(@"IMServiceImpl");
+        if (!serviceClass) {
+            return errorResponse(requestId, @"IMServiceImpl class not found");
+        }
+
+        id service = nil;
+        if ([serviceHint isEqualToString:@"sms"]) {
+            service = [serviceClass performSelector:@selector(smsService)];
+        } else {
+            service = [serviceClass performSelector:@selector(iMessageService)];
+        }
+        if (!service) {
+            return errorResponse(requestId, @"Could not get service instance");
+        }
+
+        // Get account for the service
+        Class accountControllerClass = NSClassFromString(@"IMAccountController");
+        if (!accountControllerClass) {
+            return errorResponse(requestId, @"IMAccountController class not found");
+        }
+
+        id accountController = [accountControllerClass performSelector:@selector(sharedInstance)];
+        if (!accountController) {
+            return errorResponse(requestId, @"Could not get IMAccountController instance");
+        }
+
+        id account = [accountController performSelector:@selector(bestAccountForService:) withObject:service];
+        if (!account) {
+            return errorResponse(requestId, @"Could not get account for service");
+        }
+
+        // Resolve addresses to IMHandles
+        NSMutableArray *handles = [NSMutableArray array];
+        for (NSString *address in addresses) {
+            id handle = [account performSelector:@selector(imHandleWithID:) withObject:address];
+            if (handle) {
+                [handles addObject:handle];
+            } else {
+                NSLog(@"[imsg-plus] Warning: could not resolve handle for %@", address);
+            }
+        }
+
+        if (handles.count == 0) {
+            return errorResponse(requestId, @"Could not resolve any handles from the provided addresses");
+        }
+
+        // Get or create chat via IMChatRegistry
+        Class registryClass = NSClassFromString(@"IMChatRegistry");
+        if (!registryClass) {
+            return errorResponse(requestId, @"IMChatRegistry class not found");
+        }
+
+        id registry = [registryClass performSelector:@selector(sharedInstance)];
+        if (!registry) {
+            return errorResponse(requestId, @"Could not get IMChatRegistry instance");
+        }
+
+        SEL chatForHandlesSel = @selector(chatForIMHandles:);
+        if (![registry respondsToSelector:chatForHandlesSel]) {
+            return errorResponse(requestId, @"chatForIMHandles: not available on this macOS version");
+        }
+
+        id chat = [registry performSelector:chatForHandlesSel withObject:handles];
+        if (!chat) {
+            return errorResponse(requestId, @"Failed to create/find chat for the given handles");
+        }
+
+        // Optionally set display name
+        if (name && [name length] > 0) {
+            SEL setNameSel = @selector(_setDisplayName:);
+            if ([chat respondsToSelector:setNameSel]) {
+                [chat performSelector:setNameSel withObject:name];
+                NSLog(@"[imsg-plus] Set chat display name to: %@", name);
+            } else {
+                // Fallback: try setValue:forChatProperty:
+                SEL propSel = @selector(setValue:forChatProperty:);
+                if ([chat respondsToSelector:propSel]) {
+                    NSMethodSignature *sig = [chat methodSignatureForSelector:propSel];
+                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                    [inv setSelector:propSel];
+                    [inv setTarget:chat];
+                    NSString *propName = @"GroupName";
+                    [inv setArgument:&name atIndex:2];
+                    [inv setArgument:&propName atIndex:3];
+                    [inv invoke];
+                }
+            }
+        }
+
+        // Optionally send first message
+        if (text && [text length] > 0) {
+            Class IMMessageClass = NSClassFromString(@"IMMessage");
+            if (IMMessageClass) {
+                NSAttributedString *attrText = [[NSAttributedString alloc] initWithString:text];
+                SEL initSel = @selector(initWithSender:time:text:messageSubject:fileTransferGUIDs:flags:error:guid:subject:);
+                if ([IMMessageClass instancesRespondToSelector:initSel]) {
+                    typedef id (*InitType)(id, SEL, id, id, id, id, id, unsigned long long, id, id, id);
+                    InitType initFunc = (InitType)objc_msgSend;
+                    id msg = [IMMessageClass alloc];
+                    msg = initFunc(msg, initSel, nil, nil, attrText, nil, nil, 0x5, nil, nil, nil);
+                    if (msg) {
+                        SEL sendSel = @selector(sendMessage:);
+                        if ([chat respondsToSelector:sendSel]) {
+                            [chat performSelector:sendSel withObject:msg];
+                            NSLog(@"[imsg-plus] Sent initial message to new chat");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build response
+        NSString *chatGuid = @"";
+        if ([chat respondsToSelector:@selector(guid)]) {
+            chatGuid = [chat performSelector:@selector(guid)] ?: @"";
+        }
+        NSString *chatIdentifier = @"";
+        if ([chat respondsToSelector:@selector(chatIdentifier)]) {
+            chatIdentifier = [chat performSelector:@selector(chatIdentifier)] ?: @"";
+        }
+        NSMutableArray *participantIDs = [NSMutableArray array];
+        if ([chat respondsToSelector:@selector(participants)]) {
+            NSArray *participants = [chat performSelector:@selector(participants)];
+            for (id handle in participants) {
+                if ([handle respondsToSelector:@selector(ID)]) {
+                    [participantIDs addObject:[handle performSelector:@selector(ID)] ?: @""];
+                }
+            }
+        }
+
+        return successResponse(requestId, @{
+            @"guid": chatGuid,
+            @"identifier": chatIdentifier,
+            @"participants": participantIDs,
+            @"name": name ?: @""
+        });
+    } @catch (NSException *exception) {
+        return errorResponse(requestId, [NSString stringWithFormat:@"Failed to create chat: %@", exception.reason]);
+    }
+}
+
+static NSDictionary* handleRenameChat(NSInteger requestId, NSDictionary *params) {
+    NSString *handle = params[@"handle"];
+    NSString *name = params[@"name"];
+
+    if (!handle) {
+        return errorResponse(requestId, @"Missing required parameter: handle");
+    }
+    if (!name) {
+        return errorResponse(requestId, @"Missing required parameter: name");
+    }
+
+    id chat = findChat(handle);
+    if (!chat) {
+        return errorResponse(requestId, [NSString stringWithFormat:@"Chat not found: %@", handle]);
+    }
+
+    @try {
+        SEL setNameSel = @selector(_setDisplayName:);
+        if ([chat respondsToSelector:setNameSel]) {
+            [chat performSelector:setNameSel withObject:name];
+            NSLog(@"[imsg-plus] Renamed chat %@ to: %@", handle, name);
+        } else {
+            // Fallback: try setValue:forChatProperty:
+            SEL propSel = @selector(setValue:forChatProperty:);
+            if ([chat respondsToSelector:propSel]) {
+                NSMethodSignature *sig = [chat methodSignatureForSelector:propSel];
+                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                [inv setSelector:propSel];
+                [inv setTarget:chat];
+                NSString *propName = @"GroupName";
+                [inv setArgument:&name atIndex:2];
+                [inv setArgument:&propName atIndex:3];
+                [inv invoke];
+            } else {
+                return errorResponse(requestId, @"_setDisplayName: and setValue:forChatProperty: not available");
+            }
+        }
+
+        return successResponse(requestId, @{
+            @"handle": handle,
+            @"name": name
+        });
+    } @catch (NSException *exception) {
+        return errorResponse(requestId, [NSString stringWithFormat:@"Failed to rename chat: %@", exception.reason]);
+    }
+}
+
+static NSDictionary* handleRemoveParticipant(NSInteger requestId, NSDictionary *params) {
+    NSString *handle = params[@"handle"];
+    NSArray *addresses = params[@"addresses"];
+
+    if (!handle) {
+        return errorResponse(requestId, @"Missing required parameter: handle");
+    }
+    if (!addresses || ![addresses isKindOfClass:[NSArray class]] || addresses.count == 0) {
+        return errorResponse(requestId, @"Missing required parameter: addresses");
+    }
+
+    id chat = findChat(handle);
+    if (!chat) {
+        return errorResponse(requestId, [NSString stringWithFormat:@"Chat not found: %@", handle]);
+    }
+
+    @try {
+        // Get account to resolve addresses to IMHandles
+        Class serviceClass = NSClassFromString(@"IMServiceImpl");
+        Class accountControllerClass = NSClassFromString(@"IMAccountController");
+        if (!serviceClass || !accountControllerClass) {
+            return errorResponse(requestId, @"IMServiceImpl or IMAccountController not found");
+        }
+
+        id service = [serviceClass performSelector:@selector(iMessageService)];
+        id accountController = [accountControllerClass performSelector:@selector(sharedInstance)];
+        id account = [accountController performSelector:@selector(bestAccountForService:) withObject:service];
+
+        if (!account) {
+            return errorResponse(requestId, @"Could not get account");
+        }
+
+        NSMutableArray *handles = [NSMutableArray array];
+        for (NSString *address in addresses) {
+            id imHandle = [account performSelector:@selector(imHandleWithID:) withObject:address];
+            if (imHandle) {
+                [handles addObject:imHandle];
+            }
+        }
+
+        if (handles.count == 0) {
+            return errorResponse(requestId, @"Could not resolve any handles");
+        }
+
+        SEL removeSel = @selector(removeParticipants:reason:);
+        if ([chat respondsToSelector:removeSel]) {
+            NSMethodSignature *sig = [chat methodSignatureForSelector:removeSel];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            [inv setSelector:removeSel];
+            [inv setTarget:chat];
+            [inv setArgument:&handles atIndex:2];
+            NSString *reason = @"";
+            [inv setArgument:&reason atIndex:3];
+            [inv invoke];
+            NSLog(@"[imsg-plus] Removed %lu participants from %@", (unsigned long)handles.count, handle);
+        } else {
+            // Fallback: try removeIMHandles:
+            SEL altSel = @selector(removeIMHandles:);
+            if ([chat respondsToSelector:altSel]) {
+                [chat performSelector:altSel withObject:handles];
+            } else {
+                return errorResponse(requestId, @"removeParticipants: and removeIMHandles: not available");
+            }
+        }
+
+        return successResponse(requestId, @{
+            @"handle": handle,
+            @"removed": @(handles.count)
+        });
+    } @catch (NSException *exception) {
+        return errorResponse(requestId, [NSString stringWithFormat:@"Failed to remove participants: %@", exception.reason]);
+    }
+}
+
+static NSDictionary* handleSendRichMessage(NSInteger requestId, NSDictionary *params) {
+    NSString *handle = params[@"handle"];
+    NSString *attributedTextBase64 = params[@"attributed_text"];
+    NSString *plainText = params[@"text"];
+
+    if (!handle) {
+        return errorResponse(requestId, @"Missing required parameter: handle");
+    }
+    if (!attributedTextBase64 && !plainText) {
+        return errorResponse(requestId, @"Missing required parameter: attributed_text or text");
+    }
+
+    id chat = findChat(handle);
+    if (!chat) {
+        return errorResponse(requestId, [NSString stringWithFormat:@"Chat not found: %@", handle]);
+    }
+
+    @try {
+        NSAttributedString *messageText = nil;
+
+        if (attributedTextBase64) {
+            NSData *data = [[NSData alloc] initWithBase64EncodedString:attributedTextBase64 options:0];
+            if (data) {
+                @try {
+                    #pragma clang diagnostic push
+                    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                    id unarchived = [NSUnarchiver unarchiveObjectWithData:data];
+                    #pragma clang diagnostic pop
+                    if ([unarchived isKindOfClass:[NSAttributedString class]]) {
+                        messageText = (NSAttributedString *)unarchived;
+                    }
+                } @catch (NSException *e) {
+                    NSLog(@"[imsg-plus] Failed to unarchive attributed text: %@", e.reason);
+                }
+            }
+        }
+
+        if (!messageText && plainText) {
+            messageText = [[NSAttributedString alloc] initWithString:plainText];
+        }
+
+        if (!messageText) {
+            return errorResponse(requestId, @"Could not construct message text");
+        }
+
+        Class IMMessageClass = NSClassFromString(@"IMMessage");
+        if (!IMMessageClass) {
+            return errorResponse(requestId, @"IMMessage class not found");
+        }
+
+        SEL initSel = @selector(initWithSender:time:text:messageSubject:fileTransferGUIDs:flags:error:guid:subject:);
+        if (![IMMessageClass instancesRespondToSelector:initSel]) {
+            return errorResponse(requestId, @"IMMessage init selector not available");
+        }
+
+        // Generate a unique message GUID
+        NSString *guid = [[NSUUID UUID] UUIDString];
+
+        typedef id (*InitType)(id, SEL, id, id, id, id, id, unsigned long long, id, id, id);
+        InitType initFunc = (InitType)objc_msgSend;
+        id msg = [IMMessageClass alloc];
+        msg = initFunc(msg, initSel,
+            nil,                  // sender (nil = self for outgoing)
+            [NSDate date],        // time
+            messageText,          // text (NSAttributedString)
+            nil,                  // messageSubject
+            nil,                  // fileTransferGUIDs
+            (unsigned long long)0x100005,  // flags (finished + delivered + sent)
+            nil,                  // error
+            guid,                 // guid
+            nil);                 // subject
+
+        if (!msg) {
+            return errorResponse(requestId, @"Failed to create IMMessage");
+        }
+
+        SEL sendSel = @selector(sendMessage:);
+        if (![chat respondsToSelector:sendSel]) {
+            return errorResponse(requestId, @"Chat does not respond to sendMessage:");
+        }
+
+        [chat performSelector:sendSel withObject:msg];
+        NSLog(@"[imsg-plus] Sent rich message to %@", handle);
+
+        return successResponse(requestId, @{
+            @"handle": handle,
+            @"sent": @YES
+        });
+    } @catch (NSException *exception) {
+        return errorResponse(requestId, [NSString stringWithFormat:@"Failed to send message: %@", exception.reason]);
+    }
+}
+
 #pragma mark - Command Router
 
 static NSDictionary* processCommand(NSDictionary *command) {
@@ -710,6 +1102,14 @@ static NSDictionary* processCommand(NSDictionary *command) {
         return handleStatus(requestId, params);
     } else if ([action isEqualToString:@"list_chats"]) {
         return handleListChats(requestId, params);
+    } else if ([action isEqualToString:@"create_chat"]) {
+        return handleCreateChat(requestId, params);
+    } else if ([action isEqualToString:@"rename_chat"]) {
+        return handleRenameChat(requestId, params);
+    } else if ([action isEqualToString:@"remove_participant"]) {
+        return handleRemoveParticipant(requestId, params);
+    } else if ([action isEqualToString:@"send_message"]) {
+        return handleSendRichMessage(requestId, params);
     } else if ([action isEqualToString:@"ping"]) {
         return successResponse(requestId, @{@"pong": @YES});
     } else {
