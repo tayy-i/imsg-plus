@@ -21,6 +21,7 @@ static NSString *kLockFile = nil;
 static dispatch_source_t fileWatchSource = nil;
 static NSTimer *fileWatchTimer = nil;
 static int lockFd = -1;
+static NSMutableArray *_diagLog = nil;
 
 static void initFilePaths(void) {
     if (kCommandFile == nil) {
@@ -72,6 +73,19 @@ static void initFilePaths(void) {
 - (id)bestAccountForService:(id)service;
 @end
 
+@interface IMFileTransferCenter : NSObject
++ (instancetype)sharedInstance;
+- (NSString *)guidForNewOutgoingTransferWithLocalURL:(NSURL *)localURL;
+- (id)transferForGUID:(NSString *)guid;
+- (void)retargetTransfer:(NSString *)guid toPath:(NSString *)path;
+- (void)registerTransferWithDaemon:(NSString *)guid;
+@end
+
+@interface IMFileTransfer : NSObject
+@property (nonatomic, strong) NSURL *localURL;
+- (NSString *)guid;
+@end
+
 #pragma mark - Runtime Method Injection
 
 // Provide missing isEditedMessageHistory method for IMMessageItem compatibility
@@ -100,6 +114,188 @@ static void injectCompatibilityMethods(void) {
             class_addMethod(IMMessageClass, selector,
                           (IMP)IMMessageItem_isEditedMessageHistory, "c@:");
             NSLog(@"[imsg-plus] Added isEditedMessageHistory method to IMMessage");
+        }
+    }
+}
+
+#pragma mark - Send Path Swizzles (spy on native UI sends)
+
+// Original IMPs stored here so we can call through
+static IMP _orig_CKConv_sendMessage_newComposition = NULL;
+static IMP _orig_CKConv_sendMessage_onService_newComposition = NULL;
+static IMP _orig_IMChat_sendMessage = NULL;
+
+static void swizzled_CKConv_sendMessage_newComposition(id self, SEL _cmd, id message, id composition) {
+    if (!_diagLog) _diagLog = [NSMutableArray array];
+    [_diagLog addObject:@"=== SWIZZLE: CKConversation sendMessage:newComposition: ==="];
+    [_diagLog addObject:[NSString stringWithFormat:@"self=%@ class=%@", self, [self class]]];
+
+    // Log message properties
+    if (message) {
+        [_diagLog addObject:[NSString stringWithFormat:@"message class=%@", [message class]]];
+        @try {
+            [_diagLog addObject:[NSString stringWithFormat:@"  guid=%@", [message valueForKey:@"guid"]]];
+            [_diagLog addObject:[NSString stringWithFormat:@"  expressiveSendStyleID=%@", [message valueForKey:@"expressiveSendStyleID"]]];
+            [_diagLog addObject:[NSString stringWithFormat:@"  fileTransferGUIDs=%@", [message valueForKey:@"fileTransferGUIDs"]]];
+            [_diagLog addObject:[NSString stringWithFormat:@"  threadIdentifier=%@", [message valueForKey:@"threadIdentifier"]]];
+            [_diagLog addObject:[NSString stringWithFormat:@"  flags=%@", [message valueForKey:@"flags"]]];
+            id text = [message valueForKey:@"text"];
+            if ([text isKindOfClass:[NSAttributedString class]]) {
+                NSAttributedString *attrText = (NSAttributedString *)text;
+                [_diagLog addObject:[NSString stringWithFormat:@"  text.string=%@ (len=%lu)", attrText.string, (unsigned long)attrText.length]];
+                // Log attributes on first char
+                if (attrText.length > 0) {
+                    NSDictionary *attrs = [attrText attributesAtIndex:0 effectiveRange:NULL];
+                    [_diagLog addObject:[NSString stringWithFormat:@"  text.attrs[0]=%@", attrs]];
+                }
+            } else {
+                [_diagLog addObject:[NSString stringWithFormat:@"  text=%@", text]];
+            }
+        } @catch (NSException *e) {
+            [_diagLog addObject:[NSString stringWithFormat:@"  msg props error: %@", e.reason]];
+        }
+    } else {
+        [_diagLog addObject:@"message=nil"];
+    }
+
+    // Log composition properties
+    if (composition) {
+        [_diagLog addObject:[NSString stringWithFormat:@"composition class=%@", [composition class]]];
+        @try {
+            if ([composition respondsToSelector:@selector(expressiveSendStyleID)]) {
+                [_diagLog addObject:[NSString stringWithFormat:@"  expressiveSendStyleID=%@",
+                      [composition performSelector:@selector(expressiveSendStyleID)]]];
+            }
+            if ([composition respondsToSelector:@selector(text)]) {
+                id compText = [composition performSelector:@selector(text)];
+                if ([compText isKindOfClass:[NSAttributedString class]]) {
+                    NSAttributedString *at = (NSAttributedString *)compText;
+                    [_diagLog addObject:[NSString stringWithFormat:@"  text.string=%@ (len=%lu)", at.string, (unsigned long)at.length]];
+                    if (at.length > 0) {
+                        // Log all attributes across the full range
+                        [at enumerateAttributesInRange:NSMakeRange(0, at.length) options:0
+                            usingBlock:^(NSDictionary *attrs, NSRange range, BOOL *stop) {
+                                [_diagLog addObject:[NSString stringWithFormat:@"  text.attrs[%lu-%lu]=%@",
+                                      (unsigned long)range.location, (unsigned long)(range.location+range.length), attrs]];
+                            }];
+                    }
+                } else {
+                    [_diagLog addObject:[NSString stringWithFormat:@"  text=%@", compText]];
+                }
+            }
+            if ([composition respondsToSelector:@selector(mediaObjects)]) {
+                NSArray *mos = [composition performSelector:@selector(mediaObjects)];
+                [_diagLog addObject:[NSString stringWithFormat:@"  mediaObjects count=%lu", (unsigned long)mos.count]];
+                for (NSUInteger i = 0; i < mos.count; i++) {
+                    id mo = mos[i];
+                    [_diagLog addObject:[NSString stringWithFormat:@"    mo[%lu] class=%@ transferGUID=%@ fileURL=%@",
+                          (unsigned long)i, [mo class],
+                          [mo respondsToSelector:@selector(transferGUID)] ? [mo performSelector:@selector(transferGUID)] : @"N/A",
+                          [mo respondsToSelector:@selector(fileURL)] ? [mo performSelector:@selector(fileURL)] : @"N/A"]];
+                }
+            }
+            if ([composition respondsToSelector:@selector(hasContent)]) {
+                BOOL hc = ((BOOL (*)(id, SEL))objc_msgSend)(composition, @selector(hasContent));
+                [_diagLog addObject:[NSString stringWithFormat:@"  hasContent=%d", hc]];
+            }
+        } @catch (NSException *e) {
+            [_diagLog addObject:[NSString stringWithFormat:@"  comp props error: %@", e.reason]];
+        }
+    } else {
+        [_diagLog addObject:@"composition=nil"];
+    }
+
+    // Call original
+    if (_orig_CKConv_sendMessage_newComposition) {
+        typedef void (*OrigType)(id, SEL, id, id);
+        ((OrigType)_orig_CKConv_sendMessage_newComposition)(self, _cmd, message, composition);
+    }
+}
+
+static void swizzled_CKConv_sendMessage_onService_newComposition(id self, SEL _cmd, id message, id service, id composition) {
+    if (!_diagLog) _diagLog = [NSMutableArray array];
+    [_diagLog addObject:@"=== SWIZZLE: CKConversation sendMessage:onService:newComposition: ==="];
+    [_diagLog addObject:[NSString stringWithFormat:@"service=%@ class=%@", service, service ? [service class] : @"nil"]];
+
+    // Reuse the 2-arg swizzle's logging by calling it, but don't call through twice
+    // Just log the extra service param and call original
+    if (message) {
+        @try {
+            [_diagLog addObject:[NSString stringWithFormat:@"message.expressiveSendStyleID=%@", [message valueForKey:@"expressiveSendStyleID"]]];
+            [_diagLog addObject:[NSString stringWithFormat:@"message.fileTransferGUIDs=%@", [message valueForKey:@"fileTransferGUIDs"]]];
+        } @catch (NSException *e) {}
+    } else {
+        [_diagLog addObject:@"message=nil"];
+    }
+    if (composition) {
+        @try {
+            if ([composition respondsToSelector:@selector(expressiveSendStyleID)])
+                [_diagLog addObject:[NSString stringWithFormat:@"composition.expressiveSendStyleID=%@",
+                      [composition performSelector:@selector(expressiveSendStyleID)]]];
+            if ([composition respondsToSelector:@selector(mediaObjects)]) {
+                NSArray *mos = [composition performSelector:@selector(mediaObjects)];
+                [_diagLog addObject:[NSString stringWithFormat:@"composition.mediaObjects count=%lu", (unsigned long)mos.count]];
+            }
+        } @catch (NSException *e) {}
+    } else {
+        [_diagLog addObject:@"composition=nil"];
+    }
+
+    if (_orig_CKConv_sendMessage_onService_newComposition) {
+        typedef void (*OrigType)(id, SEL, id, id, id);
+        ((OrigType)_orig_CKConv_sendMessage_onService_newComposition)(self, _cmd, message, service, composition);
+    }
+}
+
+static void swizzled_IMChat_sendMessage(id self, SEL _cmd, id message) {
+    if (!_diagLog) _diagLog = [NSMutableArray array];
+    [_diagLog addObject:@"=== SWIZZLE: IMChat sendMessage: ==="];
+    if (message) {
+        @try {
+            [_diagLog addObject:[NSString stringWithFormat:@"message class=%@ guid=%@", [message class], [message valueForKey:@"guid"]]];
+            [_diagLog addObject:[NSString stringWithFormat:@"  expressiveSendStyleID=%@", [message valueForKey:@"expressiveSendStyleID"]]];
+            [_diagLog addObject:[NSString stringWithFormat:@"  fileTransferGUIDs=%@", [message valueForKey:@"fileTransferGUIDs"]]];
+        } @catch (NSException *e) {
+            [_diagLog addObject:[NSString stringWithFormat:@"  error: %@", e.reason]];
+        }
+    }
+
+    if (_orig_IMChat_sendMessage) {
+        typedef void (*OrigType)(id, SEL, id);
+        ((OrigType)_orig_IMChat_sendMessage)(self, _cmd, message);
+    }
+}
+
+static void installSendSwizzles(void) {
+    // Swizzle CKConversation sendMessage:newComposition:
+    Class ckConvClass = NSClassFromString(@"CKConversation");
+    if (ckConvClass) {
+        SEL sel2 = @selector(sendMessage:newComposition:);
+        Method m2 = class_getInstanceMethod(ckConvClass, sel2);
+        if (m2) {
+            _orig_CKConv_sendMessage_newComposition = method_setImplementation(m2,
+                (IMP)swizzled_CKConv_sendMessage_newComposition);
+            NSLog(@"[imsg-plus] Swizzled CKConversation sendMessage:newComposition:");
+        }
+
+        SEL sel3 = @selector(sendMessage:onService:newComposition:);
+        Method m3 = class_getInstanceMethod(ckConvClass, sel3);
+        if (m3) {
+            _orig_CKConv_sendMessage_onService_newComposition = method_setImplementation(m3,
+                (IMP)swizzled_CKConv_sendMessage_onService_newComposition);
+            NSLog(@"[imsg-plus] Swizzled CKConversation sendMessage:onService:newComposition:");
+        }
+    }
+
+    // Swizzle IMChat sendMessage:
+    Class imChatClass = NSClassFromString(@"IMChat");
+    if (imChatClass) {
+        SEL sel = @selector(sendMessage:);
+        Method m = class_getInstanceMethod(imChatClass, sel);
+        if (m) {
+            _orig_IMChat_sendMessage = method_setImplementation(m,
+                (IMP)swizzled_IMChat_sendMessage);
+            NSLog(@"[imsg-plus] Swizzled IMChat sendMessage:");
         }
     }
 }
@@ -257,6 +453,74 @@ static id findChat(NSString *identifier) {
 
     NSLog(@"[imsg-plus] Chat not found for identifier: %@", identifier);
     return nil;
+}
+
+#pragma mark - Attachment Preparation
+
+// Prepare a file attachment for sending via IMCore.
+// Returns the transfer GUID on success, or nil on failure (with error logged).
+// Thread-local diagnostic string for prepareAttachment failure reason
+static NSString *_attachmentDiag = nil;
+
+static NSString* prepareAttachment(NSString *filePath, NSString *chatGUID) {
+    _attachmentDiag = nil;
+
+    if (!filePath || filePath.length == 0) {
+        _attachmentDiag = @"empty file path";
+        return nil;
+    }
+
+    // Validate file exists
+    BOOL isDir = NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:filePath isDirectory:&isDir] || isDir) {
+        _attachmentDiag = [NSString stringWithFormat:@"file not found: %@", filePath];
+        return nil;
+    }
+
+    NSURL *localURL = [NSURL fileURLWithPath:filePath];
+
+    // Get IMFileTransferCenter
+    Class ftcClass = NSClassFromString(@"IMFileTransferCenter");
+    if (!ftcClass) {
+        _attachmentDiag = @"IMFileTransferCenter class not found";
+        return nil;
+    }
+
+    id ftCenter = [ftcClass performSelector:@selector(sharedInstance)];
+    if (!ftCenter) {
+        _attachmentDiag = @"IMFileTransferCenter sharedInstance nil";
+        return nil;
+    }
+
+    // Create a new outgoing transfer
+    SEL guidSel = @selector(guidForNewOutgoingTransferWithLocalURL:);
+    if (![ftCenter respondsToSelector:guidSel]) {
+        _attachmentDiag = @"guidForNewOutgoingTransferWithLocalURL: not available";
+        return nil;
+    }
+
+    NSString *transferGUID = [ftCenter performSelector:guidSel withObject:localURL];
+    if (!transferGUID) {
+        _attachmentDiag = [NSString stringWithFormat:@"transfer GUID nil for URL: %@", localURL];
+        return nil;
+    }
+    NSLog(@"[imsg-plus] prepareAttachment: created transfer GUID: %@", transferGUID);
+
+    // The file path is expected to already be staged by the caller (CLI process)
+    // at a location accessible to the daemon (e.g. ~/Library/Messages/Attachments/).
+    // The CLI is not sandboxed and can copy files there before calling the bridge.
+    // guidForNewOutgoingTransferWithLocalURL: already points the transfer at filePath.
+    SEL registerSel = @selector(registerTransferWithDaemon:);
+    if ([ftCenter respondsToSelector:registerSel]) {
+        [ftCenter performSelector:registerSel withObject:transferGUID];
+        NSLog(@"[imsg-plus] prepareAttachment: registered transfer with daemon");
+    } else {
+        _attachmentDiag = @"registerTransferWithDaemon: not available";
+        return nil;
+    }
+
+    NSLog(@"[imsg-plus] prepareAttachment: ready, GUID=%@", transferGUID);
+    return transferGUID;
 }
 
 #pragma mark - Command Handlers
@@ -689,6 +953,8 @@ static NSDictionary* handleStatus(NSInteger requestId, NSDictionary *params) {
     BOOL hasServiceImpl = (NSClassFromString(@"IMServiceImpl") != nil);
     BOOL canCreateChat = hasRegistry && hasAccountController && hasServiceImpl;
 
+    BOOL hasFileTransferCenter = (NSClassFromString(@"IMFileTransferCenter") != nil);
+
     NSMutableDictionary *result = [@{
         @"injected": @YES,
         @"registry_available": @(hasRegistry),
@@ -701,8 +967,12 @@ static NSDictionary* handleStatus(NSInteger requestId, NSDictionary *params) {
         @"send_message_available": @(hasRegistry),
         @"thread_reply_available": @(hasRegistry),
         @"edit_message_available": @(hasRegistry),
-        @"unsend_message_available": @(hasRegistry)
+        @"unsend_message_available": @(hasRegistry),
+        @"attachment_send_available": @(hasFileTransferCenter),
     } mutableCopy];
+    if (_diagLog.count > 0) {
+        result[@"send_diag"] = [_diagLog copy];
+    }
     return successResponse(requestId, result);
 }
 
@@ -1025,16 +1295,101 @@ static NSDictionary* handleRemoveParticipant(NSInteger requestId, NSDictionary *
     }
 }
 
+static id createIMMessage(Class IMMessageClass, NSAttributedString *text, NSArray *ftGUIDs, NSString *effect, NSString *thread) {
+    NSString *guid = [[NSUUID UUID] UUIDString];
+    id msg = nil;
+
+    if (effect || thread) {
+        SEL initSel = @selector(initWithSender:time:text:messageSubject:fileTransferGUIDs:flags:error:guid:subject:balloonBundleID:payloadData:expressiveSendStyleID:threadIdentifier:);
+        if ([IMMessageClass instancesRespondToSelector:initSel]) {
+            typedef id (*InitType)(id, SEL, id, id, id, id, id, unsigned long long, id, id, id, id, id, id, id);
+            InitType initFunc = (InitType)objc_msgSend;
+            msg = [IMMessageClass alloc];
+            msg = initFunc(msg, initSel,
+                nil, [NSDate date], text, nil, ftGUIDs,
+                (unsigned long long)0x100005, nil, guid, nil,
+                nil, nil, effect, thread);
+            NSLog(@"[imsg-plus] createIMMessage: long init effect=%@ thread=%@", effect ?: @"nil", thread ?: @"nil");
+        }
+    }
+
+    if (!msg && thread) {
+        SEL initSel = @selector(initWithSender:time:text:messageSubject:fileTransferGUIDs:flags:error:guid:subject:threadIdentifier:);
+        if ([IMMessageClass instancesRespondToSelector:initSel]) {
+            typedef id (*InitType)(id, SEL, id, id, id, id, id, unsigned long long, id, id, id, id);
+            InitType initFunc = (InitType)objc_msgSend;
+            msg = [IMMessageClass alloc];
+            msg = initFunc(msg, initSel,
+                nil, [NSDate date], text, nil, ftGUIDs,
+                (unsigned long long)0x100005, nil, guid, nil, thread);
+        }
+    }
+
+    if (!msg) {
+        SEL initSel = @selector(initWithSender:time:text:messageSubject:fileTransferGUIDs:flags:error:guid:subject:);
+        if ([IMMessageClass instancesRespondToSelector:initSel]) {
+            typedef id (*InitType)(id, SEL, id, id, id, id, id, unsigned long long, id, id, id);
+            InitType initFunc = (InitType)objc_msgSend;
+            msg = [IMMessageClass alloc];
+            msg = initFunc(msg, initSel,
+                nil, [NSDate date], text, nil, ftGUIDs,
+                (unsigned long long)0x100005, nil, guid, nil);
+        }
+    }
+    return msg;
+}
+
+static void sendViaIMChat(id msg, id chat) {
+    SEL sendSel = @selector(sendMessage:);
+    if ([chat respondsToSelector:sendSel]) {
+        [chat performSelector:sendSel withObject:msg];
+    }
+}
+
+static void sendViaCKConversation(id msg, id chat, NSString *replyToGuid) {
+    id ckConversation = nil;
+    @try { ckConversation = [chat valueForKey:@"conversation"]; } @catch (NSException *e) { }
+    if (!ckConversation) {
+        @try {
+            Class ckListClass = NSClassFromString(@"CKConversationList");
+            if (ckListClass) {
+                id ckList = [ckListClass performSelector:@selector(sharedConversationList)];
+                if (ckList) {
+                    SEL s1 = @selector(conversationForExistingChat:);
+                    if ([ckList respondsToSelector:s1])
+                        ckConversation = [ckList performSelector:s1 withObject:chat];
+                    if (!ckConversation) {
+                        SEL s2 = @selector(conversationForChat:);
+                        if ([ckList respondsToSelector:s2])
+                            ckConversation = [ckList performSelector:s2 withObject:chat];
+                    }
+                }
+            }
+        } @catch (NSException *e) { }
+    }
+    SEL ckSendSel = @selector(sendMessage:newComposition:);
+    if (ckConversation && [ckConversation respondsToSelector:ckSendSel]) {
+        typedef void (*CKSendType)(id, SEL, id, id);
+        ((CKSendType)objc_msgSend)(ckConversation, ckSendSel, msg, nil);
+        return;
+    }
+    // Fallback to IMChat
+    sendViaIMChat(msg, chat);
+}
+
 static NSDictionary* handleSendRichMessage(NSInteger requestId, NSDictionary *params) {
     NSString *handle = params[@"handle"];
     NSString *attributedTextBase64 = params[@"attributed_text"];
     NSString *plainText = params[@"text"];
+    NSString *filePath = params[@"file"];
+    NSString *replyToGuid = params[@"reply_to_guid"];
+    NSString *effectId = params[@"effect_id"];
 
     if (!handle) {
         return errorResponse(requestId, @"Missing required parameter: handle");
     }
-    if (!attributedTextBase64 && !plainText) {
-        return errorResponse(requestId, @"Missing required parameter: attributed_text or text");
+    if (!attributedTextBase64 && !plainText && !filePath) {
+        return errorResponse(requestId, @"Missing required parameter: attributed_text, text, or file");
     }
 
     id chat = findChat(handle);
@@ -1043,8 +1398,13 @@ static NSDictionary* handleSendRichMessage(NSInteger requestId, NSDictionary *pa
     }
 
     @try {
-        NSAttributedString *messageText = nil;
+        Class IMMessageClass = NSClassFromString(@"IMMessage");
+        if (!IMMessageClass) {
+            return errorResponse(requestId, @"IMMessage class not found");
+        }
 
+        // Build message text from attributed_text or plain text
+        NSAttributedString *messageText = nil;
         if (attributedTextBase64) {
             NSData *data = [[NSData alloc] initWithBase64EncodedString:attributedTextBase64 options:0];
             if (data) {
@@ -1061,177 +1421,70 @@ static NSDictionary* handleSendRichMessage(NSInteger requestId, NSDictionary *pa
                 }
             }
         }
-
-        if (!messageText && plainText) {
+        if (!messageText && plainText && plainText.length > 0) {
             messageText = [[NSAttributedString alloc] initWithString:plainText];
         }
 
-        if (!messageText) {
-            return errorResponse(requestId, @"Could not construct message text");
-        }
+        BOOL hasFile = (filePath && filePath.length > 0);
+        BOOL hasText = (messageText != nil && messageText.length > 0);
+        NSString *threadId = replyToGuid ? [NSString stringWithFormat:@"r:0:0:0:%@", replyToGuid] : nil;
 
-        Class IMMessageClass = NSClassFromString(@"IMMessage");
-        if (!IMMessageClass) {
-            return errorResponse(requestId, @"IMMessage class not found");
-        }
-
-        // Generate a unique message GUID
-        NSString *guid = [[NSUUID UUID] UUIDString];
-
-        // Check for thread reply
-        NSString *replyToGuid = params[@"reply_to_guid"];
-        NSString *effectId = params[@"effect_id"];
-
-        id msg = nil;
-
-        if (replyToGuid) {
-            // Thread replies use r:RANGE:INDEX:GUID format for threadIdentifier
-            NSString *threadId = [NSString stringWithFormat:@"r:0:0:0:%@", replyToGuid];
-
-            if (effectId) {
-                // Use the init with both expressiveSendStyleID and threadIdentifier
-                SEL initSel = @selector(initWithSender:time:text:messageSubject:fileTransferGUIDs:flags:error:guid:subject:balloonBundleID:payloadData:expressiveSendStyleID:threadIdentifier:);
-                if ([IMMessageClass instancesRespondToSelector:initSel]) {
-                    typedef id (*InitType)(id, SEL, id, id, id, id, id, unsigned long long, id, id, id, id, id, id, id);
-                    InitType initFunc = (InitType)objc_msgSend;
-                    msg = [IMMessageClass alloc];
-                    msg = initFunc(msg, initSel,
-                        nil,                  // sender
-                        [NSDate date],        // time
-                        messageText,          // text
-                        nil,                  // messageSubject
-                        nil,                  // fileTransferGUIDs
-                        (unsigned long long)0x100005,  // flags
-                        nil,                  // error
-                        guid,                 // guid
-                        nil,                  // subject
-                        nil,                  // balloonBundleID
-                        nil,                  // payloadData
-                        effectId,             // expressiveSendStyleID
-                        threadId);            // threadIdentifier
-                }
+        if (hasFile) {
+            // --- ATTACHMENT (with optional text, effect, reply) ---
+            NSString *chatGUID = @"";
+            if ([chat respondsToSelector:@selector(guid)]) {
+                chatGUID = [chat performSelector:@selector(guid)] ?: @"";
+            }
+            NSString *transferGUID = prepareAttachment(filePath, chatGUID);
+            if (!transferGUID) {
+                NSString *diag = _attachmentDiag ?: @"unknown reason";
+                return errorResponse(requestId, [NSString stringWithFormat:@"Failed to prepare attachment: %@ (%@)", filePath, diag]);
             }
 
-            if (!msg) {
-                // Use the simpler init with threadIdentifier
-                SEL initSel = @selector(initWithSender:time:text:messageSubject:fileTransferGUIDs:flags:error:guid:subject:threadIdentifier:);
-                if ([IMMessageClass instancesRespondToSelector:initSel]) {
-                    typedef id (*InitType)(id, SEL, id, id, id, id, id, unsigned long long, id, id, id, id);
-                    InitType initFunc = (InitType)objc_msgSend;
-                    msg = [IMMessageClass alloc];
-                    msg = initFunc(msg, initSel,
-                        nil,                  // sender
-                        [NSDate date],        // time
-                        messageText,          // text
-                        nil,                  // messageSubject
-                        nil,                  // fileTransferGUIDs
-                        (unsigned long long)0x100005,  // flags
-                        nil,                  // error
-                        guid,                 // guid
-                        nil,                  // subject
-                        threadId);            // threadIdentifier
-                } else {
-                    return errorResponse(requestId, @"IMMessage initWithSender:...:threadIdentifier: not available");
-                }
+            // Build attachment attributed string with \uFFFC placeholder
+            NSArray *ftGUIDs = @[transferGUID];
+            unichar replacementChar = 0xFFFC;
+            NSString *replacementStr = [NSString stringWithCharacters:&replacementChar length:1];
+            NSDictionary *attachAttrs = @{
+                @"__kIMFileTransferGUIDAttributeName": transferGUID,
+                @"__kIMFilenameAttributeName": [filePath lastPathComponent],
+                @"__kIMMessagePartAttributeName": @0,
+            };
+            NSAttributedString *attachText = [[NSAttributedString alloc]
+                initWithString:replacementStr attributes:attachAttrs];
+
+            NSAttributedString *finalText = attachText;
+            if (hasText) {
+                // Combined: text (part 0) + attachment (part 1)
+                NSMutableAttributedString *combined = [[NSMutableAttributedString alloc]
+                    initWithAttributedString:messageText];
+                [combined addAttribute:@"__kIMMessagePartAttributeName"
+                    value:@0 range:NSMakeRange(0, combined.length)];
+                NSMutableDictionary *partAttrs = [attachAttrs mutableCopy];
+                partAttrs[@"__kIMMessagePartAttributeName"] = @1;
+                NSAttributedString *attachPart = [[NSAttributedString alloc]
+                    initWithString:replacementStr attributes:partAttrs];
+                [combined appendAttributedString:attachPart];
+                finalText = combined;
             }
+
+            id msg = createIMMessage(IMMessageClass, finalText, ftGUIDs, effectId, threadId);
+            if (!msg) return errorResponse(requestId, @"Failed to create IMMessage");
+
+            // Always use CKConversation for attachment sends (matches native UI behavior)
+            sendViaCKConversation(msg, chat, replyToGuid);
+
         } else {
-            // No thread reply — use standard init
-            SEL initSel = @selector(initWithSender:time:text:messageSubject:fileTransferGUIDs:flags:error:guid:subject:);
-            if (![IMMessageClass instancesRespondToSelector:initSel]) {
-                return errorResponse(requestId, @"IMMessage init selector not available");
-            }
-
-            typedef id (*InitType)(id, SEL, id, id, id, id, id, unsigned long long, id, id, id);
-            InitType initFunc = (InitType)objc_msgSend;
-            msg = [IMMessageClass alloc];
-            msg = initFunc(msg, initSel,
-                nil,                  // sender
-                [NSDate date],        // time
-                messageText,          // text
-                nil,                  // messageSubject
-                nil,                  // fileTransferGUIDs
-                (unsigned long long)0x100005,  // flags
-                nil,                  // error
-                guid,                 // guid
-                nil);                 // subject
-        }
-
-        if (!msg) {
-            return errorResponse(requestId, @"Failed to create IMMessage");
-        }
-
-        // Set expressive send effect if provided (for non-reply messages, or if reply+effect init wasn't used)
-        if (effectId && !replyToGuid) {
-            @try {
-                [msg setValue:effectId forKey:@"expressiveSendStyleID"];
-            } @catch (NSException *e) {
-                NSLog(@"[imsg-plus] Could not set expressiveSendStyleID: %@", e.reason);
-            }
-        }
-
-        if (replyToGuid) {
-            // Thread reply: send through CKConversation (same path the UI uses)
-            // The UI sends via CKConversation.sendMessage:newComposition: with composition=nil
-            // and threadIdentifier in r:0:0:PART:GUID format
-
-            // First, try to find the CKConversation for this chat
-            Class ckConvClass = NSClassFromString(@"CKConversation");
-            id ckConversation = nil;
-
-            if (ckConvClass) {
-                // Get CKConversation from chat via the conversation property
-                @try {
-                    ckConversation = [chat valueForKey:@"conversation"];
-                } @catch (NSException *e) { }
-
-                if (!ckConversation) {
-                    // Try CKConversationList
-                    @try {
-                        Class ckListClass = NSClassFromString(@"CKConversationList");
-                        if (ckListClass) {
-                            id ckList = [ckListClass performSelector:@selector(sharedConversationList)];
-                            if (ckList) {
-                                SEL convForChatSel = @selector(conversationForExistingChat:);
-                                if ([ckList respondsToSelector:convForChatSel]) {
-                                    ckConversation = [ckList performSelector:convForChatSel withObject:chat];
-                                }
-                                if (!ckConversation) {
-                                    SEL convForChatSel2 = @selector(conversationForChat:);
-                                    if ([ckList respondsToSelector:convForChatSel2]) {
-                                        ckConversation = [ckList performSelector:convForChatSel2 withObject:chat];
-                                    }
-                                }
-                            }
-                        }
-                    } @catch (NSException *e) { }
-                }
-            }
-
-            // Send via CKConversation if available, else fall back to IMChat
-            SEL ckSendSel = @selector(sendMessage:newComposition:);
-            if (ckConversation && [ckConversation respondsToSelector:ckSendSel]) {
-                typedef void (*CKSendType)(id, SEL, id, id);
-                CKSendType ckSendFunc = (CKSendType)objc_msgSend;
-                ckSendFunc(ckConversation, ckSendSel, msg, nil);
-
-                return successResponse(requestId, @{@"handle": handle, @"sent": @YES});
+            // --- TEXT ONLY (with optional effect/reply) ---
+            if (!messageText) return errorResponse(requestId, @"Could not construct message text");
+            id msg = createIMMessage(IMMessageClass, messageText, nil, effectId, threadId);
+            if (!msg) return errorResponse(requestId, @"Failed to create IMMessage");
+            if (replyToGuid) {
+                sendViaCKConversation(msg, chat, replyToGuid);
             } else {
-                // Fallback: send via IMChat.sendMessage:
-                SEL sendSel = @selector(sendMessage:);
-                if (![chat respondsToSelector:sendSel]) {
-                    return errorResponse(requestId, @"Chat does not respond to sendMessage:");
-                }
-                [chat performSelector:sendSel withObject:msg];
-                return successResponse(requestId, @{@"handle": handle, @"sent": @YES});
+                sendViaIMChat(msg, chat);
             }
         }
-
-        // Non-reply path
-        SEL sendSel = @selector(sendMessage:);
-        if (![chat respondsToSelector:sendSel]) {
-            return errorResponse(requestId, @"Chat does not respond to sendMessage:");
-        }
-        [chat performSelector:sendSel withObject:msg];
 
         return successResponse(requestId, @{
             @"handle": handle,
@@ -1659,6 +1912,10 @@ static void processCommandFile(void) {
             return;
         }
 
+        // Clear command file immediately to prevent re-entry if processCommand
+        // yields to the run loop (e.g. XPC calls in prepareAttachment)
+        [@"" writeToFile:kCommandFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
         // Parse JSON
         NSDictionary *command = [NSJSONSerialization JSONObjectWithData:commandData options:0 error:&error];
         if (error || ![command isKindOfClass:[NSDictionary class]]) {
@@ -1675,14 +1932,9 @@ static void processCommandFile(void) {
             // Synchronous response — write it now
             NSData *responseData = [NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingPrettyPrinted error:nil];
             [responseData writeToFile:kResponseFile atomically:YES];
-
-            // Clear command file to indicate we processed it
-            [@"" writeToFile:kCommandFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
             NSLog(@"[imsg-plus] Processed command, wrote response");
         } else {
             // Async handler (e.g., react) will write its own response
-            [@"" writeToFile:kCommandFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
             NSLog(@"[imsg-plus] Command dispatched async, response pending");
         }
     }
@@ -1772,6 +2024,9 @@ static void injectedInit(void) {
         } else {
             NSLog(@"[imsg-plus] IMChatRegistry NOT available");
         }
+
+        // Install send method swizzles to observe native UI sends
+        installSendSwizzles();
 
         // Start file watcher for IPC
         startFileWatcher();

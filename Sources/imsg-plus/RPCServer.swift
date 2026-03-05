@@ -369,38 +369,42 @@ final class RPCServer {
       throw RPCError.internalError("IMCoreBridge not available (required for thread replies)")
     }
 
-    // Check for markdown_text param — try rich text send via bridge
-    var sentViaRichText = false
-    if let markdownText, !markdownText.isEmpty, bridgeAvailable {
-      if let attrData = MarkdownComposer.compose(markdownText) {
-        let handle = resolveTypingHandle(
-          recipient: recipient,
-          chatIdentifier: resolvedChatIdentifier,
-          chatGUID: resolvedChatGUID
-        )
-        if let handle {
+    // Resolve handle for bridge sends
+    let handle = resolveTypingHandle(
+      recipient: recipient,
+      chatIdentifier: resolvedChatIdentifier,
+      chatGUID: resolvedChatGUID
+    )
+    let attachment: String? = file.isEmpty ? nil : file
+
+    // Try bridge first when available
+    var sentViaBridge = false
+    if bridgeAvailable, let handle {
+      do {
+        if let markdownText, !markdownText.isEmpty,
+          let attrData = MarkdownComposer.compose(markdownText)
+        {
           try await IMCoreBridge.shared.sendRichMessage(
-            handle: handle, attributedText: attrData, effect: effect, replyToGUID: replyToGUID)
-          sentViaRichText = true
+            handle: handle, attributedText: attrData, attachment: attachment,
+            effect: effect, replyToGUID: replyToGUID)
+        } else {
+          let sendText = text.isEmpty ? (markdownText ?? "") : text
+          try await IMCoreBridge.shared.sendMessage(
+            handle: handle, text: sendText, attachment: attachment,
+            effect: effect, replyToGUID: replyToGUID)
+        }
+        sentViaBridge = true
+      } catch {
+        // Thread replies cannot fall back to AppleScript
+        if replyToGUID != nil { throw error }
+        if verbose {
+          FileHandle.standardError.write(
+            Data("[bridge] send failed, falling back to AppleScript: \(error)\n".utf8))
         }
       }
     }
 
-    // Plain text with effect or reply — send via bridge
-    if !sentViaRichText && (effect != nil || replyToGUID != nil) && bridgeAvailable {
-      let handle = resolveTypingHandle(
-        recipient: recipient,
-        chatIdentifier: resolvedChatIdentifier,
-        chatGUID: resolvedChatGUID
-      )
-      if let handle {
-        try await IMCoreBridge.shared.sendMessage(
-          handle: handle, text: text, effect: effect, replyToGUID: replyToGUID)
-        sentViaRichText = true
-      }
-    }
-
-    if !sentViaRichText {
+    if !sentViaBridge {
       let sendText =
         markdownText != nil
         ? MarkdownComposer.stripMarkdown(markdownText ?? text) : text

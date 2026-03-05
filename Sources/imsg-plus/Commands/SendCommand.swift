@@ -107,74 +107,61 @@ enum SendCommand {
     }
 
     let replyGUID: String? = replyToGUID.isEmpty ? nil : replyToGUID
+    let attachment: String? = file.isEmpty ? nil : file
 
-    // Effects/reply-to/markdown require the IMCore bridge
-    if effect != nil || replyGUID != nil || (useMarkdown && !text.isEmpty) {
-      let bridge = IMCoreBridge.shared
-      let handle =
-        resolvedChatGUID.isEmpty
-        ? (resolvedChatIdentifier.isEmpty ? recipient : resolvedChatIdentifier)
-        : resolvedChatGUID
+    // Try bridge first when available
+    let bridge = IMCoreBridge.shared
+    let handle =
+      resolvedChatGUID.isEmpty
+      ? (resolvedChatIdentifier.isEmpty ? recipient : resolvedChatIdentifier)
+      : resolvedChatGUID
 
-      if bridge.isAvailable && !handle.isEmpty {
+    var sentViaBridge = false
+    if bridge.isAvailable && !handle.isEmpty {
+      do {
         if useMarkdown, let attrData = MarkdownComposer.compose(text) {
           try await bridge.sendRichMessage(
-            handle: handle, attributedText: attrData, effect: effect, replyToGUID: replyGUID)
+            handle: handle, attributedText: attrData, attachment: attachment,
+            effect: effect, replyToGUID: replyGUID)
         } else {
           try await bridge.sendMessage(
-            handle: handle, text: text, effect: effect, replyToGUID: replyGUID)
+            handle: handle, text: text, attachment: attachment,
+            effect: effect, replyToGUID: replyGUID)
         }
-        if runtime.jsonOutput {
-          var result: [String: String] = ["status": "sent"]
-          if useMarkdown { result["markdown"] = "true" }
-          if let effect { result["effect"] = effect.displayName }
-          try JSONLines.print(result)
-        } else {
-          var parts = ["sent"]
-          if useMarkdown { parts.append("with formatting") }
-          if let effect { parts.append("with \(effect.displayName) effect") }
-          Swift.print(parts.joined(separator: " "))
-        }
-        return
+        sentViaBridge = true
+      } catch {
+        // Thread replies cannot fall back to AppleScript
+        if replyGUID != nil { throw error }
       }
-
-      // Fallback when bridge unavailable: strip markdown, skip effect
-      if useMarkdown {
-        let plainText = MarkdownComposer.stripMarkdown(text)
-        try sendMessage(
-          MessageSendOptions(
-            recipient: recipient,
-            text: plainText,
-            attachmentPath: file,
-            service: service,
-            region: region,
-            chatIdentifier: resolvedChatIdentifier,
-            chatGUID: resolvedChatGUID
-          ))
-      } else {
-        try sendMessage(
-          MessageSendOptions(
-            recipient: recipient,
-            text: text,
-            attachmentPath: file,
-            service: service,
-            region: region,
-            chatIdentifier: resolvedChatIdentifier,
-            chatGUID: resolvedChatGUID
-          ))
-      }
-    } else {
-      try sendMessage(
-        MessageSendOptions(
-          recipient: recipient,
-          text: text,
-          attachmentPath: file,
-          service: service,
-          region: region,
-          chatIdentifier: resolvedChatIdentifier,
-          chatGUID: resolvedChatGUID
-        ))
     }
+
+    if sentViaBridge {
+      if runtime.jsonOutput {
+        var result: [String: String] = ["status": "sent"]
+        if useMarkdown { result["markdown"] = "true" }
+        if let effect { result["effect"] = effect.displayName }
+        try JSONLines.print(result)
+      } else {
+        var parts = ["sent"]
+        if useMarkdown { parts.append("with formatting") }
+        if let effect { parts.append("with \(effect.displayName) effect") }
+        Swift.print(parts.joined(separator: " "))
+      }
+      return
+    }
+
+    // AppleScript fallback — strip markdown, skip effect
+    let sendText = useMarkdown ? MarkdownComposer.stripMarkdown(text) : text
+    try sendMessage(
+      MessageSendOptions(
+        recipient: recipient,
+        text: sendText,
+        attachmentPath: file,
+        service: service,
+        region: region,
+        chatIdentifier: resolvedChatIdentifier,
+        chatGUID: resolvedChatGUID
+      ))
 
     if runtime.jsonOutput {
       try JSONLines.print(["status": "sent"])

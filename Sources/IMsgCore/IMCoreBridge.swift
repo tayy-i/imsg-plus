@@ -430,15 +430,34 @@ public final class IMCoreBridge: @unchecked Sendable {
     _ = try await sendCommand(action: "remove_participant", params: params)
   }
 
+  /// Stage an attachment file into ~/Library/Messages/Attachments/ so the
+  /// Messages daemon can access it. The CLI is not sandboxed, so it can write here.
+  /// Returns the staged file path.
+  private func stageAttachment(_ path: String) throws -> String {
+    let fm = FileManager.default
+    let srcURL = URL(fileURLWithPath: path)
+    let uuid = UUID().uuidString
+    let hashPrefix = String(uuid.prefix(2)).lowercased()
+    let home = fm.homeDirectoryForCurrentUser.path
+    let stagingDir = "\(home)/Library/Messages/Attachments/\(hashPrefix)/imsg-plus-\(uuid)"
+    try fm.createDirectory(atPath: stagingDir, withIntermediateDirectories: true)
+    let dest = "\(stagingDir)/\(srcURL.lastPathComponent)"
+    try fm.copyItem(atPath: path, toPath: dest)
+    return dest
+  }
+
   /// Send a rich text message (with attributed text and optional effect)
   public func sendRichMessage(
-    handle: String, attributedText: Data, effect: MessageEffect? = nil,
-    replyToGUID: String? = nil
+    handle: String, attributedText: Data, attachment: String? = nil,
+    effect: MessageEffect? = nil, replyToGUID: String? = nil
   ) async throws {
     var params: [String: Any] = [
       "handle": handle,
       "attributed_text": attributedText.base64EncodedString(),
     ]
+    if let attachment {
+      params["file"] = try stageAttachment(attachment)
+    }
     if let effect {
       params["effect_id"] = effect.expressiveSendStyleId
     }
@@ -451,10 +470,13 @@ public final class IMCoreBridge: @unchecked Sendable {
   /// Send a plain text message with an effect via IMCore bridge
   @discardableResult
   public func sendMessage(
-    handle: String, text: String, effect: MessageEffect? = nil,
-    replyToGUID: String? = nil
+    handle: String, text: String, attachment: String? = nil,
+    effect: MessageEffect? = nil, replyToGUID: String? = nil
   ) async throws -> [String: Any] {
     var params: [String: Any] = ["handle": handle, "text": text]
+    if let attachment {
+      params["file"] = try stageAttachment(attachment)
+    }
     if let effect {
       params["effect_id"] = effect.expressiveSendStyleId
     }
