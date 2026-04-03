@@ -390,6 +390,19 @@ public final class IMCoreBridge: @unchecked Sendable {
     return try await sendCommand(action: "status", params: [:])
   }
 
+  /// Get FindMy friend locations via FMFSession in Messages.app
+  public func getLocations(handle: String? = nil) async throws -> [FriendLocation] {
+    var params: [String: Any] = [:]
+    if let handle {
+      params["handle"] = handle
+    }
+    let response = try await sendCommand(action: "get_locations", params: params)
+    guard let locations = response["locations"] as? [[String: Any]] else {
+      return []
+    }
+    return locations.compactMap { FriendLocation(from: $0) }
+  }
+
   /// Create a new chat with the given addresses
   public func createChat(
     addresses: [String],

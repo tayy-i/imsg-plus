@@ -20,6 +20,7 @@ struct CommandRouter {
       ReactCommand.spec,
       EditCommand.spec,
       GroupCommand.spec,
+      LocationCommand.spec,
       StatusCommand.spec,
       LaunchCommand.spec,
       WatchdogCommand.spec,

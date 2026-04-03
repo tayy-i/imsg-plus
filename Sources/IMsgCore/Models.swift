@@ -271,6 +271,80 @@ public struct Message: Sendable, Equatable {
   }
 }
 
+/// A friend's location from FindMy location sharing
+public struct FriendLocation: Sendable {
+  public let handle: String
+  public let latitude: Double?
+  public let longitude: Double?
+  public let altitude: Double?
+  public let horizontalAccuracy: Double?
+  public let verticalAccuracy: Double?
+  public let timestamp: String?
+  public let address: String?
+  public let locality: String?
+  public let state: String?
+  public let country: String?
+  public let street: String?
+  public let label: String?
+  public let firstName: String?
+  public let lastName: String?
+  public let isOld: Bool
+  public let isInaccurate: Bool
+
+  public init(from dict: [String: Any]) {
+    self.handle = dict["handle"] as? String ?? ""
+    self.latitude = dict["latitude"] as? Double
+    self.longitude = dict["longitude"] as? Double
+    self.altitude = dict["altitude"] as? Double
+    self.horizontalAccuracy = dict["horizontal_accuracy"] as? Double
+    self.verticalAccuracy = dict["vertical_accuracy"] as? Double
+    self.timestamp = dict["timestamp"] as? String
+    self.address = dict["address"] as? String
+    self.locality = dict["locality"] as? String
+    self.state = dict["state"] as? String
+    self.country = dict["country"] as? String
+    self.street = dict["street"] as? String
+    self.label = dict["label"] as? String
+    self.firstName = dict["first_name"] as? String
+    self.lastName = dict["last_name"] as? String
+    self.isOld = dict["is_old"] as? Bool ?? false
+    self.isInaccurate = dict["is_inaccurate"] as? Bool ?? false
+  }
+
+  public init(
+    handle: String, latitude: Double?, longitude: Double?,
+    altitude: Double? = nil, horizontalAccuracy: Double? = nil,
+    verticalAccuracy: Double? = nil, timestamp: String? = nil,
+    address: String? = nil, locality: String? = nil,
+    state: String? = nil, country: String? = nil,
+    street: String? = nil, label: String? = nil,
+    firstName: String? = nil, lastName: String? = nil,
+    isOld: Bool = false, isInaccurate: Bool = false
+  ) {
+    self.handle = handle
+    self.latitude = latitude
+    self.longitude = longitude
+    self.altitude = altitude
+    self.horizontalAccuracy = horizontalAccuracy
+    self.verticalAccuracy = verticalAccuracy
+    self.timestamp = timestamp
+    self.address = address
+    self.locality = locality
+    self.state = state
+    self.country = country
+    self.street = street
+    self.label = label
+    self.firstName = firstName
+    self.lastName = lastName
+    self.isOld = isOld
+    self.isInaccurate = isInaccurate
+  }
+
+  public var hasCoordinates: Bool {
+    latitude != nil && longitude != nil
+  }
+}
+
 public struct AttachmentMeta: Sendable, Equatable {
   public let filename: String
   public let transferName: String

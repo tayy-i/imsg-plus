@@ -8,9 +8,11 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <CoreLocation/CoreLocation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <unistd.h>
+#import <dlfcn.h>
 
 #pragma mark - Constants
 
@@ -1860,6 +1862,1489 @@ static NSDictionary* handleUnsendMessage(NSInteger requestId, NSDictionary *para
     return nil;
 }
 
+#pragma mark - Location (Find My / FMFSession)
+
+static id valueForKeySafely(id obj, NSString *key) {
+    if (!obj || !key.length) return nil;
+    @try {
+        return [obj valueForKey:key];
+    } @catch (NSException *exception) {
+        return nil;
+    }
+}
+
+static id objectByPerformingSelector(id target, NSString *selectorName) {
+    SEL selector = NSSelectorFromString(selectorName);
+    if (!target || !selector || ![target respondsToSelector:selector]) {
+        return nil;
+    }
+    return ((id (*)(id, SEL))objc_msgSend)(target, selector);
+}
+
+static id objectByPerformingSelectorWithObject(id target, NSString *selectorName, id arg) {
+    SEL selector = NSSelectorFromString(selectorName);
+    if (!target || !selector || ![target respondsToSelector:selector]) {
+        return nil;
+    }
+    return ((id (*)(id, SEL, id))objc_msgSend)(target, selector, arg);
+}
+
+static id objectByPerformingSelectorWithObjectAndBool(id target, NSString *selectorName, id arg, BOOL flag) {
+    SEL selector = NSSelectorFromString(selectorName);
+    if (!target || !selector || ![target respondsToSelector:selector]) {
+        return nil;
+    }
+    return ((id (*)(id, SEL, id, BOOL))objc_msgSend)(target, selector, arg, flag);
+}
+
+static BOOL boolByPerformingSelectorWithObjectAndBool(id target, NSString *selectorName, id arg, BOOL flag, BOOL *didRespond) {
+    SEL selector = NSSelectorFromString(selectorName);
+    if (!target || !selector || ![target respondsToSelector:selector]) {
+        if (didRespond) *didRespond = NO;
+        return NO;
+    }
+    if (didRespond) *didRespond = YES;
+    return ((BOOL (*)(id, SEL, id, BOOL))objc_msgSend)(target, selector, arg, flag);
+}
+
+static BOOL boolByPerformingSelector(id target, NSString *selectorName, BOOL *didRespond) {
+    SEL selector = NSSelectorFromString(selectorName);
+    if (!target || !selector || ![target respondsToSelector:selector]) {
+        if (didRespond) *didRespond = NO;
+        return NO;
+    }
+    if (didRespond) *didRespond = YES;
+    return ((BOOL (*)(id, SEL))objc_msgSend)(target, selector);
+}
+
+static NSArray* objectsFromCollection(id collection) {
+    if (!collection || collection == [NSNull null]) return @[];
+    if ([collection isKindOfClass:[NSArray class]]) return collection;
+    if ([collection isKindOfClass:[NSSet class]]) return [(NSSet *)collection allObjects];
+    return @[collection];
+}
+
+static NSString* firstNonEmptyStringForKeys(id obj, NSArray *keys) {
+    for (NSString *key in keys) {
+        id value = valueForKeySafely(obj, key);
+        if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) {
+            return value;
+        }
+    }
+    return nil;
+}
+
+static NSNumber* firstNumberForKeys(id obj, NSArray *keys) {
+    for (NSString *key in keys) {
+        id value = valueForKeySafely(obj, key);
+        if ([value respondsToSelector:@selector(doubleValue)]) {
+            return @([value doubleValue]);
+        }
+    }
+    return nil;
+}
+
+static NSNumber* firstBoolForKeys(id obj, NSArray *keys) {
+    for (NSString *key in keys) {
+        id value = valueForKeySafely(obj, key);
+        if ([value respondsToSelector:@selector(boolValue)]) {
+            return @([value boolValue]);
+        }
+    }
+    return nil;
+}
+
+static NSString* iso8601StringFromDateValue(id value) {
+    if (!value || value == [NSNull null]) return nil;
+    if ([value isKindOfClass:[NSString class]]) {
+        return value;
+    }
+
+    NSDate *date = nil;
+    if ([value isKindOfClass:[NSDate class]]) {
+        date = value;
+    } else if ([value respondsToSelector:@selector(doubleValue)]) {
+        double timestamp = [value doubleValue];
+        if (timestamp > 1000000000000.0) {
+            timestamp /= 1000.0;
+        }
+        date = [NSDate dateWithTimeIntervalSince1970:timestamp];
+    }
+
+    if (!date) return nil;
+
+    static NSISO8601DateFormatter *formatter = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        formatter = [NSISO8601DateFormatter new];
+        formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+    });
+    return [formatter stringFromDate:date];
+}
+
+static NSString* handleStringFromObject(id handleObj) {
+    if ([handleObj isKindOfClass:[NSString class]] && [(NSString *)handleObj length] > 0) {
+        return handleObj;
+    }
+
+    NSString *candidate = firstNonEmptyStringForKeys(handleObj, @[
+        @"ID", @"identifier", @"handle", @"address", @"value", @"formattedID", @"destination"
+    ]);
+    if (candidate.length > 0) {
+        return candidate;
+    }
+
+    if (handleObj) {
+        NSString *description = [handleObj description];
+        if (description.length > 0 && ![description hasPrefix:@"<"]) {
+            return description;
+        }
+    }
+
+    return nil;
+}
+
+static NSArray* summarizedHandlesFromObjects(NSArray *objects) {
+    NSMutableArray *summaries = [NSMutableArray array];
+    for (id object in objects) {
+        NSString *handle = handleStringFromObject(object);
+        if (handle.length > 0) {
+            [summaries addObject:handle];
+        } else {
+            NSString *summary = [NSString stringWithFormat:@"%@ :: %@",
+                                 NSStringFromClass([object class]),
+                                 [object description] ?: @""];
+            [summaries addObject:summary];
+        }
+        if ([summaries count] >= 25) break;
+    }
+    return summaries;
+}
+
+static id newObjectOfClassNamed(NSString *className) {
+    Class cls = NSClassFromString(className);
+    if (!cls) return nil;
+
+    SEL newSel = NSSelectorFromString(@"new");
+    if ([cls respondsToSelector:newSel]) {
+        return ((id (*)(id, SEL))objc_msgSend)(cls, newSel);
+    }
+
+    SEL allocSel = NSSelectorFromString(@"alloc");
+    SEL initSel = NSSelectorFromString(@"init");
+    if ([cls respondsToSelector:allocSel]) {
+        id object = ((id (*)(id, SEL))objc_msgSend)(cls, allocSel);
+        if (object && [object respondsToSelector:initSel]) {
+            return ((id (*)(id, SEL))objc_msgSend)(object, initSel);
+        }
+        return object;
+    }
+
+    return nil;
+}
+
+static CLLocation* extractCLLocation(id locationObj) {
+    if ([locationObj isKindOfClass:[CLLocation class]]) {
+        return locationObj;
+    }
+
+    for (NSString *key in @[@"location", @"clLocation", @"coreLocation", @"currentLocation"]) {
+        id nested = valueForKeySafely(locationObj, key);
+        if ([nested isKindOfClass:[CLLocation class]]) {
+            return nested;
+        }
+    }
+
+    return nil;
+}
+
+static id extractAddressObject(id locationObj) {
+    for (NSString *key in @[@"address", @"formattedAddress", @"placemark", @"geocodedAddress", @"fmfAddress"]) {
+        id nested = valueForKeySafely(locationObj, key);
+        if (nested && nested != [NSNull null]) {
+            return nested;
+        }
+    }
+    return nil;
+}
+
+static NSDictionary* locationEntryForHandle(id handleObj, id locationObj) {
+    NSString *handle = handleStringFromObject(handleObj);
+    if (handle.length == 0) {
+        handle = handleStringFromObject(valueForKeySafely(locationObj, @"handle"));
+    }
+    if (handle.length == 0) {
+        return nil;
+    }
+
+    NSMutableDictionary *entry = [NSMutableDictionary dictionary];
+    entry[@"handle"] = handle;
+
+    if (!locationObj || locationObj == [NSNull null]) {
+        return entry;
+    }
+
+    CLLocation *clLocation = extractCLLocation(locationObj);
+    if (clLocation) {
+        CLLocationCoordinate2D coordinate = clLocation.coordinate;
+        if (CLLocationCoordinate2DIsValid(coordinate)) {
+            entry[@"latitude"] = @(coordinate.latitude);
+            entry[@"longitude"] = @(coordinate.longitude);
+        }
+        entry[@"altitude"] = @(clLocation.altitude);
+        if (clLocation.horizontalAccuracy >= 0) {
+            entry[@"horizontal_accuracy"] = @(clLocation.horizontalAccuracy);
+        }
+        if (clLocation.verticalAccuracy >= 0) {
+            entry[@"vertical_accuracy"] = @(clLocation.verticalAccuracy);
+        }
+        NSString *timestamp = iso8601StringFromDateValue(clLocation.timestamp);
+        if (timestamp) {
+            entry[@"timestamp"] = timestamp;
+        }
+    }
+
+    NSNumber *latitude = firstNumberForKeys(locationObj, @[@"latitude", @"lat"]);
+    NSNumber *longitude = firstNumberForKeys(locationObj, @[@"longitude", @"lng", @"lon"]);
+    NSNumber *altitude = firstNumberForKeys(locationObj, @[@"altitude"]);
+    NSNumber *horizontalAccuracy = firstNumberForKeys(locationObj, @[@"horizontalAccuracy"]);
+    NSNumber *verticalAccuracy = firstNumberForKeys(locationObj, @[@"verticalAccuracy"]);
+    NSString *timestamp = iso8601StringFromDateValue(valueForKeySafely(locationObj, @"timestamp"));
+
+    if (!entry[@"latitude"] && latitude) entry[@"latitude"] = latitude;
+    if (!entry[@"longitude"] && longitude) entry[@"longitude"] = longitude;
+    if (!entry[@"altitude"] && altitude) entry[@"altitude"] = altitude;
+    if (!entry[@"horizontal_accuracy"] && horizontalAccuracy) entry[@"horizontal_accuracy"] = horizontalAccuracy;
+    if (!entry[@"vertical_accuracy"] && verticalAccuracy) entry[@"vertical_accuracy"] = verticalAccuracy;
+    if (!entry[@"timestamp"] && timestamp) entry[@"timestamp"] = timestamp;
+
+    id addressObj = extractAddressObject(locationObj);
+    NSString *address = firstNonEmptyStringForKeys(locationObj, @[@"formattedAddress", @"addressString", @"fullAddress"]);
+    if (!address && addressObj) {
+        id lines = valueForKeySafely(addressObj, @"formattedAddressLines");
+        if ([lines isKindOfClass:[NSArray class]] && [(NSArray *)lines count] > 0) {
+            address = [(NSArray *)lines componentsJoinedByString:@", "];
+        }
+    }
+    if (!address) {
+        address = firstNonEmptyStringForKeys(addressObj, @[@"formattedAddress", @"fullAddress", @"address"]);
+    }
+    if (address.length > 0) entry[@"address"] = address;
+
+    NSString *street = firstNonEmptyStringForKeys(addressObj, @[@"street", @"streetAddress", @"thoroughfare"]);
+    NSString *locality = firstNonEmptyStringForKeys(addressObj, @[@"locality", @"city"]);
+    NSString *state = firstNonEmptyStringForKeys(addressObj, @[@"state", @"stateCode", @"administrativeArea"]);
+    NSString *country = firstNonEmptyStringForKeys(addressObj, @[@"country", @"countryName"]);
+    NSString *label = firstNonEmptyStringForKeys(locationObj, @[@"label", @"locationLabel"]);
+    NSString *firstName = firstNonEmptyStringForKeys(locationObj, @[@"firstName", @"givenName"]);
+    NSString *lastName = firstNonEmptyStringForKeys(locationObj, @[@"lastName", @"familyName"]);
+
+    if (street.length > 0) entry[@"street"] = street;
+    if (locality.length > 0) entry[@"locality"] = locality;
+    if (state.length > 0) entry[@"state"] = state;
+    if (country.length > 0) entry[@"country"] = country;
+    if (label.length > 0) entry[@"label"] = label;
+    if (firstName.length > 0) entry[@"first_name"] = firstName;
+    if (lastName.length > 0) entry[@"last_name"] = lastName;
+
+    NSNumber *isOld = firstBoolForKeys(locationObj, @[@"isOld", @"old"]);
+    NSNumber *isInaccurate = firstBoolForKeys(locationObj, @[@"isInaccurate", @"inaccurate"]);
+    if (isOld) entry[@"is_old"] = isOld;
+    if (isInaccurate) entry[@"is_inaccurate"] = isInaccurate;
+
+    return entry;
+}
+
+static NSArray* collectLocationEntriesFromFindMyLocateTarget(id target,
+                                                             NSString *label,
+                                                             NSString *filterHandle,
+                                                             NSArray *friendObjects,
+                                                             NSArray *locationSelectorsWithAddress,
+                                                             NSArray *locationSelectors,
+                                                             NSMutableSet *seenHandles,
+                                                             NSMutableArray *diagLog) {
+    NSMutableArray *results = [NSMutableArray array];
+    NSMutableArray *candidateObjects = [NSMutableArray array];
+    NSMutableSet *candidateKeys = [NSMutableSet set];
+
+    if (filterHandle.length > 0) {
+        [candidateObjects addObject:filterHandle];
+        [candidateKeys addObject:filterHandle];
+    }
+
+    NSInteger anonymousIndex = 0;
+    for (id friendObj in friendObjects) {
+        NSString *candidateKey = handleStringFromObject(friendObj);
+        if (candidateKey.length == 0) {
+            candidateKey = [NSString stringWithFormat:@"__anon_%@_%ld",
+                            label, (long)anonymousIndex++];
+        }
+        if ([candidateKeys containsObject:candidateKey]) continue;
+        [candidateKeys addObject:candidateKey];
+        [candidateObjects addObject:friendObj];
+    }
+
+    for (id candidate in candidateObjects) {
+        id locationObject = nil;
+        NSString *usedLocationSelector = nil;
+        id nestedHandleObject = valueForKeySafely(candidate, @"handle");
+
+        for (NSString *selectorName in locationSelectorsWithAddress) {
+            if (![target respondsToSelector:NSSelectorFromString(selectorName)]) continue;
+            locationObject = objectByPerformingSelectorWithObjectAndBool(target, selectorName, candidate, YES);
+            usedLocationSelector = selectorName;
+
+            if (!locationObject && nestedHandleObject && nestedHandleObject != candidate) {
+                locationObject = objectByPerformingSelectorWithObjectAndBool(target, selectorName, nestedHandleObject, YES);
+            }
+
+            NSString *candidateHandle = handleStringFromObject(candidate);
+            if (!locationObject && candidateHandle.length > 0 && candidate != candidateHandle) {
+                locationObject = objectByPerformingSelectorWithObjectAndBool(target, selectorName, candidateHandle, YES);
+            }
+
+            if (locationObject) break;
+        }
+
+        if (!locationObject) {
+            for (NSString *selectorName in locationSelectors) {
+                if (![target respondsToSelector:NSSelectorFromString(selectorName)]) continue;
+                locationObject = objectByPerformingSelectorWithObject(target, selectorName, candidate);
+                usedLocationSelector = selectorName;
+
+                if (!locationObject && nestedHandleObject && nestedHandleObject != candidate) {
+                    locationObject = objectByPerformingSelectorWithObject(target, selectorName, nestedHandleObject);
+                }
+
+                NSString *candidateHandle = handleStringFromObject(candidate);
+                if (!locationObject && candidateHandle.length > 0 && candidate != candidateHandle) {
+                    locationObject = objectByPerformingSelectorWithObject(target, selectorName, candidateHandle);
+                }
+
+                if (locationObject) break;
+            }
+        }
+
+        NSString *candidateHandle = handleStringFromObject(candidate);
+        NSString *candidateLabel = candidateHandle.length > 0 ? candidateHandle : NSStringFromClass([candidate class]);
+        [diagLog addObject:[NSString stringWithFormat:@"%@ %@(%@) -> %@",
+                            label,
+                            usedLocationSelector ?: @"cachedLocation",
+                            candidateLabel,
+                            locationObject ? NSStringFromClass([locationObject class]) : @"nil"]];
+
+        if (!locationObject) {
+            continue;
+        }
+
+        NSDictionary *entry = locationEntryForHandle(candidate, locationObject);
+        NSString *entryHandle = [entry[@"handle"] isKindOfClass:[NSString class]] ? entry[@"handle"] : nil;
+        if (!entry || entryHandle.length == 0) {
+            continue;
+        }
+
+        if (seenHandles && [seenHandles containsObject:entryHandle]) {
+            continue;
+        }
+
+        if (seenHandles) {
+            [seenHandles addObject:entryHandle];
+        }
+        [results addObject:entry];
+    }
+
+    return results;
+}
+
+static NSArray* handleObjectsFromFindMyLocateObjects(NSArray *objects) {
+    NSMutableArray *handleObjects = [NSMutableArray array];
+    NSMutableSet *seenKeys = [NSMutableSet set];
+
+    for (id object in objects) {
+        id handleObject = valueForKeySafely(object, @"handle");
+        id candidate = handleObject ?: object;
+        NSString *dedupeKey = handleStringFromObject(candidate);
+        if (dedupeKey.length == 0) {
+            dedupeKey = [NSString stringWithFormat:@"%p", candidate];
+        }
+        if ([seenKeys containsObject:dedupeKey]) continue;
+        [seenKeys addObject:dedupeKey];
+        [handleObjects addObject:candidate];
+    }
+
+    return handleObjects;
+}
+
+static id newFMLHandleForIdentifier(NSString *identifier) {
+    if (![identifier isKindOfClass:[NSString class]] || identifier.length == 0) {
+        return nil;
+    }
+
+    Class handleClass = NSClassFromString(@"FMLHandle");
+    SEL selector = NSSelectorFromString(@"handleWithIdentifier:");
+    if (!handleClass || ![handleClass respondsToSelector:selector]) {
+        return nil;
+    }
+
+    return ((id (*)(id, SEL, id))objc_msgSend)(handleClass, selector, identifier);
+}
+
+static void spinMainRunLoopForSeconds(NSTimeInterval seconds) {
+    if (seconds <= 0) {
+        return;
+    }
+
+    NSDate *untilDate = [NSDate dateWithTimeIntervalSinceNow:seconds];
+    if ([NSThread isMainThread]) {
+        [[NSRunLoop mainRunLoop] runUntilDate:untilDate];
+        return;
+    }
+
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSRunLoop mainRunLoop] runUntilDate:untilDate];
+        dispatch_semaphore_signal(semaphore);
+    });
+    dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, (int64_t)((seconds + 1.0) * NSEC_PER_SEC)));
+}
+
+// Poll explicit friend objects/handles after refresh because the cached friend arrays
+// can remain empty even after findmylocateagent has produced a usable cached location.
+static NSArray* pollLocationsFromExplicitFindMyLocateTargets(NSString *filterHandle,
+                                                             id directFindMyLocateSession,
+                                                             NSArray *directFriendObjects,
+                                                             id findMyLocateBootstrap,
+                                                             NSArray *bootstrapFriendObjects,
+                                                             NSArray *bootstrapHandleObjects,
+                                                             NSMutableArray *diagLog) {
+    NSArray *sessionCandidates = [directFriendObjects count] > 0 ? directFriendObjects : @[];
+    NSArray *wrapperCandidates = [bootstrapFriendObjects count] > 0 ? bootstrapFriendObjects :
+                                 ([bootstrapHandleObjects count] > 0 ? bootstrapHandleObjects : @[]);
+
+    if (!directFindMyLocateSession && !findMyLocateBootstrap) {
+        return @[];
+    }
+    if ([sessionCandidates count] == 0 && [wrapperCandidates count] == 0 && filterHandle.length == 0) {
+        [diagLog addObject:@"FindMyLocate explicit poll skipped: no friend objects or handles to query"];
+        return @[];
+    }
+
+    for (NSInteger attempt = 0; attempt < 6; attempt++) {
+        if (attempt > 0) {
+            spinMainRunLoopForSeconds(0.5);
+        }
+
+        NSMutableArray *results = [NSMutableArray array];
+        NSMutableSet *seenHandles = [NSMutableSet set];
+        NSString *attemptLabel = [NSString stringWithFormat:@"attempt %ld", (long)(attempt + 1)];
+
+        if (directFindMyLocateSession) {
+            NSArray *sessionResults = collectLocationEntriesFromFindMyLocateTarget(
+                directFindMyLocateSession,
+                [NSString stringWithFormat:@"FindMyLocateSession(explicit %@)", attemptLabel],
+                filterHandle,
+                sessionCandidates,
+                @[@"cachedLocationForHandle:includeAddress:"],
+                @[@"cachedLocationForHandle:"],
+                seenHandles,
+                diagLog
+            );
+            if ([sessionResults count] > 0) {
+                [results addObjectsFromArray:sessionResults];
+            }
+        }
+
+        if (findMyLocateBootstrap) {
+            NSArray *wrapperResults = collectLocationEntriesFromFindMyLocateTarget(
+                findMyLocateBootstrap,
+                [NSString stringWithFormat:@"FindMyLocateObjCWrapper(explicit %@)", attemptLabel],
+                nil,
+                wrapperCandidates,
+                @[@"cachedLocationFor:includeAddress:"],
+                @[],
+                seenHandles,
+                diagLog
+            );
+            if ([wrapperResults count] > 0) {
+                [results addObjectsFromArray:wrapperResults];
+            }
+        }
+
+        if ([results count] > 0) {
+            [diagLog addObject:[NSString stringWithFormat:@"FindMyLocate explicit poll returned %lu location entries on %@",
+                                (unsigned long)[results count], attemptLabel]];
+            return results;
+        }
+    }
+
+    [diagLog addObject:@"FindMyLocate explicit poll exhausted without location objects"];
+    return @[];
+}
+
+static NSArray* collectLocationsViaFindMyLocate(NSString *filterHandle, NSMutableArray *diagLog, BOOL *sawKnownSharingHandles) {
+    if (sawKnownSharingHandles) *sawKnownSharingHandles = NO;
+
+    dlopen("/System/Library/PrivateFrameworks/FindMyLocate.framework/FindMyLocate", RTLD_NOW);
+    dlopen("/System/Library/PrivateFrameworks/FindMyLocateObjCWrapper.framework/FindMyLocateObjCWrapper", RTLD_NOW);
+
+    NSArray *targets = @[
+        @{
+            @"label": @"FindMyLocateSession",
+            @"class_name": @"FindMyLocateSession",
+            @"friend_selectors": @[@"cachedFriendsSharingLocationsWithMe"],
+            @"location_selectors_with_address": @[@"cachedLocationForHandle:includeAddress:"],
+            @"location_selectors": @[@"cachedLocationForHandle:"],
+        },
+        @{
+            @"label": @"FindMyLocateObjCWrapper",
+            @"class_name": @"FindMyLocateObjCWrapper.ObjCBootstrap",
+            @"friend_selectors": @[@"cachedFriendsSharingLocationWithMe"],
+            @"location_selectors_with_address": @[@"cachedLocationFor:includeAddress:"],
+            @"location_selectors": @[],
+        },
+    ];
+
+    NSMutableArray *results = [NSMutableArray array];
+    NSMutableSet *seenHandles = [NSMutableSet set];
+
+    for (NSDictionary *targetInfo in targets) {
+        NSString *label = targetInfo[@"label"];
+        NSString *className = targetInfo[@"class_name"];
+        id target = newObjectOfClassNamed(className);
+        if (!target) {
+            [diagLog addObject:[NSString stringWithFormat:@"%@ unavailable", label]];
+            continue;
+        }
+
+        [diagLog addObject:[NSString stringWithFormat:@"%@ target=%@", label, NSStringFromClass([target class])]];
+
+        NSArray *friendObjects = @[];
+        NSString *usedFriendSelector = nil;
+        for (NSString *selectorName in targetInfo[@"friend_selectors"]) {
+            id value = objectByPerformingSelector(target, selectorName);
+            if (value) {
+                usedFriendSelector = selectorName;
+                friendObjects = objectsFromCollection(value);
+                break;
+            }
+        }
+
+        if (usedFriendSelector) {
+            [diagLog addObject:[NSString stringWithFormat:@"%@ %@ -> %lu objects %@",
+                                label,
+                                usedFriendSelector,
+                                (unsigned long)[friendObjects count],
+                                summarizedHandlesFromObjects(friendObjects)]];
+        } else {
+            [diagLog addObject:[NSString stringWithFormat:@"%@ no cached friends selector responded", label]];
+        }
+
+        if ([friendObjects count] > 0 && sawKnownSharingHandles) {
+            *sawKnownSharingHandles = YES;
+        }
+
+        NSArray *targetResults = collectLocationEntriesFromFindMyLocateTarget(
+            target,
+            label,
+            filterHandle,
+            friendObjects,
+            targetInfo[@"location_selectors_with_address"],
+            targetInfo[@"location_selectors"],
+            seenHandles,
+            diagLog
+        );
+        if ([targetResults count] > 0) {
+            [results addObjectsFromArray:targetResults];
+        }
+    }
+
+    return results;
+}
+
+static NSArray* friendObjectsFromFindMyLocateTarget(id target, NSArray *friendSelectors) {
+    for (NSString *selectorName in friendSelectors) {
+        id value = objectByPerformingSelector(target, selectorName);
+        NSArray *objects = objectsFromCollection(value);
+        if ([objects count] > 0) {
+            return objects;
+        }
+    }
+    return @[];
+}
+
+static NSArray* handleStringsFromFindMyLocateTarget(id target, NSArray *friendSelectors) {
+    NSArray *friendObjects = friendObjectsFromFindMyLocateTarget(target, friendSelectors);
+    NSMutableArray *handles = [NSMutableArray array];
+    NSMutableSet *seenHandles = [NSMutableSet set];
+
+    for (id object in friendObjects) {
+        NSString *handle = handleStringFromObject(object);
+        if (handle.length == 0 || [seenHandles containsObject:handle]) continue;
+        [seenHandles addObject:handle];
+        [handles addObject:handle];
+    }
+
+    return handles;
+}
+
+static NSArray* methodNamesForClass(Class cls, BOOL instanceMethods) {
+    if (!cls) return @[];
+
+    unsigned int count = 0;
+    Class targetClass = instanceMethods ? cls : object_getClass(cls);
+    Method *methods = class_copyMethodList(targetClass, &count);
+    NSMutableArray *names = [NSMutableArray arrayWithCapacity:count];
+    for (unsigned int i = 0; i < count; i++) {
+        SEL selector = method_getName(methods[i]);
+        if (selector) {
+            [names addObject:NSStringFromSelector(selector)];
+        }
+    }
+    free(methods);
+
+    return [names sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+}
+
+static NSDictionary* handleDebugObjCClass(NSInteger requestId, NSDictionary *params) {
+    NSString *className = [params[@"class_name"] isKindOfClass:[NSString class]] ? params[@"class_name"] : params[@"class"];
+    NSString *prefix = [params[@"prefix"] isKindOfClass:[NSString class]] ? params[@"prefix"] : nil;
+
+    NSMutableDictionary *payload = [NSMutableDictionary dictionary];
+
+    if (prefix.length > 0) {
+        unsigned int classCount = 0;
+        Class *classes = objc_copyClassList(&classCount);
+        NSMutableArray *matching = [NSMutableArray array];
+        for (unsigned int i = 0; i < classCount; i++) {
+            NSString *name = NSStringFromClass(classes[i]);
+            if ([name hasPrefix:prefix]) {
+                [matching addObject:name];
+            }
+        }
+        free(classes);
+        payload[@"matching_classes"] = [matching sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+    }
+
+    if (className.length > 0) {
+        Class cls = NSClassFromString(className);
+        if (!cls) {
+            return errorResponse(requestId, [NSString stringWithFormat:@"Class not found: %@", className]);
+        }
+
+        payload[@"class_name"] = className;
+        payload[@"instance_methods"] = methodNamesForClass(cls, YES);
+        payload[@"class_methods"] = methodNamesForClass(cls, NO);
+    }
+
+    if (payload.count == 0) {
+        return errorResponse(requestId, @"Provide `class_name` or `prefix`");
+    }
+
+    return successResponse(requestId, payload);
+}
+
+static id summarizedDebugValue(id value) {
+    if (!value || value == [NSNull null]) return @"nil";
+
+    if ([value isKindOfClass:[NSArray class]]) {
+        NSMutableArray *items = [NSMutableArray array];
+        for (id item in (NSArray *)value) {
+            [items addObject:[NSString stringWithFormat:@"%@ :: %@",
+                              NSStringFromClass([item class]), [item description]]];
+            if ([items count] >= 50) break;
+        }
+        return @{
+            @"class": NSStringFromClass([value class]),
+            @"count": @([(NSArray *)value count]),
+            @"items": items,
+        };
+    }
+
+    if ([value isKindOfClass:[NSSet class]]) {
+        return summarizedDebugValue([(NSSet *)value allObjects]);
+    }
+
+    if ([value isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *summary = [NSMutableDictionary dictionary];
+        NSMutableArray *keys = [NSMutableArray array];
+        for (id key in [(NSDictionary *)value allKeys]) {
+            [keys addObject:[key description]];
+        }
+        summary[@"class"] = NSStringFromClass([value class]);
+        summary[@"count"] = @([(NSDictionary *)value count]);
+        summary[@"keys"] = [keys sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+        return summary;
+    }
+
+    return @{
+        @"class": NSStringFromClass([value class]),
+        @"description": [value description] ?: @"",
+    };
+}
+
+static NSDictionary* handleDebugInvokeSelector(NSInteger requestId, NSDictionary *params) {
+    NSString *className = [params[@"class_name"] isKindOfClass:[NSString class]] ? params[@"class_name"] : nil;
+    NSString *selectorName = [params[@"selector"] isKindOfClass:[NSString class]] ? params[@"selector"] : nil;
+    BOOL useSharedInstance = [params[@"shared_instance"] respondsToSelector:@selector(boolValue)] ? [params[@"shared_instance"] boolValue] : NO;
+
+    if (className.length == 0 || selectorName.length == 0) {
+        return errorResponse(requestId, @"Provide `class_name` and `selector`");
+    }
+
+    Class cls = NSClassFromString(className);
+    if (!cls) {
+        return errorResponse(requestId, [NSString stringWithFormat:@"Class not found: %@", className]);
+    }
+
+    id target = cls;
+    if (useSharedInstance) {
+        target = objectByPerformingSelector(cls, @"sharedInstance");
+        if (!target) {
+            return errorResponse(requestId, [NSString stringWithFormat:@"%@.sharedInstance is nil", className]);
+        }
+    }
+
+    SEL selector = NSSelectorFromString(selectorName);
+    if (![target respondsToSelector:selector]) {
+        return errorResponse(requestId, [NSString stringWithFormat:@"%@ does not respond to %@", target, selectorName]);
+    }
+
+    id result = ((id (*)(id, SEL))objc_msgSend)(target, selector);
+    return successResponse(requestId, @{
+        @"class_name": className,
+        @"selector": selectorName,
+        @"shared_instance": @(useSharedInstance),
+        @"result": summarizedDebugValue(result),
+    });
+}
+
+static NSDictionary* handleDebugFriendshipState(NSInteger requestId, NSDictionary *params) {
+    NSString *handleIdentifier = [params[@"handle"] isKindOfClass:[NSString class]] ? params[@"handle"] : nil;
+    if (handleIdentifier.length == 0) {
+        return errorResponse(requestId, @"Provide `handle`");
+    }
+
+    NSMutableDictionary *payload = [NSMutableDictionary dictionary];
+    payload[@"handle"] = handleIdentifier;
+
+    id handleObject = newFMLHandleForIdentifier(handleIdentifier);
+    if (handleObject) {
+        payload[@"handle_object"] = summarizedDebugValue(handleObject);
+    }
+
+    NSArray *targetSpecs = @[
+        @{
+            @"label": @"findmylocate_session",
+            @"class": @"FindMyLocateSession",
+            @"friendship_selector": @"friendshipStateWithHandle:isFromGroup:completion:",
+            @"cached_friend_selectors": @[@"cachedFriendsSharingLocationsWithMe", @"cachedFriendsFollowingMyLocation"],
+        },
+        @{
+            @"label": @"findmylocate_wrapper",
+            @"class": @"FindMyLocateObjCWrapper.ObjCBootstrap",
+            @"friendship_selector": @"friendshipStateWithHandle:isFromGroup:completionHandler:",
+            @"cached_friend_selectors": @[@"cachedFriendsSharingLocationWithMe", @"cachedFriendsFollowingMyLocation", @"cachedFriendsWithPendingOffers"],
+        },
+    ];
+
+    for (NSDictionary *spec in targetSpecs) {
+        NSString *label = spec[@"label"];
+        NSString *className = spec[@"class"];
+        id target = newObjectOfClassNamed(className);
+        if (!target) {
+            payload[label] = @{@"error": [NSString stringWithFormat:@"Unable to create %@", className]};
+            continue;
+        }
+
+        NSMutableDictionary *targetPayload = [NSMutableDictionary dictionary];
+        targetPayload[@"target_class"] = NSStringFromClass([target class]);
+
+        BOOL cachedCanShareDidRespond = NO;
+        BOOL cachedCanShare = boolByPerformingSelectorWithObjectAndBool(
+            target,
+            @"cachedCanShareLocationWithHandle:isFromGroup:",
+            handleObject ?: handleIdentifier,
+            NO,
+            &cachedCanShareDidRespond
+        );
+        if (cachedCanShareDidRespond) {
+            targetPayload[@"cached_can_share"] = @(cachedCanShare);
+        }
+
+        NSMutableSet *seenCachedHandles = [NSMutableSet set];
+        NSMutableArray *cachedHandleLists = [NSMutableArray array];
+        for (NSString *selectorName in spec[@"cached_friend_selectors"]) {
+            NSArray *handles = handleStringsFromFindMyLocateTarget(target, @[selectorName]);
+            if ([handles count] == 0) continue;
+
+            NSMutableArray *uniqueHandles = [NSMutableArray array];
+            for (NSString *candidate in handles) {
+                if (![candidate isKindOfClass:[NSString class]] || candidate.length == 0) continue;
+                if ([seenCachedHandles containsObject:candidate]) continue;
+                [seenCachedHandles addObject:candidate];
+                [uniqueHandles addObject:candidate];
+            }
+            if ([uniqueHandles count] == 0) continue;
+
+            [cachedHandleLists addObject:@{
+                @"selector": selectorName,
+                @"handles": uniqueHandles,
+            }];
+        }
+        if ([cachedHandleLists count] > 0) {
+            targetPayload[@"cached_handle_sets"] = cachedHandleLists;
+        }
+
+        NSString *friendshipSelectorName = spec[@"friendship_selector"];
+        SEL friendshipSelector = NSSelectorFromString(friendshipSelectorName);
+        if ([target respondsToSelector:friendshipSelector]) {
+            dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+            __block id friendshipState = nil;
+            typedef void (*FriendshipIMP)(id, SEL, id, BOOL, void(^)(id));
+            FriendshipIMP friendshipIMP = (FriendshipIMP)objc_msgSend;
+            friendshipIMP(target, friendshipSelector, handleObject ?: handleIdentifier, NO, ^(id state) {
+                friendshipState = state;
+                dispatch_semaphore_signal(semaphore);
+            });
+
+            long waitResult = dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+            if (waitResult != 0) {
+                targetPayload[@"friendship_state_timeout"] = @YES;
+            } else {
+                targetPayload[@"friendship_state"] = summarizedDebugValue(friendshipState);
+                if (friendshipState) {
+                    targetPayload[@"friendship_state_methods"] = methodNamesForClass([friendshipState class], YES);
+                }
+            }
+        } else {
+            targetPayload[@"friendship_state_error"] = [NSString stringWithFormat:@"%@ does not respond to %@",
+                                                        NSStringFromClass([target class]),
+                                                        friendshipSelectorName];
+        }
+
+        payload[label] = targetPayload;
+    }
+
+    return successResponse(requestId, payload);
+}
+
+static NSDictionary* handleInitLocation(NSInteger requestId, NSDictionary *params) {
+    if (!_diagLog) _diagLog = [NSMutableArray array];
+    else [_diagLog removeAllObjects];
+    [_diagLog addObject:@"=== init_location START ==="];
+
+    @try {
+        dlopen("/System/Library/PrivateFrameworks/FMFCore.framework/FMFCore", RTLD_NOW);
+        Class FMFSessionClass = NSClassFromString(@"FMFSession");
+        if (!FMFSessionClass) {
+            return errorResponse(requestId, @"FMFSession not available");
+        }
+
+        id session = objectByPerformingSelector(FMFSessionClass, @"sharedInstance");
+        if (!session) {
+            return errorResponse(requestId, @"FMFSession.sharedInstance is nil");
+        }
+
+        NSMutableDictionary *diag = [NSMutableDictionary dictionary];
+
+        // Check provisioning
+        BOOL hasProvisioningValue = NO;
+        BOOL prov = boolByPerformingSelector((id)FMFSessionClass, @"isProvisionedForLocationSharing", &hasProvisioningValue);
+        if (hasProvisioningValue) {
+            diag[@"provisioned"] = @(prov);
+        }
+
+        // isMyLocationEnabled
+        BOOL hasMyLocationValue = NO;
+        BOOL myLocEnabled = boolByPerformingSelector(session, @"isMyLocationEnabled", &hasMyLocationValue);
+        if (hasMyLocationValue) {
+            diag[@"my_location_enabled"] = @(myLocEnabled);
+        }
+
+        // Current handles
+        NSSet *handles = objectByPerformingSelector(session, @"handles");
+        diag[@"handles"] = [handles allObjects] ?: @[];
+        diag[@"cached_sharing_with_me"] = objectsFromCollection(objectByPerformingSelector(session, @"cachedGetHandlesSharingLocationsWithMe"));
+        diag[@"sync_sharing_with_me"] = objectsFromCollection(objectByPerformingSelector(session, @"getHandlesSharingLocationsWithMe"));
+        diag[@"active_device_sync"] = [NSString stringWithFormat:@"%@", objectByPerformingSelector(session, @"getActiveLocationSharingDevice") ?: @"nil"];
+
+        id allDevicesSync = objectByPerformingSelector(session, @"getAllDevices");
+        if (allDevicesSync) {
+            diag[@"devices_sync"] = objectsFromCollection(allDevicesSync);
+        }
+
+        NSDictionary *cachedLocationMap = objectByPerformingSelector(session, @"cachedLocationForHandleByHandle");
+        if ([cachedLocationMap isKindOfClass:[NSDictionary class]]) {
+            diag[@"cached_location_handles"] = [[cachedLocationMap allKeys] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+        }
+
+        BOOL sawFindMyLocateHandles = NO;
+        NSArray *findMyLocateResults = collectLocationsViaFindMyLocate(nil, _diagLog, &sawFindMyLocateHandles);
+        diag[@"findmylocate_has_known_sharing_handles"] = @(sawFindMyLocateHandles);
+        if ([findMyLocateResults count] > 0) {
+            diag[@"findmylocate_locations"] = findMyLocateResults;
+        }
+
+        // Set handles from params if provided
+        NSArray *newHandles = params[@"handles"];
+        if (newHandles && newHandles.count > 0) {
+            NSSet *handleSet = [NSSet setWithArray:newHandles];
+            ((void (*)(id, SEL, id))objc_msgSend)(session, NSSelectorFromString(@"setHandles:"), handleSet);
+            diag[@"set_handles"] = newHandles;
+            [_diagLog addObject:[NSString stringWithFormat:@"Set handles: %@", newHandles]];
+        }
+
+        // Try to unhide location
+        SEL unhideSel = NSSelectorFromString(@"setHideMyLocationEnabled:completion:");
+        if ([session respondsToSelector:unhideSel]) {
+            typedef void (*UnhideIMP)(id, SEL, BOOL, id);
+            UnhideIMP doUnhide = (UnhideIMP)objc_msgSend;
+            doUnhide(session, unhideSel, NO, nil);
+            diag[@"unhide_called"] = @YES;
+        }
+
+        // Reload data
+        SEL reloadSel = NSSelectorFromString(@"reloadDataIfNotLoaded");
+        if ([session respondsToSelector:reloadSel]) {
+            ((void (*)(id, SEL))objc_msgSend)(session, reloadSel);
+            diag[@"reload_called"] = @YES;
+        }
+
+        // Get devices + active device + force refresh (all async, chain them)
+        typedef void (*AsyncIMP)(id, SEL, void(^)(id));
+        __block NSMutableDictionary *asyncDiag = [NSMutableDictionary dictionary];
+        dispatch_group_t group = dispatch_group_create();
+
+        // getAllDevices
+        SEL allDevSel = NSSelectorFromString(@"getAllDevices:");
+        if ([session respondsToSelector:allDevSel]) {
+            dispatch_group_enter(group);
+            AsyncIMP fn = (AsyncIMP)objc_msgSend;
+            fn(session, allDevSel, ^(id result) {
+                if ([result isKindOfClass:[NSArray class]]) {
+                    NSMutableArray *devNames = [NSMutableArray array];
+                    for (id dev in (NSArray *)result) {
+                        NSString *name = nil;
+                        @try { name = [dev valueForKey:@"name"]; } @catch(id e) {}
+                        if (!name) @try { name = [dev description]; } @catch(id e) {}
+                        [devNames addObject:name ?: @"?"];
+                    }
+                    asyncDiag[@"devices"] = devNames;
+
+                    // Try to set the first device as active
+                    if ([(NSArray *)result count] > 0) {
+                        SEL setActiveSel = NSSelectorFromString(@"setActiveDevice:completion:");
+                        if ([session respondsToSelector:setActiveSel]) {
+                            typedef void (*SetDevIMP)(id, SEL, id, void(^)(id));
+                            SetDevIMP setDev = (SetDevIMP)objc_msgSend;
+                            id firstDevice = [(NSArray *)result firstObject];
+                            setDev(session, setActiveSel, firstDevice, ^(id res) {
+                                asyncDiag[@"set_active_result"] = [NSString stringWithFormat:@"%@", res ?: @"ok"];
+                            });
+                        }
+                    }
+                } else {
+                    asyncDiag[@"devices"] = [NSString stringWithFormat:@"%@", result ?: @"nil"];
+                }
+                dispatch_group_leave(group);
+            });
+        }
+
+        // getActiveLocationSharingDevice
+        SEL activeSel = NSSelectorFromString(@"getActiveLocationSharingDevice:");
+        if ([session respondsToSelector:activeSel]) {
+            dispatch_group_enter(group);
+            AsyncIMP fn = (AsyncIMP)objc_msgSend;
+            fn(session, activeSel, ^(id result) {
+                asyncDiag[@"active_device"] = [NSString stringWithFormat:@"%@", result ?: @"nil"];
+                dispatch_group_leave(group);
+            });
+        }
+
+        // forceRefresh
+        SEL refreshSel = NSSelectorFromString(@"forceRefreshWithCompletion:");
+        if ([session respondsToSelector:refreshSel]) {
+            dispatch_group_enter(group);
+            typedef void (*RefreshIMP)(id, SEL, void(^)(void));
+            RefreshIMP fn = (RefreshIMP)objc_msgSend;
+            fn(session, refreshSel, ^{
+                asyncDiag[@"refresh"] = @"completed";
+                // After refresh, check sharing handles
+                SEL shareSel = NSSelectorFromString(@"getHandlesSharingLocationsWithMe:");
+                if ([session respondsToSelector:shareSel]) {
+                    AsyncIMP fn2 = (AsyncIMP)objc_msgSend;
+                    fn2(session, shareSel, ^(id handles) {
+                        if ([handles isKindOfClass:[NSSet class]]) {
+                            asyncDiag[@"sharing_with_me"] = [(NSSet *)handles allObjects];
+                        } else {
+                            asyncDiag[@"sharing_with_me"] = [NSString stringWithFormat:@"%@", handles ?: @"nil"];
+                        }
+                        SEL cachedSel = NSSelectorFromString(@"cachedLocationForHandle:");
+                        if ([session respondsToSelector:cachedSel] && [handles respondsToSelector:@selector(allObjects)]) {
+                            NSMutableArray *cached = [NSMutableArray array];
+                            for (id handleObj in [(NSSet *)handles allObjects]) {
+                                id cachedLocation = ((id (*)(id, SEL, id))objc_msgSend)(session, cachedSel, handleObj);
+                                NSDictionary *entry = locationEntryForHandle(handleObj, cachedLocation);
+                                if (entry) [cached addObject:entry];
+                            }
+                            asyncDiag[@"cached_locations"] = cached;
+                        }
+                        dispatch_group_leave(group);
+                    });
+                } else {
+                    dispatch_group_leave(group);
+                }
+            });
+        }
+
+        // Wait for all async ops and write response
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC));
+            [diag addEntriesFromDictionary:asyncDiag];
+            diag[@"diag_log"] = [_diagLog copy];
+            writeResponseToFile(successResponse(requestId, diag));
+        });
+
+        return nil; // async
+    } @catch (NSException *exception) {
+        return errorResponse(requestId, [NSString stringWithFormat:@"init_location failed: %@", exception.reason]);
+    }
+}
+
+static NSDictionary* handleGetLocations(NSInteger requestId, NSDictionary *params) {
+    if (!_diagLog) _diagLog = [NSMutableArray array];
+    else [_diagLog removeAllObjects];
+    [_diagLog addObject:@"=== get_locations START (FindMyLocate + FMFSession) ==="];
+
+    @try {
+        NSString *filterHandle = [params[@"handle"] isKindOfClass:[NSString class]] ? params[@"handle"] : nil;
+
+        BOOL sawFindMyLocateHandles = NO;
+        NSArray *findMyLocateResults = collectLocationsViaFindMyLocate(filterHandle, _diagLog, &sawFindMyLocateHandles);
+        if ([findMyLocateResults count] > 0) {
+            [_diagLog addObject:[NSString stringWithFormat:@"returning %lu location entries from FindMyLocate snapshot",
+                                 (unsigned long)[findMyLocateResults count]]];
+            return successResponse(requestId, @{@"locations": findMyLocateResults});
+        }
+        if (sawFindMyLocateHandles) {
+            [_diagLog addObject:@"FindMyLocate found sharing handles but no cached location objects"];
+        }
+
+        NSMutableArray *asyncFindMyLocateHandles = [NSMutableArray array];
+        NSMutableArray *asyncFindMyLocateObjects = [NSMutableArray array];
+        id directFindMyLocateSession = newObjectOfClassNamed(@"FindMyLocateSession");
+        if (directFindMyLocateSession) {
+            SEL getFriendsSel = NSSelectorFromString(@"getFriendsSharingLocationsWithMeWithCompletion:");
+            if ([directFindMyLocateSession respondsToSelector:getFriendsSel]) {
+                dispatch_semaphore_t friendsSemaphore = dispatch_semaphore_create(0);
+                __block NSArray *asyncFriendObjects = @[];
+                typedef void (*GetFriendsIMP)(id, SEL, void(^)(id));
+                GetFriendsIMP getFriends = (GetFriendsIMP)objc_msgSend;
+                getFriends(directFindMyLocateSession, getFriendsSel, ^(id friends) {
+                    asyncFriendObjects = objectsFromCollection(friends);
+                    dispatch_semaphore_signal(friendsSemaphore);
+                });
+
+                long friendsWait = dispatch_semaphore_wait(friendsSemaphore, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+                if (friendsWait != 0) {
+                    [_diagLog addObject:@"FindMyLocateSession getFriendsSharingLocationsWithMeWithCompletion timed out"];
+                } else {
+                    [_diagLog addObject:[NSString stringWithFormat:@"FindMyLocateSession getFriendsSharingLocationsWithMeWithCompletion -> %lu objects %@",
+                                         (unsigned long)[asyncFriendObjects count],
+                                         summarizedHandlesFromObjects(asyncFriendObjects)]];
+                    if ([asyncFriendObjects count] > 0) {
+                        [asyncFindMyLocateObjects addObjectsFromArray:asyncFriendObjects];
+                    }
+                    NSArray *knownHandles = handleStringsFromFindMyLocateTarget(
+                        directFindMyLocateSession,
+                        @[@"cachedFriendsSharingLocationsWithMe"]
+                    );
+                    if ([knownHandles count] == 0) {
+                        for (id friendObject in asyncFriendObjects) {
+                            NSString *handle = handleStringFromObject(friendObject);
+                            if (handle.length > 0) {
+                                [asyncFindMyLocateHandles addObject:handle];
+                            }
+                        }
+                    } else {
+                        [asyncFindMyLocateHandles addObjectsFromArray:knownHandles];
+                    }
+
+                    NSArray *asyncResults = collectLocationEntriesFromFindMyLocateTarget(
+                        directFindMyLocateSession,
+                        @"FindMyLocateSession(async)",
+                        filterHandle,
+                        asyncFriendObjects,
+                        @[@"cachedLocationForHandle:includeAddress:"],
+                        @[@"cachedLocationForHandle:"],
+                        [NSMutableSet set],
+                        _diagLog
+                    );
+                    if ([asyncResults count] > 0) {
+                        [_diagLog addObject:[NSString stringWithFormat:@"returning %lu location entries after FindMyLocate async friend fetch",
+                                             (unsigned long)[asyncResults count]]];
+                        return successResponse(requestId, @{@"locations": asyncResults});
+                    }
+                }
+            }
+        }
+
+        id findMyLocateBootstrap = newObjectOfClassNamed(@"FindMyLocateObjCWrapper.ObjCBootstrap");
+        if (findMyLocateBootstrap) {
+            SEL startUpdatingSel = NSSelectorFromString(@"startUpdatingFriendsWithInitialUpdates:completionHandler:");
+            if ([findMyLocateBootstrap respondsToSelector:startUpdatingSel]) {
+                dispatch_semaphore_t updateSemaphore = dispatch_semaphore_create(0);
+                __block NSString *updateResult = @"completed";
+                typedef void (*StartUpdatingIMP)(id, SEL, BOOL, void(^)(NSError *));
+                StartUpdatingIMP startUpdating = (StartUpdatingIMP)objc_msgSend;
+                startUpdating(findMyLocateBootstrap, startUpdatingSel, YES, ^(NSError *error) {
+                    if (error) {
+                        updateResult = [NSString stringWithFormat:@"error=%@", error.localizedDescription ?: error];
+                    }
+                    dispatch_semaphore_signal(updateSemaphore);
+                });
+
+                long updateWait = dispatch_semaphore_wait(updateSemaphore, dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC));
+                if (updateWait != 0) {
+                    [_diagLog addObject:@"FindMyLocateObjCWrapper startUpdatingFriends timed out"];
+                } else {
+                    [_diagLog addObject:[NSString stringWithFormat:@"FindMyLocateObjCWrapper startUpdatingFriends %@", updateResult]];
+                }
+
+                sawFindMyLocateHandles = NO;
+                findMyLocateResults = collectLocationsViaFindMyLocate(filterHandle, _diagLog, &sawFindMyLocateHandles);
+                if ([findMyLocateResults count] > 0) {
+                    [_diagLog addObject:[NSString stringWithFormat:@"returning %lu location entries after FindMyLocate friend update",
+                                         (unsigned long)[findMyLocateResults count]]];
+                    return successResponse(requestId, @{@"locations": findMyLocateResults});
+                }
+            }
+
+            NSMutableArray *refreshHandles = [NSMutableArray array];
+            NSArray *cachedFriendObjects = friendObjectsFromFindMyLocateTarget(
+                findMyLocateBootstrap,
+                @[@"cachedFriendsSharingLocationWithMe"]
+            );
+            NSArray *cachedHandleObjects = handleObjectsFromFindMyLocateObjects(cachedFriendObjects);
+            NSArray *asyncHandleObjects = handleObjectsFromFindMyLocateObjects(asyncFindMyLocateObjects);
+            if ([cachedHandleObjects count] > 0) {
+                [refreshHandles addObjectsFromArray:cachedHandleObjects];
+            } else if ([asyncHandleObjects count] > 0) {
+                [refreshHandles addObjectsFromArray:asyncHandleObjects];
+            } else {
+                NSMutableArray *stringHandles = [NSMutableArray array];
+                if (filterHandle.length > 0) {
+                    [stringHandles addObject:filterHandle];
+                }
+                NSArray *cachedHandles = handleStringsFromFindMyLocateTarget(
+                    findMyLocateBootstrap,
+                    @[@"cachedFriendsSharingLocationWithMe"]
+                );
+                if ([cachedHandles count] > 0) {
+                    [stringHandles addObjectsFromArray:cachedHandles];
+                }
+                if ([asyncFindMyLocateHandles count] > 0) {
+                    [stringHandles addObjectsFromArray:asyncFindMyLocateHandles];
+                }
+
+                NSMutableSet *seenStringHandles = [NSMutableSet set];
+                for (NSString *identifier in stringHandles) {
+                    if (![identifier isKindOfClass:[NSString class]] || identifier.length == 0) continue;
+                    if ([seenStringHandles containsObject:identifier]) continue;
+                    [seenStringHandles addObject:identifier];
+
+                    id handleObject = newFMLHandleForIdentifier(identifier);
+                    if (handleObject) {
+                        [refreshHandles addObject:handleObject];
+                    }
+                }
+
+                if ([refreshHandles count] == 0) {
+                    if ([cachedHandles count] > 0) {
+                        [_diagLog addObject:[NSString stringWithFormat:@"FindMyLocate had string handles but could not build FMLHandle objects: %@",
+                                             cachedHandles]];
+                    } else if ([asyncFindMyLocateHandles count] > 0) {
+                        [_diagLog addObject:[NSString stringWithFormat:@"FindMyLocate async friend fetch only yielded unresolved string handles: %@",
+                                             asyncFindMyLocateHandles]];
+                    } else if (filterHandle.length > 0) {
+                        [_diagLog addObject:[NSString stringWithFormat:@"Skipping FindMyLocate refresh for %@ because no FMLHandle objects were available",
+                                             filterHandle]];
+                    }
+                }
+            }
+
+            if ([refreshHandles count] > 0) {
+                SEL refreshSel = NSSelectorFromString(@"startRefreshingLocationFor:priority:isFromGroup:reverseGeocode:completionHandler:");
+                if ([findMyLocateBootstrap respondsToSelector:refreshSel]) {
+                    dispatch_semaphore_t refreshSemaphore = dispatch_semaphore_create(0);
+                    __block NSString *refreshResult = @"completed";
+                    typedef void (*StartRefreshIMP)(id, SEL, NSArray *, NSInteger, BOOL, BOOL, void(^)(NSError *));
+                    StartRefreshIMP startRefresh = (StartRefreshIMP)objc_msgSend;
+                    startRefresh(findMyLocateBootstrap, refreshSel, refreshHandles, 1, NO, YES, ^(NSError *error) {
+                        if (error) {
+                            refreshResult = [NSString stringWithFormat:@"error=%@", error.localizedDescription ?: error];
+                        }
+                        dispatch_semaphore_signal(refreshSemaphore);
+                    });
+
+                    long refreshWait = dispatch_semaphore_wait(refreshSemaphore, dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC));
+                    if (refreshWait != 0) {
+                        [_diagLog addObject:[NSString stringWithFormat:@"FindMyLocateObjCWrapper refresh timed out for %@", refreshHandles]];
+                    } else {
+                        [_diagLog addObject:[NSString stringWithFormat:@"FindMyLocateObjCWrapper refresh %@ for %@",
+                                             refreshResult, refreshHandles]];
+                    }
+
+                    sawFindMyLocateHandles = NO;
+                    findMyLocateResults = collectLocationsViaFindMyLocate(filterHandle, _diagLog, &sawFindMyLocateHandles);
+                    if ([findMyLocateResults count] > 0) {
+                        [_diagLog addObject:[NSString stringWithFormat:@"returning %lu location entries after FindMyLocate refresh",
+                                             (unsigned long)[findMyLocateResults count]]];
+                        return successResponse(requestId, @{@"locations": findMyLocateResults});
+                    }
+
+                    NSArray *explicitPollResults = pollLocationsFromExplicitFindMyLocateTargets(
+                        filterHandle,
+                        directFindMyLocateSession,
+                        asyncFindMyLocateObjects,
+                        findMyLocateBootstrap,
+                        cachedFriendObjects,
+                        refreshHandles,
+                        _diagLog
+                    );
+                    if ([explicitPollResults count] > 0) {
+                        [_diagLog addObject:[NSString stringWithFormat:@"returning %lu location entries after explicit FindMyLocate poll",
+                                             (unsigned long)[explicitPollResults count]]];
+                        return successResponse(requestId, @{@"locations": explicitPollResults});
+                    }
+                }
+            }
+        }
+
+        dlopen("/System/Library/PrivateFrameworks/FMFCore.framework/FMFCore", RTLD_NOW);
+        Class FMFSessionClass = NSClassFromString(@"FMFSession");
+        if (!FMFSessionClass) {
+            return errorResponse(requestId, @"FMFSession not available");
+        }
+
+        id session = objectByPerformingSelector(FMFSessionClass, @"sharedInstance");
+        if (!session) {
+            return errorResponse(requestId, @"FMFSession.sharedInstance is nil");
+        }
+
+        [_diagLog addObject:[NSString stringWithFormat:@"session=%@", NSStringFromClass([session class])]];
+
+        BOOL hasMyLocationValue = NO;
+        BOOL myLocationEnabled = boolByPerformingSelector(session, @"isMyLocationEnabled", &hasMyLocationValue);
+        if (hasMyLocationValue) {
+            [_diagLog addObject:[NSString stringWithFormat:@"isMyLocationEnabled=%d", myLocationEnabled]];
+        }
+
+        if (filterHandle.length > 0) {
+            SEL setHandlesSel = NSSelectorFromString(@"setHandles:");
+            if ([session respondsToSelector:setHandlesSel]) {
+                NSSet *handleSet = [NSSet setWithObject:filterHandle];
+                ((void (*)(id, SEL, id))objc_msgSend)(session, setHandlesSel, handleSet);
+                [_diagLog addObject:[NSString stringWithFormat:@"setHandles filter=%@", filterHandle]];
+            }
+        }
+
+        SEL reloadSel = NSSelectorFromString(@"reloadDataIfNotLoaded");
+        if ([session respondsToSelector:reloadSel]) {
+            ((void (*)(id, SEL))objc_msgSend)(session, reloadSel);
+            [_diagLog addObject:@"reloadDataIfNotLoaded called"];
+        }
+
+        SEL forceRefreshSyncSel = NSSelectorFromString(@"forceRefresh");
+        if ([session respondsToSelector:forceRefreshSyncSel]) {
+            ((void (*)(id, SEL))objc_msgSend)(session, forceRefreshSyncSel);
+            [_diagLog addObject:@"forceRefresh called"];
+        }
+
+        NSArray *cachedSharingHandles = objectsFromCollection(objectByPerformingSelector(session, @"cachedGetHandlesSharingLocationsWithMe"));
+        NSArray *syncSharingHandles = objectsFromCollection(objectByPerformingSelector(session, @"getHandlesSharingLocationsWithMe"));
+        NSDictionary *cachedLocationByHandle = objectByPerformingSelector(session, @"cachedLocationForHandleByHandle");
+        if ([cachedSharingHandles count] > 0) {
+            [_diagLog addObject:[NSString stringWithFormat:@"cachedGetHandlesSharingLocationsWithMe -> %lu handles",
+                                 (unsigned long)[cachedSharingHandles count]]];
+        }
+        if ([syncSharingHandles count] > 0) {
+            [_diagLog addObject:[NSString stringWithFormat:@"getHandlesSharingLocationsWithMe -> %lu handles",
+                                 (unsigned long)[syncSharingHandles count]]];
+        }
+        if ([cachedLocationByHandle isKindOfClass:[NSDictionary class]]) {
+            [_diagLog addObject:[NSString stringWithFormat:@"cachedLocationForHandleByHandle -> %lu entries",
+                                 (unsigned long)[cachedLocationByHandle count]]];
+        }
+
+        NSMutableDictionary *syncCandidatesByHandle = [NSMutableDictionary dictionary];
+        if (filterHandle.length > 0) {
+            syncCandidatesByHandle[filterHandle] = filterHandle;
+        }
+        for (id handleObj in cachedSharingHandles) {
+            NSString *handle = handleStringFromObject(handleObj);
+            if (handle.length > 0 && !syncCandidatesByHandle[handle]) {
+                syncCandidatesByHandle[handle] = handleObj;
+            }
+        }
+        for (id handleObj in syncSharingHandles) {
+            NSString *handle = handleStringFromObject(handleObj);
+            if (handle.length > 0 && !syncCandidatesByHandle[handle]) {
+                syncCandidatesByHandle[handle] = handleObj;
+            }
+        }
+        if ([cachedLocationByHandle isKindOfClass:[NSDictionary class]]) {
+            for (NSString *handle in cachedLocationByHandle) {
+                if (handle.length > 0 && !syncCandidatesByHandle[handle]) {
+                    syncCandidatesByHandle[handle] = handle;
+                }
+            }
+        }
+
+        NSMutableArray *syncResults = [NSMutableArray array];
+        NSArray *sortedSyncHandles = [[syncCandidatesByHandle allKeys] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+        for (NSString *handle in sortedSyncHandles) {
+            id originalHandleObj = syncCandidatesByHandle[handle] ?: handle;
+            id cachedLocation = [cachedLocationByHandle isKindOfClass:[NSDictionary class]] ? cachedLocationByHandle[handle] : nil;
+            if (!cachedLocation) {
+                cachedLocation = ((id (*)(id, SEL, id))objc_msgSend)(session, NSSelectorFromString(@"cachedLocationForHandle:"), originalHandleObj);
+            }
+            if (!cachedLocation && originalHandleObj != handle) {
+                cachedLocation = ((id (*)(id, SEL, id))objc_msgSend)(session, NSSelectorFromString(@"cachedLocationForHandle:"), handle);
+            }
+            [_diagLog addObject:[NSString stringWithFormat:@"sync cachedLocationForHandle(%@) -> %@",
+                                 handle, cachedLocation ? NSStringFromClass([cachedLocation class]) : @"nil"]];
+            NSDictionary *entry = locationEntryForHandle(originalHandleObj ?: handle, cachedLocation);
+            if (entry) {
+                [syncResults addObject:entry];
+            }
+        }
+
+        if ([syncResults count] > 0) {
+            [_diagLog addObject:[NSString stringWithFormat:@"returning %lu location entries from sync snapshot",
+                                 (unsigned long)[syncResults count]]];
+            return successResponse(requestId, @{@"locations": syncResults});
+        }
+
+        SEL shareSel = NSSelectorFromString(@"getHandlesSharingLocationsWithMe:");
+        SEL refreshSel = NSSelectorFromString(@"forceRefreshWithCompletion:");
+        SEL cachedSel = NSSelectorFromString(@"cachedLocationForHandle:");
+        if (![session respondsToSelector:cachedSel]) {
+            return errorResponse(requestId, @"FMFSession.cachedLocationForHandle: not available");
+        }
+
+        __block NSArray *sharingHandleObjects = nil;
+        __block BOOL shareRequested = NO;
+        __block BOOL shareFinished = NO;
+        __block BOOL shareTimedOut = NO;
+        __block BOOL refreshRequested = NO;
+        __block BOOL refreshFinished = NO;
+        __block BOOL refreshTimedOut = NO;
+        __block BOOL responseWritten = NO;
+
+        void (^finishIfReady)(BOOL) = ^(BOOL forced) {
+            if (responseWritten) return;
+
+            BOOL shareSatisfied = !shareRequested || shareFinished;
+            BOOL refreshSatisfied = !refreshRequested || refreshFinished;
+            if (!forced && !(shareSatisfied && refreshSatisfied)) {
+                return;
+            }
+
+            NSMutableDictionary *candidatesByHandle = [NSMutableDictionary dictionary];
+            if (filterHandle.length > 0) {
+                candidatesByHandle[filterHandle] = filterHandle;
+            }
+
+            for (id handleObj in objectsFromCollection(sharingHandleObjects)) {
+                NSString *handle = handleStringFromObject(handleObj);
+                if (handle.length > 0 && !candidatesByHandle[handle]) {
+                    candidatesByHandle[handle] = handleObj;
+                }
+            }
+
+            NSMutableArray *results = [NSMutableArray array];
+            NSArray *sortedHandles = [[candidatesByHandle allKeys] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+            for (NSString *handle in sortedHandles) {
+                id originalHandleObj = candidatesByHandle[handle] ?: handle;
+                id cachedLocation = ((id (*)(id, SEL, id))objc_msgSend)(session, cachedSel, originalHandleObj);
+                if (!cachedLocation && originalHandleObj != handle) {
+                    cachedLocation = ((id (*)(id, SEL, id))objc_msgSend)(session, cachedSel, handle);
+                }
+                [_diagLog addObject:[NSString stringWithFormat:@"cachedLocationForHandle(%@) -> %@",
+                                     handle, cachedLocation ? NSStringFromClass([cachedLocation class]) : @"nil"]];
+                NSDictionary *entry = locationEntryForHandle(originalHandleObj ?: handle, cachedLocation);
+                if (entry) {
+                    [results addObject:entry];
+                }
+            }
+
+            BOOL cleanEmpty = shareRequested && shareFinished && !shareTimedOut;
+            if (results.count > 0 || cleanEmpty) {
+                [_diagLog addObject:[NSString stringWithFormat:@"returning %lu location entries",
+                                     (unsigned long)results.count]];
+                responseWritten = YES;
+                writeResponseToFile(successResponse(requestId, @{@"locations": results}));
+                return;
+            }
+
+            NSString *diag = [_diagLog componentsJoinedByString:@"; "];
+            responseWritten = YES;
+            writeResponseToFile(errorResponse(
+                requestId,
+                [NSString stringWithFormat:@"FMFSession did not return location data. Diag: %@", diag]
+            ));
+        };
+
+        if ([session respondsToSelector:shareSel]) {
+            shareRequested = YES;
+            typedef void (*HandlesIMP)(id, SEL, void(^)(id));
+            HandlesIMP fetchHandles = (HandlesIMP)objc_msgSend;
+            fetchHandles(session, shareSel, ^(id handles) {
+                sharingHandleObjects = objectsFromCollection(handles);
+                shareFinished = YES;
+                [_diagLog addObject:[NSString stringWithFormat:@"sharing handles callback returned %lu handles",
+                                     (unsigned long)[sharingHandleObjects count]]];
+                finishIfReady(NO);
+            });
+        } else {
+            [_diagLog addObject:@"getHandlesSharingLocationsWithMe: unavailable"];
+        }
+
+        if ([session respondsToSelector:refreshSel]) {
+            refreshRequested = YES;
+            typedef void (*RefreshIMP)(id, SEL, void(^)(void));
+            RefreshIMP refresh = (RefreshIMP)objc_msgSend;
+            refresh(session, refreshSel, ^{
+                refreshFinished = YES;
+                [_diagLog addObject:@"forceRefreshWithCompletion finished"];
+                finishIfReady(NO);
+            });
+        } else {
+            [_diagLog addObject:@"forceRefreshWithCompletion: unavailable"];
+        }
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 7 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            if (responseWritten) return;
+            if (shareRequested && !shareFinished) {
+                shareTimedOut = YES;
+                [_diagLog addObject:@"sharing handles callback timed out"];
+            }
+            if (refreshRequested && !refreshFinished) {
+                refreshTimedOut = YES;
+                [_diagLog addObject:@"forceRefreshWithCompletion timed out"];
+            }
+            shareFinished = YES;
+            refreshFinished = YES;
+            finishIfReady(YES);
+        });
+
+        return nil; // async — response written by callbacks/timeout
+    } @catch (NSException *exception) {
+        return errorResponse(requestId, [NSString stringWithFormat:@"Failed to get locations: %@", exception.reason]);
+    }
+}
+
 #pragma mark - Command Router
 
 static NSDictionary* processCommand(NSDictionary *command) {
@@ -1892,6 +3377,16 @@ static NSDictionary* processCommand(NSDictionary *command) {
         return handleEditMessage(requestId, params);
     } else if ([action isEqualToString:@"unsend_message"]) {
         return handleUnsendMessage(requestId, params);
+    } else if ([action isEqualToString:@"get_locations"]) {
+        return handleGetLocations(requestId, params);
+    } else if ([action isEqualToString:@"init_location"]) {
+        return handleInitLocation(requestId, params);
+    } else if ([action isEqualToString:@"debug_objc_class"]) {
+        return handleDebugObjCClass(requestId, params);
+    } else if ([action isEqualToString:@"debug_invoke_selector"]) {
+        return handleDebugInvokeSelector(requestId, params);
+    } else if ([action isEqualToString:@"debug_friendship_state"]) {
+        return handleDebugFriendshipState(requestId, params);
     } else if ([action isEqualToString:@"ping"]) {
         return successResponse(requestId, @{@"pong": @YES});
     } else {

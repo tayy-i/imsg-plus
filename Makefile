@@ -40,6 +40,7 @@ build-dylib:
 	@mkdir -p .build/release
 	@clang -dynamiclib -arch arm64e -fobjc-arc \
 		-framework Foundation \
+		-framework CoreLocation \
 		-o .build/release/imsg-plus-helper.dylib \
 		Sources/IMsgHelper/IMsgInjected.m
 	@echo "Built imsg-plus-helper.dylib successfully"

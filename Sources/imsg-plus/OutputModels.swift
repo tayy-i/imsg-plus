@@ -151,6 +151,58 @@ struct AttachmentPayload: Codable {
   }
 }
 
+struct LocationPayload: Codable {
+  let handle: String
+  let latitude: Double?
+  let longitude: Double?
+  let altitude: Double?
+  let horizontalAccuracy: Double?
+  let verticalAccuracy: Double?
+  let timestamp: String?
+  let address: String?
+  let locality: String?
+  let state: String?
+  let country: String?
+  let street: String?
+  let label: String?
+  let firstName: String?
+  let lastName: String?
+  let isOld: Bool
+  let isInaccurate: Bool
+
+  init(location: FriendLocation) {
+    self.handle = location.handle
+    self.latitude = location.latitude
+    self.longitude = location.longitude
+    self.altitude = location.altitude
+    self.horizontalAccuracy = location.horizontalAccuracy
+    self.verticalAccuracy = location.verticalAccuracy
+    self.timestamp = location.timestamp
+    self.address = location.address
+    self.locality = location.locality
+    self.state = location.state
+    self.country = location.country
+    self.street = location.street
+    self.label = location.label
+    self.firstName = location.firstName
+    self.lastName = location.lastName
+    self.isOld = location.isOld
+    self.isInaccurate = location.isInaccurate
+  }
+
+  enum CodingKeys: String, CodingKey {
+    case handle
+    case latitude, longitude, altitude
+    case horizontalAccuracy = "horizontal_accuracy"
+    case verticalAccuracy = "vertical_accuracy"
+    case timestamp, address, locality, state, country, street, label
+    case firstName = "first_name"
+    case lastName = "last_name"
+    case isOld = "is_old"
+    case isInaccurate = "is_inaccurate"
+  }
+}
+
 enum CLIISO8601 {
   static func format(_ date: Date) -> String {
     let formatter = ISO8601DateFormatter()
