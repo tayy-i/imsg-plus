@@ -1954,6 +1954,17 @@ static NSNumber* firstBoolForKeys(id obj, NSArray *keys) {
     return nil;
 }
 
+static NSArray* stringArrayFromCollection(id collection) {
+    NSArray *objects = objectsFromCollection(collection);
+    NSMutableArray *strings = [NSMutableArray array];
+    for (id object in objects) {
+        if ([object isKindOfClass:[NSString class]] && [(NSString *)object length] > 0) {
+            [strings addObject:object];
+        }
+    }
+    return strings;
+}
+
 static NSString* iso8601StringFromDateValue(id value) {
     if (!value || value == [NSNull null]) return nil;
     if ([value isKindOfClass:[NSString class]]) {
@@ -2068,7 +2079,175 @@ static id extractAddressObject(id locationObj) {
     return nil;
 }
 
-static NSDictionary* locationEntryForHandle(id handleObj, id locationObj) {
+static NSArray* debugPropertyNamesForObject(id obj) {
+    if (!obj) return @[];
+
+    NSMutableSet *names = [NSMutableSet set];
+    for (Class cls = [obj class]; cls != Nil && cls != [NSObject class]; cls = class_getSuperclass(cls)) {
+        unsigned int count = 0;
+        objc_property_t *properties = class_copyPropertyList(cls, &count);
+        for (unsigned int i = 0; i < count; i++) {
+            const char *propertyName = property_getName(properties[i]);
+            if (propertyName) {
+                [names addObject:[NSString stringWithUTF8String:propertyName]];
+            }
+        }
+        free(properties);
+    }
+
+    return [[names allObjects] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+}
+
+static id jsonSafeDebugValue(id value, NSInteger depth) {
+    if (!value || value == [NSNull null]) {
+        return [NSNull null];
+    }
+
+    if ([value isKindOfClass:[NSString class]] || [value isKindOfClass:[NSNumber class]]) {
+        return value;
+    }
+
+    if ([value isKindOfClass:[NSDate class]]) {
+        NSString *timestamp = iso8601StringFromDateValue(value);
+        return timestamp ?: [value description];
+    }
+
+    if ([value isKindOfClass:[NSURL class]]) {
+        return [(NSURL *)value absoluteString] ?: [value description];
+    }
+
+    if ([value isKindOfClass:[NSUUID class]]) {
+        return [(NSUUID *)value UUIDString];
+    }
+
+    if ([value isKindOfClass:[NSData class]]) {
+        return @{
+            @"class": NSStringFromClass([value class]),
+            @"length": @([(NSData *)value length]),
+        };
+    }
+
+    if ([value isKindOfClass:[NSTimeZone class]]) {
+        NSTimeZone *timeZone = value;
+        return @{
+            @"class": NSStringFromClass([value class]),
+            @"name": timeZone.name ?: @"",
+            @"abbreviation": timeZone.abbreviation ?: @"",
+            @"seconds_from_gmt": @(timeZone.secondsFromGMT),
+        };
+    }
+
+    if ([value isKindOfClass:[CLRegion class]]) {
+        NSMutableDictionary *region = [@{
+            @"class": NSStringFromClass([value class]),
+            @"identifier": [(CLRegion *)value identifier] ?: @"",
+        } mutableCopy];
+        if ([value isKindOfClass:[CLCircularRegion class]]) {
+            CLCircularRegion *circular = value;
+            region[@"center_latitude"] = @(circular.center.latitude);
+            region[@"center_longitude"] = @(circular.center.longitude);
+            region[@"radius"] = @(circular.radius);
+        }
+        return region;
+    }
+
+    CLLocation *location = extractCLLocation(value);
+    if (location) {
+        NSMutableDictionary *payload = [@{
+            @"class": NSStringFromClass([location class]),
+            @"latitude": @(location.coordinate.latitude),
+            @"longitude": @(location.coordinate.longitude),
+            @"altitude": @(location.altitude),
+            @"horizontal_accuracy": @(location.horizontalAccuracy),
+            @"vertical_accuracy": @(location.verticalAccuracy),
+            @"course": @(location.course),
+            @"speed": @(location.speed),
+        } mutableCopy];
+        NSString *timestamp = iso8601StringFromDateValue(location.timestamp);
+        if (timestamp) payload[@"timestamp"] = timestamp;
+        return payload;
+    }
+
+    if ([value isKindOfClass:[NSDictionary class]]) {
+        if (depth <= 0) {
+            return @{
+                @"class": NSStringFromClass([value class]),
+                @"count": @([(NSDictionary *)value count]),
+            };
+        }
+
+        NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+        NSArray *sortedKeys = [[(NSDictionary *)value allKeys] sortedArrayUsingComparator:^NSComparisonResult(id a, id b) {
+            return [[a description] localizedCaseInsensitiveCompare:[b description]];
+        }];
+        NSUInteger limit = MIN([sortedKeys count], (NSUInteger)50);
+        for (NSUInteger i = 0; i < limit; i++) {
+            id key = sortedKeys[i];
+            id nested = jsonSafeDebugValue([(NSDictionary *)value objectForKey:key], depth - 1);
+            if (nested) {
+                dict[[key description]] = nested;
+            }
+        }
+        return dict;
+    }
+
+    if ([value isKindOfClass:[NSArray class]]) {
+        if (depth <= 0) {
+            return @{
+                @"class": NSStringFromClass([value class]),
+                @"count": @([(NSArray *)value count]),
+            };
+        }
+
+        NSMutableArray *items = [NSMutableArray array];
+        NSUInteger limit = MIN([(NSArray *)value count], (NSUInteger)50);
+        for (NSUInteger i = 0; i < limit; i++) {
+            id nested = jsonSafeDebugValue([(NSArray *)value objectAtIndex:i], depth - 1);
+            if (nested) [items addObject:nested];
+        }
+        return items;
+    }
+
+    if ([value isKindOfClass:[NSSet class]]) {
+        return jsonSafeDebugValue([(NSSet *)value allObjects], depth);
+    }
+
+    return @{
+        @"class": NSStringFromClass([value class]),
+        @"description": [value description] ?: @"",
+    };
+}
+
+static NSDictionary* debugSnapshotForObject(id obj, NSArray *extraKeys) {
+    if (!obj || obj == [NSNull null]) return nil;
+
+    NSMutableSet *keys = [NSMutableSet setWithArray:debugPropertyNamesForObject(obj)];
+    for (NSString *key in extraKeys) {
+        if ([key isKindOfClass:[NSString class]] && key.length > 0) {
+            [keys addObject:key];
+        }
+    }
+
+    NSArray *sortedKeys = [[keys allObjects] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+    NSMutableDictionary *fields = [NSMutableDictionary dictionary];
+    for (NSString *key in sortedKeys) {
+        id value = valueForKeySafely(obj, key);
+        if (!value || value == [NSNull null]) continue;
+        id safeValue = jsonSafeDebugValue(value, 2);
+        if (safeValue) {
+            fields[key] = safeValue;
+        }
+    }
+
+    return @{
+        @"class": NSStringFromClass([obj class]),
+        @"description": [obj description] ?: @"",
+        @"keys": sortedKeys,
+        @"fields": fields,
+    };
+}
+
+static NSDictionary* locationEntryForHandle(id handleObj, id locationObj, BOOL includeDebugRaw) {
     NSString *handle = handleStringFromObject(handleObj);
     if (handle.length == 0) {
         handle = handleStringFromObject(valueForKeySafely(locationObj, @"handle"));
@@ -2120,22 +2299,24 @@ static NSDictionary* locationEntryForHandle(id handleObj, id locationObj) {
 
     id addressObj = extractAddressObject(locationObj);
     NSString *address = firstNonEmptyStringForKeys(locationObj, @[@"formattedAddress", @"addressString", @"fullAddress"]);
+    NSArray *formattedAddressLines = stringArrayFromCollection(valueForKeySafely(addressObj, @"formattedAddressLines"));
     if (!address && addressObj) {
-        id lines = valueForKeySafely(addressObj, @"formattedAddressLines");
-        if ([lines isKindOfClass:[NSArray class]] && [(NSArray *)lines count] > 0) {
-            address = [(NSArray *)lines componentsJoinedByString:@", "];
+        if ([formattedAddressLines count] > 0) {
+            address = [formattedAddressLines componentsJoinedByString:@", "];
         }
     }
     if (!address) {
         address = firstNonEmptyStringForKeys(addressObj, @[@"formattedAddress", @"fullAddress", @"address"]);
     }
     if (address.length > 0) entry[@"address"] = address;
+    if ([formattedAddressLines count] > 0) entry[@"formatted_address_lines"] = formattedAddressLines;
 
     NSString *street = firstNonEmptyStringForKeys(addressObj, @[@"street", @"streetAddress", @"thoroughfare"]);
     NSString *locality = firstNonEmptyStringForKeys(addressObj, @[@"locality", @"city"]);
     NSString *state = firstNonEmptyStringForKeys(addressObj, @[@"state", @"stateCode", @"administrativeArea"]);
     NSString *country = firstNonEmptyStringForKeys(addressObj, @[@"country", @"countryName"]);
     NSString *label = firstNonEmptyStringForKeys(locationObj, @[@"label", @"locationLabel"]);
+    NSArray *labels = stringArrayFromCollection(valueForKeySafely(locationObj, @"labels"));
     NSString *firstName = firstNonEmptyStringForKeys(locationObj, @[@"firstName", @"givenName"]);
     NSString *lastName = firstNonEmptyStringForKeys(locationObj, @[@"lastName", @"familyName"]);
 
@@ -2144,6 +2325,7 @@ static NSDictionary* locationEntryForHandle(id handleObj, id locationObj) {
     if (state.length > 0) entry[@"state"] = state;
     if (country.length > 0) entry[@"country"] = country;
     if (label.length > 0) entry[@"label"] = label;
+    if ([labels count] > 0) entry[@"labels"] = labels;
     if (firstName.length > 0) entry[@"first_name"] = firstName;
     if (lastName.length > 0) entry[@"last_name"] = lastName;
 
@@ -2151,6 +2333,33 @@ static NSDictionary* locationEntryForHandle(id handleObj, id locationObj) {
     NSNumber *isInaccurate = firstBoolForKeys(locationObj, @[@"isInaccurate", @"inaccurate"]);
     if (isOld) entry[@"is_old"] = isOld;
     if (isInaccurate) entry[@"is_inaccurate"] = isInaccurate;
+
+    if (includeDebugRaw) {
+        NSDictionary *rawLocation = debugSnapshotForObject(locationObj, @[
+            @"name", @"label", @"locationLabel", @"firstName", @"lastName",
+            @"formattedAddress", @"addressString", @"fullAddress",
+            @"address", @"placemark", @"geocodedAddress", @"fmfAddress",
+            @"location", @"clLocation", @"coreLocation", @"currentLocation",
+            @"latitude", @"longitude", @"lat", @"lng", @"lon",
+            @"altitude", @"horizontalAccuracy", @"verticalAccuracy",
+            @"timestamp", @"isOld", @"old", @"isInaccurate", @"inaccurate"
+        ]);
+        NSDictionary *rawAddress = debugSnapshotForObject(addressObj, @[
+            @"name", @"formattedAddress", @"formattedAddressLines",
+            @"address", @"addressDictionary", @"postalAddress",
+            @"street", @"streetAddress", @"thoroughfare", @"subThoroughfare",
+            @"locality", @"subLocality", @"city",
+            @"administrativeArea", @"subAdministrativeArea",
+            @"state", @"stateCode", @"postalCode",
+            @"country", @"countryName", @"ISOcountryCode", @"isoCountryCode",
+            @"areasOfInterest", @"inlandWater", @"ocean",
+            @"timeZone", @"region", @"location"
+        ]);
+        id rawCLLocation = jsonSafeDebugValue(clLocation ?: extractCLLocation(locationObj), 2);
+        if (rawLocation) entry[@"raw_location"] = rawLocation;
+        if (rawAddress) entry[@"raw_address"] = rawAddress;
+        if (rawCLLocation && rawCLLocation != [NSNull null]) entry[@"raw_cllocation"] = rawCLLocation;
+    }
 
     return entry;
 }
@@ -2161,6 +2370,7 @@ static NSArray* collectLocationEntriesFromFindMyLocateTarget(id target,
                                                              NSArray *friendObjects,
                                                              NSArray *locationSelectorsWithAddress,
                                                              NSArray *locationSelectors,
+                                                             BOOL includeDebugRaw,
                                                              NSMutableSet *seenHandles,
                                                              NSMutableArray *diagLog) {
     NSMutableArray *results = [NSMutableArray array];
@@ -2237,7 +2447,7 @@ static NSArray* collectLocationEntriesFromFindMyLocateTarget(id target,
             continue;
         }
 
-        NSDictionary *entry = locationEntryForHandle(candidate, locationObject);
+        NSDictionary *entry = locationEntryForHandle(candidate, locationObject, includeDebugRaw);
         NSString *entryHandle = [entry[@"handle"] isKindOfClass:[NSString class]] ? entry[@"handle"] : nil;
         if (!entry || entryHandle.length == 0) {
             continue;
@@ -2316,6 +2526,7 @@ static NSArray* pollLocationsFromExplicitFindMyLocateTargets(NSString *filterHan
                                                              id findMyLocateBootstrap,
                                                              NSArray *bootstrapFriendObjects,
                                                              NSArray *bootstrapHandleObjects,
+                                                             BOOL includeDebugRaw,
                                                              NSMutableArray *diagLog) {
     NSArray *sessionCandidates = [directFriendObjects count] > 0 ? directFriendObjects : @[];
     NSArray *wrapperCandidates = [bootstrapFriendObjects count] > 0 ? bootstrapFriendObjects :
@@ -2346,6 +2557,7 @@ static NSArray* pollLocationsFromExplicitFindMyLocateTargets(NSString *filterHan
                 sessionCandidates,
                 @[@"cachedLocationForHandle:includeAddress:"],
                 @[@"cachedLocationForHandle:"],
+                includeDebugRaw,
                 seenHandles,
                 diagLog
             );
@@ -2362,6 +2574,7 @@ static NSArray* pollLocationsFromExplicitFindMyLocateTargets(NSString *filterHan
                 wrapperCandidates,
                 @[@"cachedLocationFor:includeAddress:"],
                 @[],
+                includeDebugRaw,
                 seenHandles,
                 diagLog
             );
@@ -2381,7 +2594,7 @@ static NSArray* pollLocationsFromExplicitFindMyLocateTargets(NSString *filterHan
     return @[];
 }
 
-static NSArray* collectLocationsViaFindMyLocate(NSString *filterHandle, NSMutableArray *diagLog, BOOL *sawKnownSharingHandles) {
+static NSArray* collectLocationsViaFindMyLocate(NSString *filterHandle, BOOL includeDebugRaw, NSMutableArray *diagLog, BOOL *sawKnownSharingHandles) {
     if (sawKnownSharingHandles) *sawKnownSharingHandles = NO;
 
     dlopen("/System/Library/PrivateFrameworks/FindMyLocate.framework/FindMyLocate", RTLD_NOW);
@@ -2450,6 +2663,7 @@ static NSArray* collectLocationsViaFindMyLocate(NSString *filterHandle, NSMutabl
             friendObjects,
             targetInfo[@"location_selectors_with_address"],
             targetInfo[@"location_selectors"],
+            includeDebugRaw,
             seenHandles,
             diagLog
         );
@@ -2779,7 +2993,7 @@ static NSDictionary* handleInitLocation(NSInteger requestId, NSDictionary *param
         }
 
         BOOL sawFindMyLocateHandles = NO;
-        NSArray *findMyLocateResults = collectLocationsViaFindMyLocate(nil, _diagLog, &sawFindMyLocateHandles);
+        NSArray *findMyLocateResults = collectLocationsViaFindMyLocate(nil, YES, _diagLog, &sawFindMyLocateHandles);
         diag[@"findmylocate_has_known_sharing_handles"] = @(sawFindMyLocateHandles);
         if ([findMyLocateResults count] > 0) {
             diag[@"findmylocate_locations"] = findMyLocateResults;
@@ -2884,7 +3098,7 @@ static NSDictionary* handleInitLocation(NSInteger requestId, NSDictionary *param
                             NSMutableArray *cached = [NSMutableArray array];
                             for (id handleObj in [(NSSet *)handles allObjects]) {
                                 id cachedLocation = ((id (*)(id, SEL, id))objc_msgSend)(session, cachedSel, handleObj);
-                                NSDictionary *entry = locationEntryForHandle(handleObj, cachedLocation);
+                                NSDictionary *entry = locationEntryForHandle(handleObj, cachedLocation, YES);
                                 if (entry) [cached addObject:entry];
                             }
                             asyncDiag[@"cached_locations"] = cached;
@@ -2918,9 +3132,10 @@ static NSDictionary* handleGetLocations(NSInteger requestId, NSDictionary *param
 
     @try {
         NSString *filterHandle = [params[@"handle"] isKindOfClass:[NSString class]] ? params[@"handle"] : nil;
+        BOOL includeDebugRaw = [params[@"debug_raw"] respondsToSelector:@selector(boolValue)] ? [params[@"debug_raw"] boolValue] : NO;
 
         BOOL sawFindMyLocateHandles = NO;
-        NSArray *findMyLocateResults = collectLocationsViaFindMyLocate(filterHandle, _diagLog, &sawFindMyLocateHandles);
+        NSArray *findMyLocateResults = collectLocationsViaFindMyLocate(filterHandle, includeDebugRaw, _diagLog, &sawFindMyLocateHandles);
         if ([findMyLocateResults count] > 0) {
             [_diagLog addObject:[NSString stringWithFormat:@"returning %lu location entries from FindMyLocate snapshot",
                                  (unsigned long)[findMyLocateResults count]]];
@@ -2977,6 +3192,7 @@ static NSDictionary* handleGetLocations(NSInteger requestId, NSDictionary *param
                         asyncFriendObjects,
                         @[@"cachedLocationForHandle:includeAddress:"],
                         @[@"cachedLocationForHandle:"],
+                        includeDebugRaw,
                         [NSMutableSet set],
                         _diagLog
                     );
@@ -3012,7 +3228,7 @@ static NSDictionary* handleGetLocations(NSInteger requestId, NSDictionary *param
                 }
 
                 sawFindMyLocateHandles = NO;
-                findMyLocateResults = collectLocationsViaFindMyLocate(filterHandle, _diagLog, &sawFindMyLocateHandles);
+                findMyLocateResults = collectLocationsViaFindMyLocate(filterHandle, includeDebugRaw, _diagLog, &sawFindMyLocateHandles);
                 if ([findMyLocateResults count] > 0) {
                     [_diagLog addObject:[NSString stringWithFormat:@"returning %lu location entries after FindMyLocate friend update",
                                          (unsigned long)[findMyLocateResults count]]];
@@ -3096,7 +3312,7 @@ static NSDictionary* handleGetLocations(NSInteger requestId, NSDictionary *param
                     }
 
                     sawFindMyLocateHandles = NO;
-                    findMyLocateResults = collectLocationsViaFindMyLocate(filterHandle, _diagLog, &sawFindMyLocateHandles);
+                    findMyLocateResults = collectLocationsViaFindMyLocate(filterHandle, includeDebugRaw, _diagLog, &sawFindMyLocateHandles);
                     if ([findMyLocateResults count] > 0) {
                         [_diagLog addObject:[NSString stringWithFormat:@"returning %lu location entries after FindMyLocate refresh",
                                              (unsigned long)[findMyLocateResults count]]];
@@ -3110,6 +3326,7 @@ static NSDictionary* handleGetLocations(NSInteger requestId, NSDictionary *param
                         findMyLocateBootstrap,
                         cachedFriendObjects,
                         refreshHandles,
+                        includeDebugRaw,
                         _diagLog
                     );
                     if ([explicitPollResults count] > 0) {
@@ -3214,7 +3431,7 @@ static NSDictionary* handleGetLocations(NSInteger requestId, NSDictionary *param
             }
             [_diagLog addObject:[NSString stringWithFormat:@"sync cachedLocationForHandle(%@) -> %@",
                                  handle, cachedLocation ? NSStringFromClass([cachedLocation class]) : @"nil"]];
-            NSDictionary *entry = locationEntryForHandle(originalHandleObj ?: handle, cachedLocation);
+            NSDictionary *entry = locationEntryForHandle(originalHandleObj ?: handle, cachedLocation, includeDebugRaw);
             if (entry) {
                 [syncResults addObject:entry];
             }
@@ -3273,7 +3490,7 @@ static NSDictionary* handleGetLocations(NSInteger requestId, NSDictionary *param
                 }
                 [_diagLog addObject:[NSString stringWithFormat:@"cachedLocationForHandle(%@) -> %@",
                                      handle, cachedLocation ? NSStringFromClass([cachedLocation class]) : @"nil"]];
-                NSDictionary *entry = locationEntryForHandle(originalHandleObj ?: handle, cachedLocation);
+                NSDictionary *entry = locationEntryForHandle(originalHandleObj ?: handle, cachedLocation, includeDebugRaw);
                 if (entry) {
                     [results addObject:entry];
                 }

@@ -281,15 +281,60 @@ public struct FriendLocation: Sendable {
   public let verticalAccuracy: Double?
   public let timestamp: String?
   public let address: String?
+  public let formattedAddressLines: [String]?
   public let locality: String?
   public let state: String?
   public let country: String?
   public let street: String?
   public let label: String?
+  public let labels: [String]?
   public let firstName: String?
   public let lastName: String?
   public let isOld: Bool
   public let isInaccurate: Bool
+
+  private static func normalizeLocationLabel(_ value: String?) -> String? {
+    guard let value else { return nil }
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+
+    let tokenPrefix = "_$!<"
+    let tokenSuffix = ">!$_"
+    guard trimmed.hasPrefix(tokenPrefix), trimmed.hasSuffix(tokenSuffix) else {
+      return trimmed
+    }
+
+    let start = trimmed.index(trimmed.startIndex, offsetBy: tokenPrefix.count)
+    let end = trimmed.index(trimmed.endIndex, offsetBy: -tokenSuffix.count)
+    var inner = String(trimmed[start..<end])
+    inner = inner.replacingOccurrences(of: "_", with: " ")
+    inner = inner.replacingOccurrences(of: "-", with: " ")
+    inner = inner.replacingOccurrences(
+      of: #"\s+"#, with: " ", options: .regularExpression)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !inner.isEmpty else { return nil }
+
+    switch inner.lowercased() {
+    case "home": return "Home"
+    case "work": return "Work"
+    default: return inner.localizedCapitalized
+    }
+  }
+
+  private static func normalizeLocationLabels(_ values: [String]?) -> [String]? {
+    guard let values else { return nil }
+    var normalized: [String] = []
+    var seen = Set<String>()
+
+    for value in values {
+      guard let normalizedValue = normalizeLocationLabel(value) else { continue }
+      if seen.insert(normalizedValue).inserted {
+        normalized.append(normalizedValue)
+      }
+    }
+
+    return normalized.isEmpty ? nil : normalized
+  }
 
   public init(from dict: [String: Any]) {
     self.handle = dict["handle"] as? String ?? ""
@@ -300,11 +345,13 @@ public struct FriendLocation: Sendable {
     self.verticalAccuracy = dict["vertical_accuracy"] as? Double
     self.timestamp = dict["timestamp"] as? String
     self.address = dict["address"] as? String
+    self.formattedAddressLines = dict["formatted_address_lines"] as? [String]
     self.locality = dict["locality"] as? String
     self.state = dict["state"] as? String
     self.country = dict["country"] as? String
     self.street = dict["street"] as? String
-    self.label = dict["label"] as? String
+    self.label = Self.normalizeLocationLabel(dict["label"] as? String)
+    self.labels = Self.normalizeLocationLabels(dict["labels"] as? [String])
     self.firstName = dict["first_name"] as? String
     self.lastName = dict["last_name"] as? String
     self.isOld = dict["is_old"] as? Bool ?? false
@@ -315,9 +362,9 @@ public struct FriendLocation: Sendable {
     handle: String, latitude: Double?, longitude: Double?,
     altitude: Double? = nil, horizontalAccuracy: Double? = nil,
     verticalAccuracy: Double? = nil, timestamp: String? = nil,
-    address: String? = nil, locality: String? = nil,
+    address: String? = nil, formattedAddressLines: [String]? = nil, locality: String? = nil,
     state: String? = nil, country: String? = nil,
-    street: String? = nil, label: String? = nil,
+    street: String? = nil, label: String? = nil, labels: [String]? = nil,
     firstName: String? = nil, lastName: String? = nil,
     isOld: Bool = false, isInaccurate: Bool = false
   ) {
@@ -329,11 +376,13 @@ public struct FriendLocation: Sendable {
     self.verticalAccuracy = verticalAccuracy
     self.timestamp = timestamp
     self.address = address
+    self.formattedAddressLines = formattedAddressLines
     self.locality = locality
     self.state = state
     self.country = country
     self.street = street
-    self.label = label
+    self.label = Self.normalizeLocationLabel(label)
+    self.labels = Self.normalizeLocationLabels(labels)
     self.firstName = firstName
     self.lastName = lastName
     self.isOld = isOld

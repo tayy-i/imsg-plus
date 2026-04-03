@@ -12,6 +12,8 @@ enum LocationCommand {
       injected dylib) since FindMy entitlements are needed.
 
       Optionally filter by a specific handle (phone number or email).
+      Use --raw with --json to include a private-api debug dump of the
+      underlying location and placemark objects.
       """,
     signature: CommandSignatures.withRuntimeFlags(
       CommandSignature(
@@ -19,6 +21,11 @@ enum LocationCommand {
           .make(
             label: "handle", names: [.long("handle")],
             help: "Filter by phone number or email (substring match)")
+        ],
+        flags: [
+          .make(
+            label: "raw", names: [.long("raw")],
+            help: "Include raw location/address object fields for debugging")
         ]
       )
     ),
@@ -27,6 +34,7 @@ enum LocationCommand {
       "imsg-plus location --handle +14155551234",
       "imsg-plus location --handle john@example.com",
       "imsg-plus location --json",
+      "imsg-plus location --json --raw",
     ]
   ) { values, runtime in
     try await run(values: values, runtime: runtime)
@@ -43,16 +51,26 @@ enum LocationCommand {
     }
 
     let handle = values.option("handle")
+    let raw = values.flags.contains("raw")
 
     do {
-      let locations = try await bridge.getLocations(handle: handle)
-
       if runtime.jsonOutput {
-        for loc in locations {
-          let payload = LocationPayload(location: loc)
-          try JSONLines.print(payload)
+        if raw {
+          let rawLocations = try await bridge.getLocationsResponse(
+            handle: handle, includeDebugRaw: true)
+          for location in rawLocations {
+            print(JSONSerialization.string(from: location))
+          }
+        } else {
+          let locations = try await bridge.getLocations(handle: handle)
+          for loc in locations {
+            let payload = LocationPayload(location: loc)
+            try JSONLines.print(payload)
+          }
         }
       } else {
+        let locations = try await bridge.getLocations(handle: handle)
+
         if locations.isEmpty {
           print("No friends are currently sharing their location with you.")
           return
@@ -60,6 +78,9 @@ enum LocationCommand {
 
         for loc in locations {
           printLocation(loc)
+          if raw {
+            print("  Raw: use --json --raw for the full object dump")
+          }
           print()
         }
       }
@@ -88,6 +109,9 @@ enum LocationCommand {
     if let label = loc.label {
       print("  Label: \(label)")
     }
+    if let labels = loc.labels, !labels.isEmpty {
+      print("  Labels: \(labels.joined(separator: ", "))")
+    }
 
     if let lat = loc.latitude, let lng = loc.longitude {
       print("  Coordinates: \(lat), \(lng)")
@@ -106,6 +130,9 @@ enum LocationCommand {
       if !parts.isEmpty {
         print("  Address: \(parts.joined(separator: ", "))")
       }
+    }
+    if let formattedAddressLines = loc.formattedAddressLines, !formattedAddressLines.isEmpty {
+      print("  Address Lines: \(formattedAddressLines.joined(separator: " | "))")
     }
 
     if let alt = loc.altitude {

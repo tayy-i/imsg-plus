@@ -17,11 +17,13 @@ struct FriendLocationTests {
       "vertical_accuracy": 5.0,
       "timestamp": "2026-04-03T12:00:00Z",
       "address": "1 Apple Park Way, Cupertino, CA",
+      "formatted_address_lines": ["1 Apple Park Way", "Cupertino, CA"],
       "locality": "Cupertino",
       "state": "CA",
       "country": "United States",
       "street": "1 Apple Park Way",
       "label": "Work",
+      "labels": ["_$!<work>!$_"],
       "is_old": false,
       "is_inaccurate": false,
     ]
@@ -35,11 +37,13 @@ struct FriendLocationTests {
     #expect(loc.verticalAccuracy == 5.0)
     #expect(loc.timestamp == "2026-04-03T12:00:00Z")
     #expect(loc.address == "1 Apple Park Way, Cupertino, CA")
+    #expect(loc.formattedAddressLines == ["1 Apple Park Way", "Cupertino, CA"])
     #expect(loc.locality == "Cupertino")
     #expect(loc.state == "CA")
     #expect(loc.country == "United States")
     #expect(loc.street == "1 Apple Park Way")
     #expect(loc.label == "Work")
+    #expect(loc.labels == ["Work"])
     #expect(loc.isOld == false)
     #expect(loc.isInaccurate == false)
     #expect(loc.hasCoordinates == true)
@@ -83,12 +87,29 @@ struct FriendLocationTests {
       handle: "+14155551234",
       latitude: 37.7749,
       longitude: -122.4194,
-      address: "Cupertino"
+      address: "Cupertino",
+      formattedAddressLines: ["1 Infinite Loop", "Cupertino, CA"],
+      labels: ["_$!<home>!$_"]
     )
     #expect(loc.handle == "+14155551234")
     #expect(loc.hasCoordinates == true)
     #expect(loc.altitude == nil)
     #expect(loc.address == "Cupertino")
+    #expect(loc.formattedAddressLines == ["1 Infinite Loop", "Cupertino, CA"])
+    #expect(loc.labels == ["Home"])
+  }
+
+  @Test("Label tokens are normalized")
+  func labelTokensNormalized() {
+    let dict: [String: Any] = [
+      "handle": "+1234",
+      "label": "_$!<work>!$_",
+      "labels": ["_$!<home>!$_", "_$!<favorite_coffee_shop>!$_", "_$!<home>!$_"],
+    ]
+
+    let loc = FriendLocation(from: dict)
+    #expect(loc.label == "Work")
+    #expect(loc.labels == ["Home", "Favorite Coffee Shop"])
   }
 
   @Test("Empty dictionary defaults")
