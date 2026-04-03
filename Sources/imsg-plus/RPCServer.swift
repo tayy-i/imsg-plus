@@ -18,6 +18,8 @@ final class RPCServer {
   private let autoTyping: Bool
   private let bridgeAvailable: Bool
   private let contactResolver: ContactResolving?
+  private let getLocations: (String?) async throws -> [FriendLocation]
+  private let getLocationsResponse: (String?, Bool) async throws -> [[String: Any]]
   private var nextSubscriptionID = 1
   private var subscriptions: [Int: Task<Void, Never>] = [:]
 
@@ -28,7 +30,14 @@ final class RPCServer {
     autoTyping: Bool? = nil,
     output: RPCOutput = RPCWriter(),
     sendMessage: @escaping (MessageSendOptions) throws -> Void = { try MessageSender().send($0) },
-    contactResolver: ContactResolving? = ContactResolver()
+    contactResolver: ContactResolving? = ContactResolver(),
+    bridgeAvailable: Bool? = nil,
+    getLocations: @escaping (String?) async throws -> [FriendLocation] = {
+      try await IMCoreBridge.shared.getLocations(handle: $0)
+    },
+    getLocationsResponse: @escaping (String?, Bool) async throws -> [[String: Any]] = {
+      try await IMCoreBridge.shared.getLocationsResponse(handle: $0, includeDebugRaw: $1)
+    }
   ) {
     self.store = store
     self.watcher = MessageWatcher(store: store)
@@ -37,10 +46,12 @@ final class RPCServer {
     self.output = output
     self.sendMessage = sendMessage
     self.contactResolver = contactResolver
-    let available = IMCoreBridge.shared.isAvailable
+    let available = bridgeAvailable ?? IMCoreBridge.shared.isAvailable
     self.bridgeAvailable = available
     self.autoRead = autoRead ?? available
     self.autoTyping = autoTyping ?? available
+    self.getLocations = getLocations
+    self.getLocationsResponse = getLocationsResponse
   }
 
   func run() async throws {
@@ -146,6 +157,8 @@ final class RPCServer {
           )
         }
         respond(id: id, result: ["messages": payloads])
+      case "locations.list", "location.get":
+        try await handleLocationsList(params: params, id: id)
       case "watch.subscribe":
         let chatID = int64Param(params["chat_id"])
         let sinceRowID = int64Param(params["since_rowid"])
@@ -585,6 +598,24 @@ final class RPCServer {
       handle: handle, messageGUID: guid, partIndex: partIndex)
     respond(
       id: id, result: ["ok": true, "handle": handle, "guid": guid, "action": "unsent"])
+  }
+
+  private func handleLocationsList(params: [String: Any], id: Any?) async throws {
+    guard bridgeAvailable else {
+      throw RPCError.internalError("IMCoreBridge not available")
+    }
+
+    let handle = stringParam(params["handle"])
+    let raw = boolParam(params["raw"]) ?? false
+
+    if raw {
+      let locations = try await getLocationsResponse(handle, true)
+      respond(id: id, result: ["locations": locations])
+      return
+    }
+
+    let locations = try await getLocations(handle).map(locationPayload)
+    respond(id: id, result: ["locations": locations])
   }
 
   /// Resolve the best handle for typing/read from send params

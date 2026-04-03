@@ -431,3 +431,88 @@ func rpcWatchUnsubscribeRequiresSubscription() async throws {
   let error = output.errors.first?["error"] as? [String: Any]
   #expect(int64Value(error?["code"]) == -32602)
 }
+
+@Test
+func rpcLocationsListReturnsPayload() async throws {
+  let store = try RPCTestDatabase.makeStore()
+  let output = TestRPCOutput()
+  let location = FriendLocation(
+    handle: "+14155551234",
+    latitude: 37.7749,
+    longitude: -122.4194,
+    address: "1 Apple Park Way, Cupertino, CA",
+    formattedAddressLines: ["1 Apple Park Way", "Cupertino, CA"],
+    labels: ["_$!<home>!$_"]
+  )
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    output: output,
+    bridgeAvailable: true,
+    getLocations: { handle in
+      #expect(handle == "+14155551234")
+      return [location]
+    }
+  )
+
+  let line =
+    #"{"jsonrpc":"2.0","id":30,"method":"locations.list","params":{"handle":"+14155551234"}}"#
+  await server.handleLineForTesting(line)
+
+  let result = output.responses.first?["result"] as? [String: Any]
+  let locations = result?["locations"] as? [[String: Any]] ?? []
+  #expect(locations.count == 1)
+  #expect(locations[0]["labels"] as? [String] == ["Home"])
+  #expect(locations[0]["formatted_address_lines"] as? [String] == ["1 Apple Park Way", "Cupertino, CA"])
+}
+
+@Test
+func rpcLocationGetSupportsRawOutput() async throws {
+  let store = try RPCTestDatabase.makeStore()
+  let output = TestRPCOutput()
+  let rawLocation: [String: Any] = [
+    "handle": "+14155551234",
+    "labels": ["_$!<home>!$_"],
+    "raw_location": ["fields": ["labels": ["_$!<home>!$_"]]],
+  ]
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    output: output,
+    bridgeAvailable: true,
+    getLocationsResponse: { handle, raw in
+      #expect(handle == "+14155551234")
+      #expect(raw == true)
+      return [rawLocation]
+    }
+  )
+
+  let line =
+    #"{"jsonrpc":"2.0","id":31,"method":"location.get","params":{"handle":"+14155551234","raw":true}}"#
+  await server.handleLineForTesting(line)
+
+  let result = output.responses.first?["result"] as? [String: Any]
+  let locations = result?["locations"] as? [[String: Any]] ?? []
+  #expect(locations.count == 1)
+  #expect(locations[0]["labels"] as? [String] == ["_$!<home>!$_"])
+  #expect((locations[0]["raw_location"] as? [String: Any])?["fields"] as? [String: Any] != nil)
+}
+
+@Test
+func rpcLocationsListRequiresBridge() async throws {
+  let store = try RPCTestDatabase.makeStore()
+  let output = TestRPCOutput()
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    output: output,
+    bridgeAvailable: false
+  )
+
+  let line = #"{"jsonrpc":"2.0","id":32,"method":"locations.list","params":{}}"#
+  await server.handleLineForTesting(line)
+
+  let error = output.errors.first?["error"] as? [String: Any]
+  #expect(int64Value(error?["code"]) == -32603)
+  #expect((error?["message"] as? String)?.isEmpty == false)
+}

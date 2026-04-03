@@ -104,6 +104,65 @@ func reactionPayload(_ reaction: Reaction, senderName: String? = nil) -> [String
   return payload
 }
 
+func locationPayload(_ location: FriendLocation) -> [String: Any] {
+  var payload: [String: Any] = [
+    "handle": location.handle,
+    "is_old": location.isOld,
+    "is_inaccurate": location.isInaccurate,
+  ]
+
+  if let latitude = location.latitude {
+    payload["latitude"] = latitude
+  }
+  if let longitude = location.longitude {
+    payload["longitude"] = longitude
+  }
+  if let altitude = location.altitude {
+    payload["altitude"] = altitude
+  }
+  if let horizontalAccuracy = location.horizontalAccuracy {
+    payload["horizontal_accuracy"] = horizontalAccuracy
+  }
+  if let verticalAccuracy = location.verticalAccuracy {
+    payload["vertical_accuracy"] = verticalAccuracy
+  }
+  if let timestamp = location.timestamp, !timestamp.isEmpty {
+    payload["timestamp"] = timestamp
+  }
+  if let address = location.address, !address.isEmpty {
+    payload["address"] = address
+  }
+  if let formattedAddressLines = location.formattedAddressLines, !formattedAddressLines.isEmpty {
+    payload["formatted_address_lines"] = formattedAddressLines
+  }
+  if let locality = location.locality, !locality.isEmpty {
+    payload["locality"] = locality
+  }
+  if let state = location.state, !state.isEmpty {
+    payload["state"] = state
+  }
+  if let country = location.country, !country.isEmpty {
+    payload["country"] = country
+  }
+  if let street = location.street, !street.isEmpty {
+    payload["street"] = street
+  }
+  if let label = location.label, !label.isEmpty {
+    payload["label"] = label
+  }
+  if let labels = location.labels, !labels.isEmpty {
+    payload["labels"] = labels
+  }
+  if let firstName = location.firstName, !firstName.isEmpty {
+    payload["first_name"] = firstName
+  }
+  if let lastName = location.lastName, !lastName.isEmpty {
+    payload["last_name"] = lastName
+  }
+
+  return payload
+}
+
 func isGroupHandle(identifier: String, guid: String) -> Bool {
   let handle = identifier.isEmpty ? guid : identifier
   return handle.contains(";+;") || handle.contains(";-;")

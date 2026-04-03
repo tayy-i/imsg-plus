@@ -173,6 +173,35 @@ func messagePayloadOmitsEditFieldsWhenNotEdited() {
 }
 
 @Test
+func locationPayloadIncludesNormalizedLabelsAndAddressLines() {
+  let location = FriendLocation(
+    handle: "+14155551234",
+    latitude: 37.7749,
+    longitude: -122.4194,
+    altitude: 12,
+    horizontalAccuracy: 5,
+    verticalAccuracy: 8,
+    timestamp: "2026-04-03T12:00:00Z",
+    address: "1 Apple Park Way, Cupertino, CA",
+    formattedAddressLines: ["1 Apple Park Way", "Cupertino, CA"],
+    locality: "Cupertino",
+    state: "CA",
+    country: "United States",
+    street: "1 Apple Park Way",
+    labels: ["_$!<home>!$_", "_$!<favorite_coffee_shop>!$_"],
+    isOld: false,
+    isInaccurate: false
+  )
+
+  let payload = locationPayload(location)
+  #expect(payload["handle"] as? String == "+14155551234")
+  #expect(payload["latitude"] as? Double == 37.7749)
+  #expect(payload["formatted_address_lines"] as? [String] == ["1 Apple Park Way", "Cupertino, CA"])
+  #expect(payload["labels"] as? [String] == ["Home", "Favorite Coffee Shop"])
+  #expect(payload["is_old"] as? Bool == false)
+}
+
+@Test
 func paramParsingHelpers() {
   #expect(stringParam(123 as NSNumber) == "123")
   #expect(intParam("42") == 42)
