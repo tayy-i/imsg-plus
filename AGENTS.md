@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 - `Sources/imsg` holds the CLI entrypoint and command wiring.
-- `Sources/IMsgCore` contains SQLite access, watchers, AppleScript send logic, and helpers.
+- `Sources/IMsgCore` contains SQLite access, watchers, IMCore bridge logic, and helpers.
 - `bin/` is created by `make build` for local artifacts.
 
 ## Build, Test, and Development Commands
@@ -70,4 +70,4 @@ The dylib uses Objective-C runtime to access IMCore classes:
 
 ## Security & macOS Permissions
 - The tool needs read-only access to `~/Library/Messages/chat.db`; ensure the terminal has Full Disk Access before running tests that touch the DB.
-- Sending requires Automation permission for Messages.app and SMS relay configured in macOS/iOS; document any manual steps needed for reviewers.
+- Sending requires the injected Messages.app helper to be available; document any manual steps needed for reviewers.

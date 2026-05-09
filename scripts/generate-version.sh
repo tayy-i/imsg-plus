@@ -30,8 +30,6 @@ cat > "$PLIST_OUTPUT" <<PLIST
   <string>${MARKETING_VERSION}</string>
   <key>CFBundleVersion</key>
   <string>${MARKETING_VERSION}</string>
-  <key>NSAppleEventsUsageDescription</key>
-  <string>Send messages via Messages.app.</string>
 </dict>
 </plist>
 PLIST

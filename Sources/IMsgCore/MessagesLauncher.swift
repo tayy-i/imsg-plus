@@ -159,14 +159,16 @@ public final class MessagesLauncher: @unchecked Sendable {
     defer { lock.unlock() }
 
     // Build command
+    let requestID = Int(Date().timeIntervalSince1970 * 1000)
     let command: [String: Any] = [
-      "id": Int(Date().timeIntervalSince1970 * 1000),
+      "id": requestID,
       "action": action,
       "params": params,
     ]
 
     // Write command to file
     let jsonData = try JSONSerialization.data(withJSONObject: command, options: [])
+    try? "".write(toFile: responseFile, atomically: true, encoding: .utf8)
     try jsonData.write(to: URL(fileURLWithPath: commandFile))
 
     // Wait for response (poll response file)
@@ -193,6 +195,10 @@ public final class MessagesLauncher: @unchecked Sendable {
         else {
           throw MessagesLauncherError.invalidResponse
         }
+        guard responseID(response["id"]) == requestID else {
+          try? "".write(toFile: responseFile, atomically: true, encoding: .utf8)
+          continue
+        }
 
         // Clear response file
         try? "".write(toFile: responseFile, atomically: true, encoding: .utf8)
@@ -204,23 +210,23 @@ public final class MessagesLauncher: @unchecked Sendable {
     throw MessagesLauncherError.socketError("Timeout waiting for response")
   }
 
+  private func responseID(_ value: Any?) -> Int? {
+    if let value = value as? Int {
+      return value
+    }
+    if let value = value as? NSNumber {
+      return value.intValue
+    }
+    return nil
+  }
+
   /// Send a command asynchronously
   public func sendCommand(action: String, params: [String: Any]) async throws -> [String: Any] {
     // Ensure Messages.app is running with injection
     try ensureRunning()
 
-    // Capture params as a sendable copy
-    let paramsCopy = params
-
-    return try await withCheckedThrowingContinuation { continuation in
-      queue.async {
-        do {
-          let response = try self.sendCommandSync(action: action, params: paramsCopy)
-          continuation.resume(returning: response)
-        } catch {
-          continuation.resume(throwing: error)
-        }
-      }
+    return try queue.sync {
+      try self.sendCommandSync(action: action, params: params)
     }
   }
 }

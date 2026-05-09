@@ -3,7 +3,6 @@
 # Integration test for imsg-plus features:
 #   - Bridge-first sends (plain text, attachments, effects, thread replies)
 #   - Edit, unsend
-#   - AppleScript fallback
 #   - RPC smoke tests
 #
 # Requires: SIP disabled, dylib injected, Messages.app running.
@@ -335,31 +334,6 @@ elif echo "$RPC_REPLY" | jq -e '.result.ok == true' >/dev/null 2>&1; then
 else
   fail "RPC send with reply_to_guid: unexpected response"
 fi
-
-# --- Test 12: AppleScript fallback ---
-log "Step 12: AppleScript fallback (kill Messages, send without bridge)"
-record "Killing Messages.app to test fallback..."
-killall Messages 2>/dev/null || true
-sleep 2
-
-FALLBACK_OUT=$($IMSG send --to "$TARGET" --text "integration-test-fallback-$(date +%s)" --json 2>&1 || true)
-record "Fallback result: $FALLBACK_OUT"
-if echo "$FALLBACK_OUT" | jq -e '.status == "sent"' >/dev/null 2>&1; then
-  pass "AppleScript fallback send (bridge unavailable)"
-else
-  # AppleScript send prints "sent" to stdout, not JSON — check for that
-  if echo "$FALLBACK_OUT" | grep -q '"status":"sent"'; then
-    pass "AppleScript fallback send (bridge unavailable)"
-  else
-    fail "AppleScript fallback: $FALLBACK_OUT"
-  fi
-fi
-sleep 3
-
-# Relaunch Messages with injection so subsequent manual tests work
-record "Relaunching Messages.app with injection..."
-$IMSG launch 2>/dev/null &
-sleep 5
 
 # --- Cleanup ---
 rm -f "$TEST_FILE" "$TEST_IMG"

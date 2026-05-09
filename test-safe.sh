@@ -51,5 +51,4 @@ echo "2. Get a message GUID: imsg history --chat-id <ID> --limit 5"
 echo "3. Try typing: imsg typing --handle <phone> --state on"
 echo "   (Will show 'not fully implemented' due to Swift/ObjC bridging limits)"
 echo
-echo "Note: The architecture is in place, but full implementation would"
-echo "require either Objective-C bridging code or AppleScript fallbacks."
+echo "Note: Sends and advanced actions require the injected Objective-C bridge."

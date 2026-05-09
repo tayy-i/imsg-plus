@@ -16,7 +16,7 @@
 - `imsg send --chat-id <rowid>` (preferred; DB local).
 - `imsg send --chat-identifier <handle>` (portable).
 - `imsg send --chat-guid <guid>` (portable).
-- Uses AppleScript `chat id "<handle>"` for group sends (Jared pattern).
+- Uses the injected IMCore bridge for group sends.
 - Attachments supported same as direct sends.
 
 ## Inbound metadata (JSON)

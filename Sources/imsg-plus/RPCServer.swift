@@ -13,7 +13,8 @@ final class RPCServer {
   private let output: RPCOutput
   private let cache: ChatCache
   private let verbose: Bool
-  private let sendMessage: (MessageSendOptions) throws -> Void
+  private let bridgeSendMessage:
+    (String, String, String?, String?, MessageEffect?, String?) async throws -> Void
   private let autoRead: Bool
   private let autoTyping: Bool
   private let bridgeAvailable: Bool
@@ -29,7 +30,10 @@ final class RPCServer {
     autoRead: Bool? = nil,
     autoTyping: Bool? = nil,
     output: RPCOutput = RPCWriter(),
-    sendMessage: @escaping (MessageSendOptions) throws -> Void = { try MessageSender().send($0) },
+    bridgeSendMessage:
+      @escaping (
+        String, String, String?, String?, MessageEffect?, String?
+      ) async throws -> Void = RPCServer.defaultBridgeSendMessage,
     contactResolver: ContactResolving? = ContactResolver(),
     bridgeAvailable: Bool? = nil,
     getLocations: @escaping (String?) async throws -> [FriendLocation] = {
@@ -44,7 +48,7 @@ final class RPCServer {
     self.cache = ChatCache(store: store)
     self.verbose = verbose
     self.output = output
-    self.sendMessage = sendMessage
+    self.bridgeSendMessage = bridgeSendMessage
     self.contactResolver = contactResolver
     let available = bridgeAvailable ?? IMCoreBridge.shared.isAvailable
     self.bridgeAvailable = available
@@ -299,11 +303,12 @@ final class RPCServer {
   private func handleSend(params: [String: Any], id: Any?) async throws {
     let text = stringParam(params["text"]) ?? ""
     let file = stringParam(params["file"]) ?? ""
-    let serviceRaw = stringParam(params["service"]) ?? "auto"
-    guard let service = MessageService(rawValue: serviceRaw.lowercased()) else {
-      throw RPCError.invalidParams("invalid service")
+    if stringParam(params["service"]) != nil {
+      throw RPCError.invalidParams("service is no longer supported for send; imsg-plus sends through the IMCore bridge")
     }
-    let region = stringParam(params["region"]) ?? "US"
+    if stringParam(params["region"]) != nil {
+      throw RPCError.invalidParams("region is no longer supported for send; imsg-plus sends through the IMCore bridge")
+    }
 
     let chatID = int64Param(params["chat_id"])
     let chatIdentifier = stringParam(params["chat_identifier"]) ?? ""
@@ -377,61 +382,24 @@ final class RPCServer {
       effect = parsed
     }
 
-    // Thread reply requires bridge
-    if replyToGUID != nil && !bridgeAvailable {
-      throw RPCError.internalError("IMCoreBridge not available (required for thread replies)")
+    guard bridgeAvailable else {
+      throw RPCError.internalError("IMCoreBridge not available (required for send)")
     }
 
-    // Resolve handle for bridge sends
     let handle = resolveTypingHandle(
       recipient: recipient,
       chatIdentifier: resolvedChatIdentifier,
       chatGUID: resolvedChatGUID
     )
+    guard let handle else {
+      throw RPCError.invalidParams("missing send handle")
+    }
     let attachment: String? = file.isEmpty ? nil : file
 
-    // Try bridge first when available
-    var sentViaBridge = false
-    if bridgeAvailable, let handle {
-      do {
-        if let markdownText, !markdownText.isEmpty,
-          let attrData = MarkdownComposer.compose(markdownText)
-        {
-          try await IMCoreBridge.shared.sendRichMessage(
-            handle: handle, attributedText: attrData, attachment: attachment,
-            effect: effect, replyToGUID: replyToGUID)
-        } else {
-          let sendText = text.isEmpty ? (markdownText ?? "") : text
-          try await IMCoreBridge.shared.sendMessage(
-            handle: handle, text: sendText, attachment: attachment,
-            effect: effect, replyToGUID: replyToGUID)
-        }
-        sentViaBridge = true
-      } catch {
-        // Thread replies cannot fall back to AppleScript
-        if replyToGUID != nil { throw error }
-        if verbose {
-          FileHandle.standardError.write(
-            Data("[bridge] send failed, falling back to AppleScript: \(error)\n".utf8))
-        }
-      }
-    }
-
-    if !sentViaBridge {
-      let sendText =
-        markdownText != nil
-        ? MarkdownComposer.stripMarkdown(markdownText ?? text) : text
-      try sendMessage(
-        MessageSendOptions(
-          recipient: recipient,
-          text: sendText,
-          attachmentPath: file,
-          service: service,
-          region: region,
-          chatIdentifier: resolvedChatIdentifier,
-          chatGUID: resolvedChatGUID
-        )
-      )
+    do {
+      try await bridgeSendMessage(handle, text, markdownText, attachment, effect, replyToGUID)
+    } catch {
+      throw RPCError.internalError(describeBridgeSendError(error))
     }
 
     // Turn off typing after send (fire-and-forget)
@@ -463,6 +431,44 @@ final class RPCServer {
       result["effect"] = effect.displayName
     }
     respond(id: id, result: result)
+  }
+
+  private static func defaultBridgeSendMessage(
+    handle: String,
+    text: String,
+    markdownText: String?,
+    attachment: String?,
+    effect: MessageEffect?,
+    replyToGUID: String?
+  ) async throws {
+    if let markdownText, !markdownText.isEmpty,
+      let attrData = MarkdownComposer.compose(markdownText)
+    {
+      try await IMCoreBridge.shared.sendRichMessage(
+        handle: handle,
+        attributedText: attrData,
+        attachment: attachment,
+        effect: effect,
+        replyToGUID: replyToGUID
+      )
+      return
+    }
+
+    let sendText = text.isEmpty ? (markdownText ?? "") : text
+    try await IMCoreBridge.shared.sendMessage(
+      handle: handle,
+      text: sendText,
+      attachment: attachment,
+      effect: effect,
+      replyToGUID: replyToGUID
+    )
+  }
+
+  private func describeBridgeSendError(_ error: Error) -> String {
+    if let bridgeError = error as? IMCoreBridgeError {
+      return bridgeError.description
+    }
+    return error.localizedDescription
   }
 
   private func handleTypingSet(params: [String: Any], id: Any?) async throws {

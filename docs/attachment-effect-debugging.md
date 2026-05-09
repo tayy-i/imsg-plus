@@ -23,12 +23,13 @@ blocks:
 `~/Library/Messages/Attachments/XX/imsg-plus-UUID/filename` before calling the bridge. The dylib
 receives the already-staged path and creates the file transfer from it.
 
-### 2. AppleScript Fallback Masked the Bug
+### 2. Legacy Fallback Masked the Bug
 
-`SendCommand.swift` and `RPCServer.swift` silently fell back to AppleScript when the bridge threw
-errors. Since AppleScript can send attachments (but not effects), attachment sends appeared to work.
+`SendCommand.swift` and `RPCServer.swift` previously fell back to a non-bridge send path when the
+bridge threw errors. Since that path could send attachments but not effects, attachment sends
+appeared to work.
 The bridge attachment path had been broken since it was first written, but nobody noticed because
-AppleScript handled it.
+The legacy fallback handled it.
 
 ### 3. Empty Text Treated as "Has Text"
 

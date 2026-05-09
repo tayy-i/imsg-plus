@@ -165,14 +165,16 @@ func sendCommandRunsWithStubSender() async throws {
     flags: []
   )
   let runtime = RuntimeOptions(parsedValues: values)
-  var captured: MessageSendOptions?
+  var captured: (handle: String, text: String, attachment: String?)?
   try await SendCommand.run(
     values: values, runtime: runtime,
-    sendMessage: { options in
-      captured = options
+    bridgeAvailable: true,
+    bridgeSendMessage: { handle, text, _, attachment, _, _ in
+      captured = (handle, text, attachment)
     })
-  #expect(captured?.recipient == "+15551234567")
+  #expect(captured?.handle == "+15551234567")
   #expect(captured?.text == "hi")
+  #expect(captured?.attachment == nil)
 }
 
 @Test
@@ -184,15 +186,33 @@ func sendCommandResolvesChatID() async throws {
     flags: []
   )
   let runtime = RuntimeOptions(parsedValues: values)
-  var captured: MessageSendOptions?
+  var captured: (handle: String, text: String)?
   try await SendCommand.run(
     values: values, runtime: runtime,
-    sendMessage: { options in
-      captured = options
+    bridgeAvailable: true,
+    bridgeSendMessage: { handle, text, _, _, _, _ in
+      captured = (handle, text)
     })
-  #expect(captured?.chatIdentifier == "+123")
-  #expect(captured?.chatGUID == "iMessage;+;chat123")
-  #expect(captured?.recipient.isEmpty == true)
+  #expect(captured?.handle == "iMessage;+;chat123")
+  #expect(captured?.text == "hi")
+}
+
+@Test
+func sendCommandRequiresBridge() async throws {
+  let values = ParsedValues(
+    positional: [],
+    options: ["to": ["+15551234567"], "text": ["hi"]],
+    flags: []
+  )
+  let runtime = RuntimeOptions(parsedValues: values)
+  do {
+    try await SendCommand.run(values: values, runtime: runtime, bridgeAvailable: false)
+    #expect(Bool(false))
+  } catch let error as IMsgError {
+    #expect(error.localizedDescription.contains("IMCoreBridge not available"))
+  } catch {
+    #expect(Bool(false))
+  }
 }
 
 @Test

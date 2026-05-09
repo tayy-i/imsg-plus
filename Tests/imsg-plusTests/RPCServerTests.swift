@@ -158,21 +158,69 @@ func rpcMessagesHistoryIncludesChatFields() async throws {
 func rpcSendResolvesChatID() async throws {
   let store = try RPCTestDatabase.makeStore()
   let output = TestRPCOutput()
-  var captured: MessageSendOptions?
+  var captured: (handle: String, text: String)?
   let server = RPCServer(
     store: store,
     verbose: false,
     output: output,
-    sendMessage: { options in captured = options }
+    bridgeSendMessage: { handle, text, _, _, _, _ in captured = (handle, text) },
+    bridgeAvailable: true
   )
 
   let line = #"{"jsonrpc":"2.0","id":"3","method":"send","params":{"chat_id":1,"text":"yo"}}"#
   await server.handleLineForTesting(line)
 
-  #expect(captured?.chatIdentifier == "iMessage;+;chat123")
-  #expect(captured?.chatGUID == "iMessage;+;chat123")
-  #expect(captured?.recipient.isEmpty == true)
+  #expect(captured?.handle == "iMessage;+;chat123")
+  #expect(captured?.text == "yo")
   #expect(output.responses.first?["result"] as? [String: Any] != nil)
+}
+
+@Test
+func rpcSendReportsBridgeTimeout() async throws {
+  let store = try RPCTestDatabase.makeStore()
+  let output = TestRPCOutput()
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    autoTyping: false,
+    output: output,
+    bridgeSendMessage: { _, _, _, _, _, _ in
+      throw IMCoreBridgeError.connectionFailed("IPC error: Timeout waiting for response")
+    },
+    bridgeAvailable: true
+  )
+
+  let line = #"{"jsonrpc":"2.0","id":"3b","method":"send","params":{"chat_id":1,"text":"yo"}}"#
+  await server.handleLineForTesting(line)
+
+  #expect(output.errors.count == 1)
+  let error = output.errors[0]["error"] as? [String: Any]
+  #expect(int64Value(error?["code"]) == -32603)
+  #expect((error?["data"] as? String)?.contains("Timeout waiting for response") == true)
+}
+
+@Test
+func rpcSendRejectsBridgeChatNotFound() async throws {
+  let store = try RPCTestDatabase.makeStore()
+  let output = TestRPCOutput()
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    autoTyping: false,
+    output: output,
+    bridgeSendMessage: { _, _, _, _, _, _ in
+      throw IMCoreBridgeError.chatNotFound("iMessage;+;chat123")
+    },
+    bridgeAvailable: true
+  )
+
+  let line = #"{"jsonrpc":"2.0","id":"3c","method":"send","params":{"chat_id":1,"text":"yo"}}"#
+  await server.handleLineForTesting(line)
+
+  #expect(output.errors.count == 1)
+  let error = output.errors[0]["error"] as? [String: Any]
+  #expect(int64Value(error?["code"]) == -32603)
+  #expect((error?["data"] as? String)?.contains("Chat not found") == true)
 }
 
 @Test
@@ -266,7 +314,7 @@ func rpcHistoryRequiresChatID() async throws {
 }
 
 @Test
-func rpcSendRejectsInvalidService() async throws {
+func rpcSendRejectsUnsupportedServiceParam() async throws {
   let store = try RPCTestDatabase.makeStore()
   let output = TestRPCOutput()
   let server = RPCServer(store: store, verbose: false, output: output)
@@ -277,6 +325,7 @@ func rpcSendRejectsInvalidService() async throws {
 
   let error = output.errors.first?["error"] as? [String: Any]
   #expect(int64Value(error?["code"]) == -32602)
+  #expect((error?["data"] as? String)?.contains("service is no longer supported") == true)
 }
 
 @Test
@@ -463,7 +512,8 @@ func rpcLocationsListReturnsPayload() async throws {
   let locations = result?["locations"] as? [[String: Any]] ?? []
   #expect(locations.count == 1)
   #expect(locations[0]["labels"] as? [String] == ["Home"])
-  #expect(locations[0]["formatted_address_lines"] as? [String] == ["1 Apple Park Way", "Cupertino, CA"])
+  #expect(
+    locations[0]["formatted_address_lines"] as? [String] == ["1 Apple Park Way", "Cupertino, CA"])
 }
 
 @Test

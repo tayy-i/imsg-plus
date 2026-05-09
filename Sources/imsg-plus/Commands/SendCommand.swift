@@ -19,11 +19,6 @@ enum SendCommand {
           .make(label: "text", names: [.long("text")], help: "message body"),
           .make(label: "file", names: [.long("file")], help: "path to attachment"),
           .make(
-            label: "service", names: [.long("service")], help: "service to use: imessage|sms|auto"),
-          .make(
-            label: "region", names: [.long("region")],
-            help: "default region for phone normalization"),
-          .make(
             label: "effect", names: [.long("effect")],
             help:
               "Send effect: gentle, loud, slam, invisibleink, confetti, balloons, fireworks, heart, lasers, echo, spotlight, sparkles, shootingstar"
@@ -41,7 +36,7 @@ enum SendCommand {
     ),
     usageExamples: [
       "imsg send --to +14155551212 --text \"hi\"",
-      "imsg send --to +14155551212 --text \"hi\" --file ~/Desktop/pic.jpg --service imessage",
+      "imsg send --to +14155551212 --text \"hi\" --file ~/Desktop/pic.jpg",
       "imsg send --chat-id 1 --text \"hi\"",
       "imsg send --to +14155551212 --text \"happy birthday!\" --effect balloons",
     ]
@@ -52,7 +47,11 @@ enum SendCommand {
   static func run(
     values: ParsedValues,
     runtime: RuntimeOptions,
-    sendMessage: @escaping (MessageSendOptions) throws -> Void = { try MessageSender().send($0) },
+    bridgeAvailable: Bool = IMCoreBridge.shared.isAvailable,
+    bridgeSendMessage:
+      @escaping (
+        String, String, String?, String?, MessageEffect?, String?
+      ) async throws -> Void = SendCommand.defaultBridgeSendMessage,
     storeFactory: @escaping (String) throws -> MessageStore = { try MessageStore(path: $0) }
   ) async throws {
     let dbPath = values.option("db") ?? MessageStore.defaultPath
@@ -73,12 +72,6 @@ enum SendCommand {
     if text.isEmpty && file.isEmpty {
       throw ParsedValuesError.missingOption("text or file")
     }
-    let serviceRaw = values.option("service") ?? "auto"
-    guard let service = MessageService(rawValue: serviceRaw) else {
-      throw IMsgError.invalidService(serviceRaw)
-    }
-    let region = values.option("region") ?? "US"
-
     var resolvedChatIdentifier = chatIdentifier
     var resolvedChatGUID = chatGUID
     if let chatID {
@@ -109,64 +102,74 @@ enum SendCommand {
     let replyGUID: String? = replyToGUID.isEmpty ? nil : replyToGUID
     let attachment: String? = file.isEmpty ? nil : file
 
-    // Try bridge first when available
-    let bridge = IMCoreBridge.shared
     let handle =
       resolvedChatGUID.isEmpty
       ? (resolvedChatIdentifier.isEmpty ? recipient : resolvedChatIdentifier)
       : resolvedChatGUID
 
-    var sentViaBridge = false
-    if bridge.isAvailable && !handle.isEmpty {
-      do {
-        if useMarkdown, let attrData = MarkdownComposer.compose(text) {
-          try await bridge.sendRichMessage(
-            handle: handle, attributedText: attrData, attachment: attachment,
-            effect: effect, replyToGUID: replyGUID)
-        } else {
-          try await bridge.sendMessage(
-            handle: handle, text: text, attachment: attachment,
-            effect: effect, replyToGUID: replyGUID)
-        }
-        sentViaBridge = true
-      } catch {
-        // Thread replies cannot fall back to AppleScript
-        if replyGUID != nil { throw error }
-      }
+    guard !handle.isEmpty else {
+      throw IMsgError.invalidChatTarget("Missing send handle")
+    }
+    guard bridgeAvailable else {
+      throw IMsgError.invalidArgument("IMCoreBridge not available. Run `imsg-plus launch` before sending.")
     }
 
-    if sentViaBridge {
-      if runtime.jsonOutput {
-        var result: [String: String] = ["status": "sent"]
-        if useMarkdown { result["markdown"] = "true" }
-        if let effect { result["effect"] = effect.displayName }
-        try JSONLines.print(result)
-      } else {
-        var parts = ["sent"]
-        if useMarkdown { parts.append("with formatting") }
-        if let effect { parts.append("with \(effect.displayName) effect") }
-        Swift.print(parts.joined(separator: " "))
-      }
+    let markdownText = useMarkdown ? text : nil
+    let sendText = useMarkdown ? "" : text
+    do {
+      try await bridgeSendMessage(handle, sendText, markdownText, attachment, effect, replyGUID)
+    } catch {
+      throw IMsgError.invalidArgument(describeBridgeSendError(error))
+    }
+
+    if runtime.jsonOutput {
+      var result: [String: String] = ["status": "sent"]
+      if useMarkdown { result["markdown"] = "true" }
+      if let effect { result["effect"] = effect.displayName }
+      try JSONLines.print(result)
+    } else {
+      var parts = ["sent"]
+      if useMarkdown { parts.append("with formatting") }
+      if let effect { parts.append("with \(effect.displayName) effect") }
+      Swift.print(parts.joined(separator: " "))
+    }
+  }
+
+  private static func defaultBridgeSendMessage(
+    handle: String,
+    text: String,
+    markdownText: String?,
+    attachment: String?,
+    effect: MessageEffect?,
+    replyToGUID: String?
+  ) async throws {
+    if let markdownText, !markdownText.isEmpty,
+      let attrData = MarkdownComposer.compose(markdownText)
+    {
+      try await IMCoreBridge.shared.sendRichMessage(
+        handle: handle,
+        attributedText: attrData,
+        attachment: attachment,
+        effect: effect,
+        replyToGUID: replyToGUID
+      )
       return
     }
 
-    // AppleScript fallback — strip markdown, skip effect
-    let sendText = useMarkdown ? MarkdownComposer.stripMarkdown(text) : text
-    try sendMessage(
-      MessageSendOptions(
-        recipient: recipient,
-        text: sendText,
-        attachmentPath: file,
-        service: service,
-        region: region,
-        chatIdentifier: resolvedChatIdentifier,
-        chatGUID: resolvedChatGUID
-      ))
+    let sendText = text.isEmpty ? (markdownText ?? "") : text
+    try await IMCoreBridge.shared.sendMessage(
+      handle: handle,
+      text: sendText,
+      attachment: attachment,
+      effect: effect,
+      replyToGUID: replyToGUID
+    )
+  }
 
-    if runtime.jsonOutput {
-      try JSONLines.print(["status": "sent"])
-    } else {
-      Swift.print("sent")
+  private static func describeBridgeSendError(_ error: Error) -> String {
+    if let bridgeError = error as? IMCoreBridgeError {
+      return bridgeError.description
     }
+    return error.localizedDescription
   }
 }

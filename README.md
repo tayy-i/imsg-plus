@@ -1,13 +1,12 @@
 # 💬 imsg-plus — Enhanced iMessage CLI with Typing, Reactions & More
 
-An enhanced macOS Messages.app CLI that adds typing indicators, read receipts, tapback reactions, and a JSON-RPC server to the original [imsg](https://github.com/steipete/imsg). Basic features use AppleScript; advanced features use IMCore via an Objective-C helper dylib.
+An enhanced macOS Messages.app CLI that adds bridge-backed sending, typing indicators, read receipts, tapback reactions, and a JSON-RPC server to the original [imsg](https://github.com/steipete/imsg). Sending and advanced features use IMCore via an Objective-C helper dylib injected into Messages.app.
 
 ## Features
 
 ### Original Features
 - List chats, view history, or stream new messages (`watch`).
-- Send text and attachments via iMessage or SMS (AppleScript, no private APIs).
-- Phone normalization to E.164 for reliable buddy lookup (`--region`, default US).
+- Send text and attachments through the injected IMCore bridge.
 - Optional attachment metadata output (mime, name, path, missing flag).
 - Filters: participants, start/end time, JSON output for tooling.
 - Read-only DB access (`mode=ro`), no DB writes.
@@ -28,7 +27,6 @@ An enhanced macOS Messages.app CLI that adds typing indicators, read receipts, t
 ## Requirements
 - macOS 14+ with Messages.app signed in.
 - Full Disk Access for your terminal to read `~/Library/Messages/chat.db`.
-- **Automation permission** for imsg-plus to control Messages.app (see [Permissions troubleshooting](#%EF%B8%8F-automation-permission-important) — this is the #1 source of issues).
 - For SMS relay, enable "Text Message Forwarding" on your iPhone to this Mac.
 
 ## Install
@@ -51,7 +49,10 @@ make build-dylib
 - `imsg-plus chats [--limit 20] [--json]` — list recent conversations.
 - `imsg-plus history --chat-id <id> [--limit 50] [--attachments] [--participants +15551234567,...] [--start 2025-01-01T00:00:00Z] [--end 2025-02-01T00:00:00Z] [--json]`
 - `imsg-plus watch [--chat-id <id>] [--since-rowid <n>] [--debounce 250ms] [--attachments] [--participants …] [--start …] [--end …] [--json]`
-- `imsg-plus send --to <handle> [--text "hi"] [--file /path/img.jpg] [--service imessage|sms|auto] [--region US]`
+- `imsg-plus send --to <handle> [--text "hi"] [--file /path/img.jpg]`
+
+`send` requires Messages.app to be running with the helper dylib injected; run
+`imsg-plus launch` before sending.
 
 ### New Commands (imsg-plus)
 - `imsg-plus typing --handle <phone/email> --state on|off` — Control typing indicator
@@ -82,7 +83,7 @@ imsg-plus history --chat-id 1 --start 2025-01-01T00:00:00Z --json
 imsg-plus watch --chat-id 1 --attachments --debounce 250ms
 
 # send a picture
-imsg-plus send --to "+14155551212" --text "hi" --file ~/Desktop/pic.jpg --service imessage
+imsg-plus send --to "+14155551212" --text "hi" --file ~/Desktop/pic.jpg
 
 # show typing indicator
 imsg-plus typing --handle "+14155551212" --state on
@@ -188,55 +189,9 @@ If you see "unable to open database file" or empty output:
 1. Grant Full Disk Access: System Settings → Privacy & Security → Full Disk Access → add your terminal.
 2. Ensure Messages.app is signed in and `~/Library/Messages/chat.db` exists.
 
-### ⚠️ Automation Permission (Important!)
-
-imsg-plus uses AppleScript to control Messages.app. macOS requires **Automation permission** for this to work.
-
-**Symptoms when permission is missing:**
-- `send` commands hang forever (no error, just blocks)
-- Messages appear in chat.db but never actually send
-- Works fine from the web UI / database, but recipients never receive them
-
-**How to fix:**
-
-1. **From a GUI Terminal session** (not SSH), run:
-   ```bash
-   /usr/local/bin/imsg-plus send --to <your-phone> --text "permission test"
-   ```
-2. macOS will prompt: "imsg-plus wants to control Messages.app"
-3. Click **Allow**
-
-Or manually: System Settings → Privacy & Security → Automation → find `imsg-plus` → enable **Messages**
-
-### 🔄 Why Rebuilds Break Permissions
-
-**This is the #1 gotcha with imsg-plus.**
-
-imsg-plus is **ad-hoc signed** (no Apple Developer certificate). macOS ties Automation permissions to the binary's code signature. When you rebuild:
-
-1. The code signature changes
-2. macOS invalidates the previous Automation authorization
-3. imsg-plus silently loses permission to control Messages.app
-4. Since it often runs headlessly (daemon, SSH, cron), macOS can't prompt you — it just denies silently
-
-**After every rebuild, you must re-grant Automation permission** by running a send command from a GUI Terminal session (not SSH).
-
-### Long-term Fix: Developer ID Signing
-
-To make permissions persist across rebuilds, sign the binary with an Apple Developer ID certificate:
-
-```bash
-# After building
-codesign --force --sign "Developer ID Application: Your Name (TEAMID)" /usr/local/bin/imsg-plus
-```
-
-With proper signing, macOS recognizes rebuilds as the "same" app and preserves permissions.
-
-**Note:** This requires an [Apple Developer Program](https://developer.apple.com/programs/) membership ($99/year).
-
 ## Advanced Features Setup (imsg-plus)
 
-The typing, read receipt, and tapback features require injecting a dylib into Messages.app to access Apple's private IMCore framework.
+Sending, typing, read receipt, tapback, edit, unsend, and location features require injecting a dylib into Messages.app to access Apple's private IMCore framework.
 
 ### Prerequisites
 
@@ -275,7 +230,6 @@ That's it. The `launch` command replaces the manual `DYLD_INSERT_LIBRARIES` danc
 **Security Warning**
 - These features use Apple's private IMCore framework
 - Requires SIP disabled, which reduces system security
-- The Automation permission (System Settings → Privacy & Security → Automation) is required for AppleScript-based sending. Without it, send commands hang silently — no error, just blocks forever waiting for an auth dialog.
 - Intended for personal use and testing only
 - Re-enable SIP when not needed: `csrutil enable` (from Recovery Mode)
 
