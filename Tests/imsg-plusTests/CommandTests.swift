@@ -169,12 +169,45 @@ func sendCommandRunsWithStubSender() async throws {
   try await SendCommand.run(
     values: values, runtime: runtime,
     bridgeAvailable: true,
-    bridgeSendMessage: { handle, text, _, attachment, _, _ in
+    bridgeSendMessage: { handle, text, _, attachment, _, _, _ in
       captured = (handle, text, attachment)
+      return [:]
     })
   #expect(captured?.handle == "+15551234567")
   #expect(captured?.text == "hi")
   #expect(captured?.attachment == nil)
+}
+
+@Test
+func sendCommandPassesExtensionPayload() async throws {
+  let payloadData = Data("payload".utf8)
+  let values = ParsedValues(
+    positional: [],
+    options: [
+      "to": ["+15551234567"],
+      "balloonBundleID": [
+        "com.apple.messages.MSMessageExtensionBalloonPlugin:TEAMID:com.example.MessagesExtension"
+      ],
+      "payloadDataBase64": [payloadData.base64EncodedString()],
+    ],
+    flags: []
+  )
+  let runtime = RuntimeOptions(parsedValues: values)
+  var captured: (handle: String, text: String, payload: MessageExtensionPayload?)?
+  try await SendCommand.run(
+    values: values, runtime: runtime,
+    bridgeAvailable: true,
+    bridgeSendMessage: { handle, text, _, _, _, _, payload in
+      captured = (handle, text, payload)
+      return ["guid": "msg-guid-extension"]
+    })
+
+  #expect(captured?.handle == "+15551234567")
+  #expect(captured?.text.isEmpty == true)
+  #expect(
+    captured?.payload?.balloonBundleID
+      == "com.apple.messages.MSMessageExtensionBalloonPlugin:TEAMID:com.example.MessagesExtension")
+  #expect(captured?.payload?.payloadData == payloadData)
 }
 
 @Test
@@ -190,8 +223,9 @@ func sendCommandResolvesChatID() async throws {
   try await SendCommand.run(
     values: values, runtime: runtime,
     bridgeAvailable: true,
-    bridgeSendMessage: { handle, text, _, _, _, _ in
+    bridgeSendMessage: { handle, text, _, _, _, _, _ in
       captured = (handle, text)
+      return [:]
     })
   #expect(captured?.handle == "iMessage;+;chat123")
   #expect(captured?.text == "hi")
@@ -281,7 +315,7 @@ func editCommandRequiresTextOrUnsend() async {
     try await EditCommand.run(values: values, runtime: runtime)
     #expect(Bool(false))
   } catch let error as IMsgError {
-    #expect(error.localizedDescription.contains("--text or --unsend"))
+    #expect(error.localizedDescription.contains("--text, extension payload, or --unsend"))
   } catch {
     #expect(Bool(false))
   }

@@ -21,6 +21,8 @@ An enhanced macOS Messages.app CLI that adds bridge-backed sending, typing indic
 - **JSON-RPC server** — Programmatic access via `imsg-plus rpc` over stdin/stdout
 - **Auto-typing** — Outgoing sends show typing indicator first (1.5–4s based on message length)
 - **Auto-read** — Incoming messages automatically get read receipts (~1s delay)
+- **Experimental extension payloads** — Send private Messages app-extension balloon payloads by
+  passing `balloon_bundle_id` plus archived `payload_data`
 - **Watchdog** — Auto-heal Messages.app sync issues by monitoring imagent logs
 - **Objective-C helper** — Bridges Swift to IMCore private framework
 
@@ -84,6 +86,11 @@ imsg-plus watch --chat-id 1 --attachments --debounce 250ms
 
 # send a picture
 imsg-plus send --to "+14155551212" --text "hi" --file ~/Desktop/pic.jpg
+
+# send an experimental app-extension balloon payload
+imsg-plus send --to "+14155551212" \
+  --balloon-bundle-id "com.apple.messages.MSMessageExtensionBalloonPlugin:TEAMID:com.example.MessagesExtension" \
+  --payload-file ./payload-data.bplist
 
 # show typing indicator
 imsg-plus typing --handle "+14155551212" --state on
@@ -160,6 +167,12 @@ imsg-plus rpc --no-auto-read --no-auto-typing
 {"jsonrpc":"2.0","method":"tapback.send","params":{"handle":"+14155551212","guid":"ABC-123","type":"love"},"id":3}
 ```
 
+Experimental extension payload send:
+
+```json
+{"jsonrpc":"2.0","method":"send","params":{"to":"+14155551212","balloon_bundle_id":"com.apple.messages.MSMessageExtensionBalloonPlugin:TEAMID:com.example.MessagesExtension","payload_file":"./payload-data.bplist"},"id":4}
+```
+
 ### `send` chat routing
 
 The `send` method supports multiple ways to target a chat:
@@ -170,8 +183,15 @@ The `send` method supports multiple ways to target a chat:
 | `chat_id` | Numeric chat ID from `chats.list` |
 | `chat_identifier` | Chat identifier string (e.g., `+14155551212`) |
 | `chat_guid` | Full chat GUID (e.g., `iMessage;-;+14155551212`) |
+| `balloon_bundle_id` | Experimental private app-extension balloon identifier |
+| `payload_data_base64` / `payload_file` | Experimental archived app-extension payload data |
 
 Use **either** `to` **or** one of the `chat_*` parameters — not both. The `chat_*` params are useful for replying to existing chats (especially group chats) where you already know the chat ID from a `chats.list` or `watch.subscribe` response.
+
+Extension payload sending uses private Messages/IMCore behavior and may break
+across macOS/iOS updates. Provide exactly one of `payload_data_base64` or
+`payload_file`; the payload should be the binary data normally stored in
+Messages `message.payload_data`.
 
 ## Attachment notes
 `--attachments` prints per-attachment lines with name, MIME, missing flag, and resolved path (tilde expanded). Only metadata is shown; files aren't copied.

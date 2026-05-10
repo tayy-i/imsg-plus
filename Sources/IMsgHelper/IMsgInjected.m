@@ -1297,11 +1297,40 @@ static NSDictionary* handleRemoveParticipant(NSInteger requestId, NSDictionary *
     }
 }
 
-static id createIMMessage(Class IMMessageClass, NSAttributedString *text, NSArray *ftGUIDs, NSString *effect, NSString *thread) {
+static id createIMMessage(
+    Class IMMessageClass,
+    NSAttributedString *text,
+    NSArray *ftGUIDs,
+    NSString *effect,
+    NSString *thread,
+    NSString *balloonBundleID,
+    NSData *payloadData
+) {
     NSString *guid = [[NSUUID UUID] UUIDString];
     id msg = nil;
 
-    if (effect || thread) {
+    if ((effect || balloonBundleID || payloadData) && !thread) {
+        SEL factorySel = @selector(instantMessageWithText:messageSubject:fileTransferGUIDs:flags:balloonBundleID:payloadData:expressiveSendStyleID:);
+        if ([IMMessageClass respondsToSelector:factorySel]) {
+            typedef id (*FactoryType)(id, SEL, id, id, id, unsigned long long, id, id, id);
+            FactoryType factoryFunc = (FactoryType)objc_msgSend;
+            msg = factoryFunc(IMMessageClass, factorySel,
+                text, nil, ftGUIDs, (unsigned long long)0x100005,
+                balloonBundleID, payloadData, effect);
+            SEL updateGuidSel = @selector(_updateGUID:);
+            if (msg && [msg respondsToSelector:updateGuidSel]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(msg, updateGuidSel, guid);
+            }
+            NSLog(
+                @"[imsg-plus] createIMMessage: factory effect=%@ balloon=%@ payload_len=%lu",
+                effect ?: @"nil",
+                balloonBundleID ?: @"nil",
+                (unsigned long)(payloadData ? payloadData.length : 0)
+            );
+        }
+    }
+
+    if (!msg && (effect || thread || balloonBundleID || payloadData)) {
         SEL initSel = @selector(initWithSender:time:text:messageSubject:fileTransferGUIDs:flags:error:guid:subject:balloonBundleID:payloadData:expressiveSendStyleID:threadIdentifier:);
         if ([IMMessageClass instancesRespondToSelector:initSel]) {
             typedef id (*InitType)(id, SEL, id, id, id, id, id, unsigned long long, id, id, id, id, id, id, id);
@@ -1310,9 +1339,19 @@ static id createIMMessage(Class IMMessageClass, NSAttributedString *text, NSArra
             msg = initFunc(msg, initSel,
                 nil, [NSDate date], text, nil, ftGUIDs,
                 (unsigned long long)0x100005, nil, guid, nil,
-                nil, nil, effect, thread);
-            NSLog(@"[imsg-plus] createIMMessage: long init effect=%@ thread=%@", effect ?: @"nil", thread ?: @"nil");
+                balloonBundleID, payloadData, effect, thread);
+            NSLog(
+                @"[imsg-plus] createIMMessage: long init effect=%@ thread=%@ balloon=%@ payload_len=%lu",
+                effect ?: @"nil",
+                thread ?: @"nil",
+                balloonBundleID ?: @"nil",
+                (unsigned long)(payloadData ? payloadData.length : 0)
+            );
         }
+    }
+
+    if (!msg && (balloonBundleID || payloadData)) {
+        return nil;
     }
 
     if (!msg && thread) {
@@ -1339,6 +1378,87 @@ static id createIMMessage(Class IMMessageClass, NSAttributedString *text, NSArra
         }
     }
     return msg;
+}
+
+static BOOL messageHasExtensionPayload(id msg, NSString *balloonBundleID, NSData *payloadData) {
+    if (!balloonBundleID && !payloadData) {
+        return YES;
+    }
+    NSString *attachedBalloonBundleID = nil;
+    NSData *attachedPayloadData = nil;
+    @try {
+        if (balloonBundleID && [msg respondsToSelector:@selector(setBalloonBundleID:)]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(msg, @selector(setBalloonBundleID:), balloonBundleID);
+        }
+        if (payloadData && [msg respondsToSelector:@selector(setPayloadData:)]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(msg, @selector(setPayloadData:), payloadData);
+        }
+        if ([msg respondsToSelector:@selector(balloonBundleID)]) {
+            attachedBalloonBundleID = ((id (*)(id, SEL))objc_msgSend)(msg, @selector(balloonBundleID));
+        }
+        if ([msg respondsToSelector:@selector(payloadData)]) {
+            attachedPayloadData = ((id (*)(id, SEL))objc_msgSend)(msg, @selector(payloadData));
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[imsg-plus] extension payload verification failed: %@", exception.reason);
+        return NO;
+    }
+    BOOL balloonMatches = (!balloonBundleID || [attachedBalloonBundleID isEqualToString:balloonBundleID]);
+    BOOL payloadMatches = (!payloadData || (attachedPayloadData && attachedPayloadData.length == payloadData.length));
+    NSLog(
+        @"[imsg-plus] extension payload attached balloon=%@ payload_len=%lu",
+        attachedBalloonBundleID ?: @"nil",
+        (unsigned long)(attachedPayloadData ? attachedPayloadData.length : 0)
+    );
+    return balloonMatches && payloadMatches;
+}
+
+static NSString* messageGUID(id msg) {
+    if (!msg) return nil;
+    @try {
+        if ([msg respondsToSelector:@selector(guid)]) {
+            return ((id (*)(id, SEL))objc_msgSend)(msg, @selector(guid));
+        }
+        id guid = [msg valueForKey:@"guid"];
+        return [guid isKindOfClass:[NSString class]] ? guid : nil;
+    } @catch (NSException *exception) {
+        NSLog(@"[imsg-plus] Could not read message guid: %@", exception.reason);
+        return nil;
+    }
+}
+
+static void applyExtensionPayloadToObject(id object, NSString *balloonBundleID, NSData *payloadData) {
+    if (!object || (!balloonBundleID && !payloadData)) {
+        return;
+    }
+    @try {
+        if (balloonBundleID) {
+            if ([object respondsToSelector:@selector(setBalloonBundleID:)]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(object, @selector(setBalloonBundleID:), balloonBundleID);
+            } else {
+                @try { [object setValue:balloonBundleID forKey:@"balloonBundleID"]; } @catch (NSException *e) { }
+                @try { [object setValue:balloonBundleID forKey:@"_balloonBundleID"]; } @catch (NSException *e) { }
+            }
+        }
+        if (payloadData) {
+            if ([object respondsToSelector:@selector(setPayloadData:)]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(object, @selector(setPayloadData:), payloadData);
+            } else {
+                @try { [object setValue:payloadData forKey:@"payloadData"]; } @catch (NSException *e) { }
+                @try { [object setValue:payloadData forKey:@"_payloadData"]; } @catch (NSException *e) { }
+            }
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[imsg-plus] Could not apply extension payload to %@: %@", object, exception.reason);
+    }
+}
+
+static NSAttributedString* extensionReplacementText(void) {
+    unichar replacementChar = 0xFFFC;
+    NSString *replacementStr = [NSString stringWithCharacters:&replacementChar length:1];
+    return [[NSAttributedString alloc] initWithString:replacementStr attributes:@{
+        @"__kIMMessagePartAttributeName": @0,
+    }];
 }
 
 static void sendViaIMChat(id msg, id chat) {
@@ -1386,12 +1506,27 @@ static NSDictionary* handleSendRichMessage(NSInteger requestId, NSDictionary *pa
     NSString *filePath = params[@"file"];
     NSString *replyToGuid = params[@"reply_to_guid"];
     NSString *effectId = params[@"effect_id"];
+    NSString *balloonBundleID = params[@"balloon_bundle_id"];
+    NSString *payloadDataBase64 = params[@"payload_data"];
 
     if (!handle) {
         return errorResponse(requestId, @"Missing required parameter: handle");
     }
-    if (!attributedTextBase64 && !plainText && !filePath) {
-        return errorResponse(requestId, @"Missing required parameter: attributed_text, text, or file");
+    BOOL hasBalloonBundleID = (balloonBundleID && balloonBundleID.length > 0);
+    BOOL hasPayloadDataParam = (payloadDataBase64 && payloadDataBase64.length > 0);
+    if (hasBalloonBundleID != hasPayloadDataParam) {
+        return errorResponse(requestId, @"balloon_bundle_id and payload_data must be provided together");
+    }
+    NSData *payloadData = nil;
+    if (hasPayloadDataParam) {
+        payloadData = [[NSData alloc] initWithBase64EncodedString:payloadDataBase64 options:0];
+        if (!payloadData || payloadData.length == 0) {
+            return errorResponse(requestId, @"payload_data is not valid base64 or is empty");
+        }
+    }
+    BOOL hasExtensionPayload = (hasBalloonBundleID && payloadData && payloadData.length > 0);
+    if (!attributedTextBase64 && !plainText && !filePath && !hasExtensionPayload) {
+        return errorResponse(requestId, @"Missing required parameter: attributed_text, text, file, or extension payload");
     }
 
     id chat = findChat(handle);
@@ -1425,6 +1560,9 @@ static NSDictionary* handleSendRichMessage(NSInteger requestId, NSDictionary *pa
         }
         if (!messageText && plainText && plainText.length > 0) {
             messageText = [[NSAttributedString alloc] initWithString:plainText];
+        }
+        if (!messageText && hasExtensionPayload) {
+            messageText = extensionReplacementText();
         }
 
         BOOL hasFile = (filePath && filePath.length > 0);
@@ -1470,28 +1608,71 @@ static NSDictionary* handleSendRichMessage(NSInteger requestId, NSDictionary *pa
                 finalText = combined;
             }
 
-            id msg = createIMMessage(IMMessageClass, finalText, ftGUIDs, effectId, threadId);
+            id msg = createIMMessage(
+                IMMessageClass, finalText, ftGUIDs, effectId, threadId, balloonBundleID, payloadData);
             if (!msg) return errorResponse(requestId, @"Failed to create IMMessage");
+            if (hasExtensionPayload && !messageHasExtensionPayload(msg, balloonBundleID, payloadData)) {
+                return errorResponse(requestId, @"Failed to attach extension payload to IMMessage");
+            }
+
+            NSString *sentGUID = messageGUID(msg);
 
             // Always use CKConversation for attachment sends (matches native UI behavior)
             sendViaCKConversation(msg, chat, replyToGuid);
+            if (sentGUID) {
+                NSMutableDictionary *result = [@{
+                    @"handle": handle,
+                    @"sent": @YES,
+                    @"guid": sentGUID
+                } mutableCopy];
+                if (hasExtensionPayload) {
+                    result[@"extension_payload"] = @YES;
+                    result[@"balloon_bundle_id"] = balloonBundleID;
+                    result[@"payload_length"] = @(payloadData.length);
+                }
+                return successResponse(requestId, result);
+            }
 
         } else {
             // --- TEXT ONLY (with optional effect/reply) ---
             if (!messageText) return errorResponse(requestId, @"Could not construct message text");
-            id msg = createIMMessage(IMMessageClass, messageText, nil, effectId, threadId);
+            id msg = createIMMessage(
+                IMMessageClass, messageText, nil, effectId, threadId, balloonBundleID, payloadData);
             if (!msg) return errorResponse(requestId, @"Failed to create IMMessage");
-            if (replyToGuid) {
+            if (hasExtensionPayload && !messageHasExtensionPayload(msg, balloonBundleID, payloadData)) {
+                return errorResponse(requestId, @"Failed to attach extension payload to IMMessage");
+            }
+            NSString *sentGUID = messageGUID(msg);
+            if (replyToGuid || hasExtensionPayload) {
                 sendViaCKConversation(msg, chat, replyToGuid);
             } else {
                 sendViaIMChat(msg, chat);
             }
+            if (sentGUID) {
+                NSMutableDictionary *result = [@{
+                    @"handle": handle,
+                    @"sent": @YES,
+                    @"guid": sentGUID
+                } mutableCopy];
+                if (hasExtensionPayload) {
+                    result[@"extension_payload"] = @YES;
+                    result[@"balloon_bundle_id"] = balloonBundleID;
+                    result[@"payload_length"] = @(payloadData.length);
+                }
+                return successResponse(requestId, result);
+            }
         }
 
-        return successResponse(requestId, @{
+        NSMutableDictionary *result = [@{
             @"handle": handle,
             @"sent": @YES
-        });
+        } mutableCopy];
+        if (hasExtensionPayload) {
+            result[@"extension_payload"] = @YES;
+            result[@"balloon_bundle_id"] = balloonBundleID;
+            result[@"payload_length"] = @(payloadData.length);
+        }
+        return successResponse(requestId, result);
     } @catch (NSException *exception) {
         return errorResponse(requestId, [NSString stringWithFormat:@"Failed to send message: %@", exception.reason]);
     }
@@ -1504,6 +1685,8 @@ static NSDictionary* handleEditMessage(NSInteger requestId, NSDictionary *params
     NSString *messageGUID = params[@"guid"];
     NSString *newText = params[@"text"];
     NSString *attributedTextBase64 = params[@"attributed_text"];
+    NSString *balloonBundleID = params[@"balloon_bundle_id"];
+    NSString *payloadDataBase64 = params[@"payload_data"];
 
     if (!handle) {
         return errorResponse(requestId, @"Missing required parameter: handle");
@@ -1511,8 +1694,21 @@ static NSDictionary* handleEditMessage(NSInteger requestId, NSDictionary *params
     if (!messageGUID) {
         return errorResponse(requestId, @"Missing required parameter: guid");
     }
-    if (!newText && !attributedTextBase64) {
-        return errorResponse(requestId, @"Missing required parameter: text or attributed_text");
+    BOOL hasBalloonBundleID = (balloonBundleID && balloonBundleID.length > 0);
+    BOOL hasPayloadDataParam = (payloadDataBase64 && payloadDataBase64.length > 0);
+    if (hasBalloonBundleID != hasPayloadDataParam) {
+        return errorResponse(requestId, @"balloon_bundle_id and payload_data must be provided together");
+    }
+    NSData *payloadData = nil;
+    if (hasPayloadDataParam) {
+        payloadData = [[NSData alloc] initWithBase64EncodedString:payloadDataBase64 options:0];
+        if (!payloadData || payloadData.length == 0) {
+            return errorResponse(requestId, @"payload_data is not valid base64 or is empty");
+        }
+    }
+    BOOL hasExtensionPayload = (hasBalloonBundleID && payloadData && payloadData.length > 0);
+    if (!newText && !attributedTextBase64 && !hasExtensionPayload) {
+        return errorResponse(requestId, @"Missing required parameter: text, attributed_text, or extension payload");
     }
 
     id chat = findChat(handle);
@@ -1579,9 +1775,20 @@ static NSDictionary* handleEditMessage(NSInteger requestId, NSDictionary *params
                 if (!newAttrText && newText) {
                     newAttrText = [[NSAttributedString alloc] initWithString:newText];
                 }
+                if (!newAttrText && hasExtensionPayload) {
+                    newAttrText = extensionReplacementText();
+                }
                 if (!newAttrText) {
                     writeResponseToFile(errorResponse(requestId, @"Could not construct edit text"));
                     return;
+                }
+                if (hasExtensionPayload) {
+                    NSMutableAttributedString *mutable = [[NSMutableAttributedString alloc]
+                        initWithAttributedString:newAttrText];
+                    [mutable addAttribute:@"__kIMMessagePartAttributeName"
+                        value:@0 range:NSMakeRange(0, mutable.length)];
+                    newAttrText = mutable;
+                    applyExtensionPayloadToObject(message, balloonBundleID, payloadData);
                 }
 
                 // Get the IMMessageItem from the IMMessage
@@ -1596,6 +1803,9 @@ static NSDictionary* handleEditMessage(NSInteger requestId, NSDictionary *params
                     return;
                 }
                 NSLog(@"[imsg-plus] Got IMMessageItem: %@ (class: %@)", messageItem, [messageItem class]);
+                if (hasExtensionPayload) {
+                    applyExtensionPayloadToObject(messageItem, balloonBundleID, payloadData);
+                }
 
                 // Build backward-compat plain text
                 NSAttributedString *backwardText = [[NSAttributedString alloc] initWithString:newAttrText.string];
@@ -1645,11 +1855,17 @@ static NSDictionary* handleEditMessage(NSInteger requestId, NSDictionary *params
                 }
 
                 NSLog(@"[imsg-plus] ✅ Edited message %@ via %@", messageGUID, methodUsed);
-                writeResponseToFile(successResponse(requestId, @{
+                NSMutableDictionary *result = [@{
                     @"handle": handle,
                     @"guid": messageGUID,
                     @"method": methodUsed
-                }));
+                } mutableCopy];
+                if (hasExtensionPayload) {
+                    result[@"extension_payload"] = @YES;
+                    result[@"balloon_bundle_id"] = balloonBundleID;
+                    result[@"payload_length"] = @(payloadData.length);
+                }
+                writeResponseToFile(successResponse(requestId, result));
             } @catch (NSException *exception) {
                 NSLog(@"[imsg-plus] ❌ Exception in edit completion: %@", exception.reason);
                 writeResponseToFile(errorResponse(requestId,

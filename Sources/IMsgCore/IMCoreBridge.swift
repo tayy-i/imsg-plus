@@ -215,6 +215,21 @@ public enum MessageEffect: String, Sendable, Equatable, CaseIterable {
   }
 }
 
+/// Experimental app-extension balloon payload for Messages.app.
+///
+/// `balloonBundleID` is the private Messages balloon identifier stored in
+/// `message.balloon_bundle_id`, and `payloadData` is the archived payload stored
+/// in `message.payload_data`.
+public struct MessageExtensionPayload: Equatable, Sendable {
+  public let balloonBundleID: String
+  public let payloadData: Data
+
+  public init(balloonBundleID: String, payloadData: Data) {
+    self.balloonBundleID = balloonBundleID
+    self.payloadData = payloadData
+  }
+}
+
 public enum IMCoreBridgeError: Error, CustomStringConvertible {
   case frameworkNotAvailable
   case dylibNotFound
@@ -391,7 +406,8 @@ public final class IMCoreBridge: @unchecked Sendable {
   }
 
   /// Get FindMy friend locations via Messages.app with optional raw debug payloads.
-  public func getLocationsResponse(handle: String? = nil, includeDebugRaw: Bool = false) async throws
+  public func getLocationsResponse(handle: String? = nil, includeDebugRaw: Bool = false)
+    async throws
     -> [[String: Any]]
   {
     var params: [String: Any] = [:]
@@ -470,10 +486,12 @@ public final class IMCoreBridge: @unchecked Sendable {
   }
 
   /// Send a rich text message (with attributed text and optional effect)
+  @discardableResult
   public func sendRichMessage(
     handle: String, attributedText: Data, attachment: String? = nil,
-    effect: MessageEffect? = nil, replyToGUID: String? = nil
-  ) async throws {
+    effect: MessageEffect? = nil, replyToGUID: String? = nil,
+    extensionPayload: MessageExtensionPayload? = nil
+  ) async throws -> [String: Any] {
     var params: [String: Any] = [
       "handle": handle,
       "attributed_text": attributedText.base64EncodedString(),
@@ -487,14 +505,19 @@ public final class IMCoreBridge: @unchecked Sendable {
     if let replyToGUID {
       params["reply_to_guid"] = replyToGUID
     }
-    _ = try await sendCommand(action: "send_message", params: params)
+    if let extensionPayload {
+      params["balloon_bundle_id"] = extensionPayload.balloonBundleID
+      params["payload_data"] = extensionPayload.payloadData.base64EncodedString()
+    }
+    return try await sendCommand(action: "send_message", params: params)
   }
 
   /// Send a plain text message with an effect via IMCore bridge
   @discardableResult
   public func sendMessage(
     handle: String, text: String, attachment: String? = nil,
-    effect: MessageEffect? = nil, replyToGUID: String? = nil
+    effect: MessageEffect? = nil, replyToGUID: String? = nil,
+    extensionPayload: MessageExtensionPayload? = nil
   ) async throws -> [String: Any] {
     var params: [String: Any] = ["handle": handle, "text": text]
     if let attachment {
@@ -506,23 +529,35 @@ public final class IMCoreBridge: @unchecked Sendable {
     if let replyToGUID {
       params["reply_to_guid"] = replyToGUID
     }
+    if let extensionPayload {
+      params["balloon_bundle_id"] = extensionPayload.balloonBundleID
+      params["payload_data"] = extensionPayload.payloadData.base64EncodedString()
+    }
     return try await sendCommand(action: "send_message", params: params)
   }
 
   /// Edit a previously sent message
+  @discardableResult
   public func editMessage(
     handle: String, messageGUID: String, newText: String,
-    attributedText: Data? = nil
-  ) async throws {
+    attributedText: Data? = nil,
+    extensionPayload: MessageExtensionPayload? = nil
+  ) async throws -> [String: Any] {
     var params: [String: Any] = [
       "handle": handle,
       "guid": messageGUID,
-      "text": newText,
     ]
+    if !newText.isEmpty {
+      params["text"] = newText
+    }
     if let attributedText {
       params["attributed_text"] = attributedText.base64EncodedString()
     }
-    _ = try await sendCommand(action: "edit_message", params: params)
+    if let extensionPayload {
+      params["balloon_bundle_id"] = extensionPayload.balloonBundleID
+      params["payload_data"] = extensionPayload.payloadData.base64EncodedString()
+    }
+    return try await sendCommand(action: "edit_message", params: params)
   }
 
   /// Unsend (retract) a previously sent message

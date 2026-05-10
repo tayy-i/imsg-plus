@@ -2,6 +2,49 @@ import Foundation
 import SQLite
 
 extension MessageStore {
+  public func recentOutgoingExtensionMessageGUID(
+    chatID: Int64?,
+    balloonBundleID: String,
+    payloadData: Data,
+    since: Date
+  ) throws -> String? {
+    guard !balloonBundleID.isEmpty, !payloadData.isEmpty else {
+      return nil
+    }
+
+    var sql = """
+      SELECT m.guid
+      FROM message m
+      JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+      WHERE m.is_from_me = 1
+        AND m.balloon_bundle_id = ?
+        AND m.payload_data = ?
+        AND m.date >= ?
+      """
+    var bindings: [Binding?] = [
+      balloonBundleID,
+      Blob(bytes: [UInt8](payloadData)),
+      MessageStore.appleEpoch(since),
+    ]
+    if let chatID {
+      sql += " AND cmj.chat_id = ?"
+      bindings.append(chatID)
+    }
+    sql += " ORDER BY m.ROWID DESC LIMIT 1"
+
+    return try withConnection { db in
+      do {
+        for row in try db.prepare(sql, bindings) {
+          let guid = stringValue(row[0])
+          return guid.isEmpty ? nil : guid
+        }
+      } catch {
+        return nil
+      }
+      return nil
+    }
+  }
+
   public func messages(chatID: Int64, limit: Int) throws -> [Message] {
     return try messages(chatID: chatID, limit: limit, filter: nil)
   }

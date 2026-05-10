@@ -19,6 +19,15 @@ enum SendCommand {
           .make(label: "text", names: [.long("text")], help: "message body"),
           .make(label: "file", names: [.long("file")], help: "path to attachment"),
           .make(
+            label: "balloonBundleID", names: [.long("balloon-bundle-id")],
+            help: "experimental Messages app-extension balloon bundle id"),
+          .make(
+            label: "payloadDataBase64", names: [.long("payload-data-base64")],
+            help: "experimental base64-encoded Messages app-extension payload_data blob"),
+          .make(
+            label: "payloadFile", names: [.long("payload-file")],
+            help: "experimental raw Messages app-extension payload_data file"),
+          .make(
             label: "effect", names: [.long("effect")],
             help:
               "Send effect: gentle, loud, slam, invisibleink, confetti, balloons, fireworks, heart, lasers, echo, spotlight, sparkles, shootingstar"
@@ -50,8 +59,8 @@ enum SendCommand {
     bridgeAvailable: Bool = IMCoreBridge.shared.isAvailable,
     bridgeSendMessage:
       @escaping (
-        String, String, String?, String?, MessageEffect?, String?
-      ) async throws -> Void = SendCommand.defaultBridgeSendMessage,
+        String, String, String?, String?, MessageEffect?, String?, MessageExtensionPayload?
+      ) async throws -> [String: Any] = SendCommand.defaultBridgeSendMessage,
     storeFactory: @escaping (String) throws -> MessageStore = { try MessageStore(path: $0) }
   ) async throws {
     let dbPath = values.option("db") ?? MessageStore.defaultPath
@@ -69,8 +78,9 @@ enum SendCommand {
 
     let text = values.option("text") ?? ""
     let file = values.option("file") ?? ""
-    if text.isEmpty && file.isEmpty {
-      throw ParsedValuesError.missingOption("text or file")
+    let extensionPayload = try parseExtensionPayload(values: values)
+    if text.isEmpty && file.isEmpty && extensionPayload == nil {
+      throw ParsedValuesError.missingOption("text, file, or payload-data-base64/payload-file")
     }
     var resolvedChatIdentifier = chatIdentifier
     var resolvedChatGUID = chatGUID
@@ -111,13 +121,18 @@ enum SendCommand {
       throw IMsgError.invalidChatTarget("Missing send handle")
     }
     guard bridgeAvailable else {
-      throw IMsgError.invalidArgument("IMCoreBridge not available. Run `imsg-plus launch` before sending.")
+      throw IMsgError.invalidArgument(
+        "IMCoreBridge not available. Run `imsg-plus launch` before sending.")
     }
 
     let markdownText = useMarkdown ? text : nil
     let sendText = useMarkdown ? "" : text
+    let guid: String?
     do {
-      try await bridgeSendMessage(handle, sendText, markdownText, attachment, effect, replyGUID)
+      let bridgeResult = try await bridgeSendMessage(
+        handle, sendText, markdownText, attachment, effect, replyGUID, extensionPayload)
+      guid = bridgeResult["guid"] as? String
+        ?? bridgeResult["message_guid"] as? String
     } catch {
       throw IMsgError.invalidArgument(describeBridgeSendError(error))
     }
@@ -126,11 +141,15 @@ enum SendCommand {
       var result: [String: String] = ["status": "sent"]
       if useMarkdown { result["markdown"] = "true" }
       if let effect { result["effect"] = effect.displayName }
+      if extensionPayload != nil { result["extension_payload"] = "true" }
+      if let guid, !guid.isEmpty { result["guid"] = guid }
       try JSONLines.print(result)
     } else {
       var parts = ["sent"]
       if useMarkdown { parts.append("with formatting") }
       if let effect { parts.append("with \(effect.displayName) effect") }
+      if extensionPayload != nil { parts.append("with extension payload") }
+      if let guid, !guid.isEmpty { parts.append("guid \(guid)") }
       Swift.print(parts.joined(separator: " "))
     }
   }
@@ -141,29 +160,73 @@ enum SendCommand {
     markdownText: String?,
     attachment: String?,
     effect: MessageEffect?,
-    replyToGUID: String?
-  ) async throws {
+    replyToGUID: String?,
+    extensionPayload: MessageExtensionPayload?
+  ) async throws -> [String: Any] {
     if let markdownText, !markdownText.isEmpty,
       let attrData = MarkdownComposer.compose(markdownText)
     {
-      try await IMCoreBridge.shared.sendRichMessage(
+      return try await IMCoreBridge.shared.sendRichMessage(
         handle: handle,
         attributedText: attrData,
         attachment: attachment,
         effect: effect,
-        replyToGUID: replyToGUID
+        replyToGUID: replyToGUID,
+        extensionPayload: extensionPayload
       )
-      return
     }
 
     let sendText = text.isEmpty ? (markdownText ?? "") : text
-    try await IMCoreBridge.shared.sendMessage(
+    return try await IMCoreBridge.shared.sendMessage(
       handle: handle,
       text: sendText,
       attachment: attachment,
       effect: effect,
-      replyToGUID: replyToGUID
+      replyToGUID: replyToGUID,
+      extensionPayload: extensionPayload
     )
+  }
+
+  private static func parseExtensionPayload(values: ParsedValues) throws -> MessageExtensionPayload?
+  {
+    let balloonBundleID = values.option("balloonBundleID") ?? ""
+    let payloadDataBase64 = values.option("payloadDataBase64") ?? ""
+    let payloadFile = values.option("payloadFile") ?? ""
+
+    if payloadDataBase64.isEmpty && payloadFile.isEmpty {
+      if !balloonBundleID.isEmpty {
+        throw IMsgError.invalidArgument(
+          "--balloon-bundle-id requires --payload-data-base64 or --payload-file")
+      }
+      return nil
+    }
+    if payloadDataBase64.isEmpty == payloadFile.isEmpty {
+      throw IMsgError.invalidArgument("Use exactly one of --payload-data-base64 or --payload-file")
+    }
+    guard !balloonBundleID.isEmpty else {
+      throw IMsgError.invalidArgument("--balloon-bundle-id is required with extension payload data")
+    }
+
+    let payloadData: Data
+    if !payloadDataBase64.isEmpty {
+      guard let decoded = Data(base64Encoded: payloadDataBase64) else {
+        throw IMsgError.invalidArgument("--payload-data-base64 is not valid base64")
+      }
+      payloadData = decoded
+    } else {
+      do {
+        payloadData = try Data(contentsOf: URL(fileURLWithPath: payloadFile))
+      } catch {
+        throw IMsgError.invalidArgument(
+          "Could not read --payload-file: \(error.localizedDescription)")
+      }
+    }
+
+    guard !payloadData.isEmpty else {
+      throw IMsgError.invalidArgument("extension payload data is empty")
+    }
+
+    return MessageExtensionPayload(balloonBundleID: balloonBundleID, payloadData: payloadData)
   }
 
   private static func describeBridgeSendError(_ error: Error) -> String {

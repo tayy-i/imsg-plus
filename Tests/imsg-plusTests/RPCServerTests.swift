@@ -163,7 +163,10 @@ func rpcSendResolvesChatID() async throws {
     store: store,
     verbose: false,
     output: output,
-    bridgeSendMessage: { handle, text, _, _, _, _ in captured = (handle, text) },
+    bridgeSendMessage: { handle, text, _, _, _, _, _ in
+      captured = (handle, text)
+      return ["guid": "msg-guid-1"]
+    },
     bridgeAvailable: true
   )
 
@@ -176,6 +179,40 @@ func rpcSendResolvesChatID() async throws {
 }
 
 @Test
+func rpcSendPassesExtensionPayload() async throws {
+  let store = try RPCTestDatabase.makeStore()
+  let output = TestRPCOutput()
+  let payloadData = Data("payload".utf8)
+  var captured: (handle: String, payload: MessageExtensionPayload?)?
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    autoTyping: false,
+    output: output,
+    bridgeSendMessage: { handle, _, _, _, _, _, payload in
+      captured = (handle, payload)
+      return ["guid": "msg-guid-extension"]
+    },
+    bridgeAvailable: true
+  )
+
+  let line =
+    #"{"jsonrpc":"2.0","id":"3a","method":"send","params":{"chat_id":1,"balloon_bundle_id":"com.apple.messages.MSMessageExtensionBalloonPlugin:TEAMID:com.example.MessagesExtension","payload_data_base64":""#
+    + payloadData.base64EncodedString()
+    + #""}}"#
+  await server.handleLineForTesting(line)
+
+  #expect(captured?.handle == "iMessage;+;chat123")
+  #expect(
+    captured?.payload?.balloonBundleID
+      == "com.apple.messages.MSMessageExtensionBalloonPlugin:TEAMID:com.example.MessagesExtension")
+  #expect(captured?.payload?.payloadData == payloadData)
+  let result = output.responses.first?["result"] as? [String: Any]
+  #expect(result?["extension_payload"] as? Bool == true)
+  #expect(result?["guid"] as? String == "msg-guid-extension")
+}
+
+@Test
 func rpcSendReportsBridgeTimeout() async throws {
   let store = try RPCTestDatabase.makeStore()
   let output = TestRPCOutput()
@@ -184,7 +221,7 @@ func rpcSendReportsBridgeTimeout() async throws {
     verbose: false,
     autoTyping: false,
     output: output,
-    bridgeSendMessage: { _, _, _, _, _, _ in
+    bridgeSendMessage: { _, _, _, _, _, _, _ in
       throw IMCoreBridgeError.connectionFailed("IPC error: Timeout waiting for response")
     },
     bridgeAvailable: true
@@ -208,7 +245,7 @@ func rpcSendRejectsBridgeChatNotFound() async throws {
     verbose: false,
     autoTyping: false,
     output: output,
-    bridgeSendMessage: { _, _, _, _, _, _ in
+    bridgeSendMessage: { _, _, _, _, _, _, _ in
       throw IMCoreBridgeError.chatNotFound("iMessage;+;chat123")
     },
     bridgeAvailable: true

@@ -21,6 +21,15 @@ enum EditCommand {
             help: "Phone number, email, or chat identifier"),
           .make(label: "guid", names: [.long("guid")], help: "Message GUID to edit"),
           .make(label: "text", names: [.long("text")], help: "New message text"),
+          .make(
+            label: "balloonBundleID", names: [.long("balloon-bundle-id")],
+            help: "experimental replacement Messages app-extension balloon bundle id"),
+          .make(
+            label: "payloadDataBase64", names: [.long("payload-data-base64")],
+            help: "experimental replacement Messages app-extension payload_data blob"),
+          .make(
+            label: "payloadFile", names: [.long("payload-file")],
+            help: "experimental replacement Messages app-extension payload_data file"),
         ],
         flags: [
           .make(
@@ -36,6 +45,7 @@ enum EditCommand {
       "imsg edit --handle +14155551234 --guid ABC123-456 --text \"corrected text\"",
       "imsg edit --handle +14155551234 --guid ABC123-456 --unsend",
       "imsg edit --handle +14155551234 --guid ABC123-456 --text \"**bold**\" --markdown",
+      "imsg edit --handle chat123 --guid ABC123-456 --balloon-bundle-id com.apple.messages.MSMessageExtensionBalloonPlugin:TEAMID:com.example.MessagesExtension --payload-file payload.bplist",
     ]
   ) { values, runtime in
     try await run(values: values, runtime: runtime)
@@ -52,12 +62,13 @@ enum EditCommand {
     let unsend = values.flag("unsend")
     let text = values.option("text") ?? ""
     let useMarkdown = values.flag("markdown")
+    let extensionPayload = try parseExtensionPayload(values: values)
 
-    if unsend && !text.isEmpty {
-      throw IMsgError.invalidArgument("--unsend and --text are mutually exclusive")
+    if unsend && (!text.isEmpty || extensionPayload != nil) {
+      throw IMsgError.invalidArgument("--unsend and edit content are mutually exclusive")
     }
-    if !unsend && text.isEmpty {
-      throw IMsgError.invalidArgument("--text or --unsend is required")
+    if !unsend && text.isEmpty && extensionPayload == nil {
+      throw IMsgError.invalidArgument("--text, extension payload, or --unsend is required")
     }
 
     let bridge = IMCoreBridge.shared
@@ -89,8 +100,12 @@ enum EditCommand {
         if useMarkdown {
           attrData = MarkdownComposer.compose(text)
         }
-        try await bridge.editMessage(
-          handle: handle, messageGUID: guid, newText: text, attributedText: attrData)
+        let bridgeResult = try await bridge.editMessage(
+          handle: handle,
+          messageGUID: guid,
+          newText: text,
+          attributedText: attrData,
+          extensionPayload: extensionPayload)
 
         if runtime.jsonOutput {
           var output: [String: Any] = [
@@ -100,6 +115,8 @@ enum EditCommand {
             "action": "edited",
           ]
           if useMarkdown { output["markdown"] = true }
+          if extensionPayload != nil { output["extension_payload"] = true }
+          if let method = bridgeResult["method"] as? String { output["method"] = method }
           print(JSONSerialization.string(from: output))
         } else {
           print("Edited message \(guid)")
@@ -119,5 +136,47 @@ enum EditCommand {
       }
       throw error
     }
+  }
+
+  private static func parseExtensionPayload(values: ParsedValues) throws -> MessageExtensionPayload?
+  {
+    let balloonBundleID = values.option("balloonBundleID") ?? ""
+    let payloadDataBase64 = values.option("payloadDataBase64") ?? ""
+    let payloadFile = values.option("payloadFile") ?? ""
+
+    if payloadDataBase64.isEmpty && payloadFile.isEmpty {
+      if !balloonBundleID.isEmpty {
+        throw IMsgError.invalidArgument(
+          "--balloon-bundle-id requires --payload-data-base64 or --payload-file")
+      }
+      return nil
+    }
+    if payloadDataBase64.isEmpty == payloadFile.isEmpty {
+      throw IMsgError.invalidArgument("Use exactly one of --payload-data-base64 or --payload-file")
+    }
+    guard !balloonBundleID.isEmpty else {
+      throw IMsgError.invalidArgument("--balloon-bundle-id is required with extension payload data")
+    }
+
+    let payloadData: Data
+    if !payloadDataBase64.isEmpty {
+      guard let decoded = Data(base64Encoded: payloadDataBase64) else {
+        throw IMsgError.invalidArgument("--payload-data-base64 is not valid base64")
+      }
+      payloadData = decoded
+    } else {
+      do {
+        payloadData = try Data(contentsOf: URL(fileURLWithPath: payloadFile))
+      } catch {
+        throw IMsgError.invalidArgument(
+          "Could not read --payload-file: \(error.localizedDescription)")
+      }
+    }
+
+    guard !payloadData.isEmpty else {
+      throw IMsgError.invalidArgument("extension payload data is empty")
+    }
+
+    return MessageExtensionPayload(balloonBundleID: balloonBundleID, payloadData: payloadData)
   }
 }

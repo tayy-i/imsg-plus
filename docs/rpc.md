@@ -46,22 +46,31 @@ Notifications:
 Params:
 - `subscription` (int, required)
 Result:
-- `{ "ok": true }`
+- `{ "ok": true, "guid": "..." }`
 
 ### `send`
 Params (direct):
 - `to` (string, required)
 - `text` (string, optional)
 - `file` (string, optional)
+- `balloon_bundle_id` (string, optional, experimental)
+- `payload_data_base64` (string, optional, experimental)
+- `payload_file` (string, optional, experimental)
 - `service` ("imessage"|"sms"|"auto", optional)
 - `region` (string, optional)
 
 Params (group):
 - `chat_id` or `chat_identifier` or `chat_guid` (one required; `chat_id` preferred)
-- `text` / `file` as above
+- `text` / `file` / extension payload fields as above
 
 Result:
 - `{ "ok": true }`
+
+Experimental extension payload sending requires `balloon_bundle_id` plus exactly
+one of `payload_data_base64` or `payload_file`. The payload is passed through to
+Messages as the private `message.payload_data` blob. This path depends on
+private IMCore/ChatKit behavior and should be treated as a compatibility probe,
+not a stable public API.
 
 ## Objects
 
@@ -74,6 +83,20 @@ Result:
 - `last_message_at` (ISO8601)
 - `participants` (array, optional)
 - `is_group` (bool, optional)
+
+### `message.edit`
+Params:
+- `handle` (string, required)
+- `guid` (string, required)
+- `text` or `markdown_text` (string, optional)
+- `balloon_bundle_id` plus `payload_data_base64` or `payload_file` (optional, experimental)
+
+When extension payload fields are provided, imsg-plus asks Messages to edit the
+existing message with replacement `payload_data`. This is private ChatKit/IMCore
+behavior and should be verified on the target OS before depending on it.
+
+Result:
+- `{ "ok": true, "handle": "...", "guid": "...", "action": "edited" }`
 
 ### Message
 - `id` (rowid)

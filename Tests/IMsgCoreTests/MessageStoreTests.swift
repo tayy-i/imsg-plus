@@ -324,6 +324,70 @@ func attachmentsByMessageReturnsMetadata() throws {
 }
 
 @Test
+func recentOutgoingExtensionMessageGUIDMatchesPayload() throws {
+  let db = try Connection(.inMemory)
+  try db.execute(
+    """
+    CREATE TABLE message (
+      ROWID INTEGER PRIMARY KEY,
+      guid TEXT,
+      text TEXT,
+      date INTEGER,
+      is_from_me INTEGER,
+      service TEXT,
+      balloon_bundle_id TEXT,
+      payload_data BLOB
+    );
+    """
+  )
+  try db.execute(
+    """
+    CREATE TABLE chat (
+      ROWID INTEGER PRIMARY KEY,
+      chat_identifier TEXT,
+      guid TEXT,
+      display_name TEXT,
+      service_name TEXT
+    );
+    """
+  )
+  try db.execute("CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);")
+
+  let payload = Data("payload-1".utf8)
+  let otherPayload = Data("payload-2".utf8)
+  let now = Date()
+  try db.run(
+    "INSERT INTO chat(ROWID, chat_identifier, guid, display_name, service_name) VALUES (1, 'chat123', 'iMessage;+;chat123', 'Test', 'iMessage')"
+  )
+  try db.run(
+    """
+    INSERT INTO message(ROWID, guid, text, date, is_from_me, service, balloon_bundle_id, payload_data)
+    VALUES (1, 'old-guid', '', ?, 1, 'iMessage', 'bundle.id', ?)
+    """,
+    TestDatabase.appleEpoch(now.addingTimeInterval(-10)),
+    Blob(bytes: [UInt8](otherPayload))
+  )
+  try db.run(
+    """
+    INSERT INTO message(ROWID, guid, text, date, is_from_me, service, balloon_bundle_id, payload_data)
+    VALUES (2, 'matching-guid', '', ?, 1, 'iMessage', 'bundle.id', ?)
+    """,
+    TestDatabase.appleEpoch(now),
+    Blob(bytes: [UInt8](payload))
+  )
+  try db.run("INSERT INTO chat_message_join(chat_id, message_id) VALUES (1, 1), (1, 2)")
+
+  let store = try MessageStore(connection: db, path: ":memory:")
+  let guid = try store.recentOutgoingExtensionMessageGUID(
+    chatID: 1,
+    balloonBundleID: "bundle.id",
+    payloadData: payload,
+    since: now.addingTimeInterval(-30)
+  )
+  #expect(guid == "matching-guid")
+}
+
+@Test
 func longRepeatedPatternMessage() throws {
   // Test the exact pattern that causes crashes: repeated "aaaaaaaaaaaa " pattern
   // This reproduces the UInt8 overflow bug when segment.count > 256

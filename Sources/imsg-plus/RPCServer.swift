@@ -14,7 +14,8 @@ final class RPCServer {
   private let cache: ChatCache
   private let verbose: Bool
   private let bridgeSendMessage:
-    (String, String, String?, String?, MessageEffect?, String?) async throws -> Void
+    (String, String, String?, String?, MessageEffect?, String?, MessageExtensionPayload?)
+      async throws -> [String: Any]
   private let autoRead: Bool
   private let autoTyping: Bool
   private let bridgeAvailable: Bool
@@ -32,8 +33,8 @@ final class RPCServer {
     output: RPCOutput = RPCWriter(),
     bridgeSendMessage:
       @escaping (
-        String, String, String?, String?, MessageEffect?, String?
-      ) async throws -> Void = RPCServer.defaultBridgeSendMessage,
+        String, String, String?, String?, MessageEffect?, String?, MessageExtensionPayload?
+      ) async throws -> [String: Any] = RPCServer.defaultBridgeSendMessage,
     contactResolver: ContactResolving? = ContactResolver(),
     bridgeAvailable: Bool? = nil,
     getLocations: @escaping (String?) async throws -> [FriendLocation] = {
@@ -304,10 +305,12 @@ final class RPCServer {
     let text = stringParam(params["text"]) ?? ""
     let file = stringParam(params["file"]) ?? ""
     if stringParam(params["service"]) != nil {
-      throw RPCError.invalidParams("service is no longer supported for send; imsg-plus sends through the IMCore bridge")
+      throw RPCError.invalidParams(
+        "service is no longer supported for send; imsg-plus sends through the IMCore bridge")
     }
     if stringParam(params["region"]) != nil {
-      throw RPCError.invalidParams("region is no longer supported for send; imsg-plus sends through the IMCore bridge")
+      throw RPCError.invalidParams(
+        "region is no longer supported for send; imsg-plus sends through the IMCore bridge")
     }
 
     let chatID = int64Param(params["chat_id"])
@@ -323,8 +326,9 @@ final class RPCServer {
     }
 
     let markdownText = stringParam(params["markdown_text"])
-    if text.isEmpty && file.isEmpty && (markdownText ?? "").isEmpty {
-      throw RPCError.invalidParams("text, markdown_text, or file is required")
+    let extensionPayload = try parseExtensionPayload(params: params)
+    if text.isEmpty && file.isEmpty && (markdownText ?? "").isEmpty && extensionPayload == nil {
+      throw RPCError.invalidParams("text, markdown_text, file, or extension payload is required")
     }
 
     var resolvedChatIdentifier = chatIdentifier
@@ -396,41 +400,85 @@ final class RPCServer {
     }
     let attachment: String? = file.isEmpty ? nil : file
 
+    let sendStartedAt = Date()
     do {
-      try await bridgeSendMessage(handle, text, markdownText, attachment, effect, replyToGUID)
-    } catch {
-      throw RPCError.internalError(describeBridgeSendError(error))
-    }
+      let bridgeResult = try await bridgeSendMessage(
+        handle, text, markdownText, attachment, effect, replyToGUID, extensionPayload)
+      let transientGUID =
+        stringParam(bridgeResult["guid"])
+        ?? stringParam(bridgeResult["message_guid"])
+        ?? stringParam(bridgeResult["messageGUID"])
+      let messageGUID = await resolvePersistedExtensionGUID(
+        chatID: chatID,
+        extensionPayload: extensionPayload,
+        since: sendStartedAt
+      ) ?? transientGUID
 
-    // Turn off typing after send (fire-and-forget)
-    if autoTyping && bridgeAvailable {
-      let typingHandle = resolveTypingHandle(
-        recipient: recipient,
-        chatIdentifier: resolvedChatIdentifier,
-        chatGUID: resolvedChatGUID
-      )
-      if let handle = typingHandle {
-        let localVerbose = verbose
-        Task {
-          do {
-            try await IMCoreBridge.shared.setTyping(for: handle, typing: false)
-            if localVerbose {
-              FileHandle.standardError.write(Data("[auto-typing] OFF for \(handle)\n".utf8))
-            }
-          } catch {
-            if localVerbose {
-              FileHandle.standardError.write(Data("[auto-typing] off error: \(error)\n".utf8))
+      // Turn off typing after send (fire-and-forget)
+      if autoTyping && bridgeAvailable {
+        let typingHandle = resolveTypingHandle(
+          recipient: recipient,
+          chatIdentifier: resolvedChatIdentifier,
+          chatGUID: resolvedChatGUID
+        )
+        if let handle = typingHandle {
+          let localVerbose = verbose
+          Task {
+            do {
+              try await IMCoreBridge.shared.setTyping(for: handle, typing: false)
+              if localVerbose {
+                FileHandle.standardError.write(Data("[auto-typing] OFF for \(handle)\n".utf8))
+              }
+            } catch {
+              if localVerbose {
+                FileHandle.standardError.write(Data("[auto-typing] off error: \(error)\n".utf8))
+              }
             }
           }
         }
       }
-    }
 
-    var result: [String: Any] = ["ok": true]
-    if let effect {
-      result["effect"] = effect.displayName
+      var result: [String: Any] = ["ok": true]
+      if let effect {
+        result["effect"] = effect.displayName
+      }
+      if extensionPayload != nil {
+        result["extension_payload"] = true
+      }
+      if let messageGUID, !messageGUID.isEmpty {
+        result["guid"] = messageGUID
+      }
+      if let transientGUID, let messageGUID, transientGUID != messageGUID {
+        result["transient_guid"] = transientGUID
+      }
+      respond(id: id, result: result)
+    } catch {
+      throw RPCError.internalError(describeBridgeSendError(error))
     }
-    respond(id: id, result: result)
+  }
+
+  private func resolvePersistedExtensionGUID(
+    chatID: Int64?,
+    extensionPayload: MessageExtensionPayload?,
+    since: Date
+  ) async -> String? {
+    guard let extensionPayload else {
+      return nil
+    }
+    let querySince = since.addingTimeInterval(-5)
+    let deadline = Date().addingTimeInterval(20)
+    while Date() < deadline {
+      if let guid = try? store.recentOutgoingExtensionMessageGUID(
+        chatID: chatID,
+        balloonBundleID: extensionPayload.balloonBundleID,
+        payloadData: extensionPayload.payloadData,
+        since: querySince
+      ), !guid.isEmpty {
+        return guid
+      }
+      try? await Task.sleep(nanoseconds: 250_000_000)
+    }
+    return nil
   }
 
   private static func defaultBridgeSendMessage(
@@ -439,29 +487,74 @@ final class RPCServer {
     markdownText: String?,
     attachment: String?,
     effect: MessageEffect?,
-    replyToGUID: String?
-  ) async throws {
+    replyToGUID: String?,
+    extensionPayload: MessageExtensionPayload?
+  ) async throws -> [String: Any] {
     if let markdownText, !markdownText.isEmpty,
       let attrData = MarkdownComposer.compose(markdownText)
     {
-      try await IMCoreBridge.shared.sendRichMessage(
+      return try await IMCoreBridge.shared.sendRichMessage(
         handle: handle,
         attributedText: attrData,
         attachment: attachment,
         effect: effect,
-        replyToGUID: replyToGUID
+        replyToGUID: replyToGUID,
+        extensionPayload: extensionPayload
       )
-      return
     }
 
     let sendText = text.isEmpty ? (markdownText ?? "") : text
-    try await IMCoreBridge.shared.sendMessage(
+    return try await IMCoreBridge.shared.sendMessage(
       handle: handle,
       text: sendText,
       attachment: attachment,
       effect: effect,
-      replyToGUID: replyToGUID
+      replyToGUID: replyToGUID,
+      extensionPayload: extensionPayload
     )
+  }
+
+  private func parseExtensionPayload(params: [String: Any]) throws -> MessageExtensionPayload? {
+    let balloonBundleID = stringParam(params["balloon_bundle_id"]) ?? ""
+    let payloadDataBase64 =
+      stringParam(params["payload_data_base64"])
+      ?? stringParam(params["payload_data"])
+      ?? ""
+    let payloadFile = stringParam(params["payload_file"]) ?? ""
+
+    if payloadDataBase64.isEmpty && payloadFile.isEmpty {
+      if !balloonBundleID.isEmpty {
+        throw RPCError.invalidParams(
+          "balloon_bundle_id requires payload_data_base64 or payload_file")
+      }
+      return nil
+    }
+    if payloadDataBase64.isEmpty == payloadFile.isEmpty {
+      throw RPCError.invalidParams("use exactly one of payload_data_base64 or payload_file")
+    }
+    guard !balloonBundleID.isEmpty else {
+      throw RPCError.invalidParams("balloon_bundle_id is required with extension payload data")
+    }
+
+    let payloadData: Data
+    if !payloadDataBase64.isEmpty {
+      guard let decoded = Data(base64Encoded: payloadDataBase64) else {
+        throw RPCError.invalidParams("payload_data_base64 is not valid base64")
+      }
+      payloadData = decoded
+    } else {
+      do {
+        payloadData = try Data(contentsOf: URL(fileURLWithPath: payloadFile))
+      } catch {
+        throw RPCError.invalidParams("could not read payload_file: \(error.localizedDescription)")
+      }
+    }
+
+    guard !payloadData.isEmpty else {
+      throw RPCError.invalidParams("extension payload data is empty")
+    }
+
+    return MessageExtensionPayload(balloonBundleID: balloonBundleID, payloadData: payloadData)
   }
 
   private func describeBridgeSendError(_ error: Error) -> String {
@@ -573,8 +666,9 @@ final class RPCServer {
     }
     let text = stringParam(params["text"]) ?? ""
     let markdownText = stringParam(params["markdown_text"])
-    if text.isEmpty && (markdownText ?? "").isEmpty {
-      throw RPCError.invalidParams("text or markdown_text is required")
+    let extensionPayload = try parseExtensionPayload(params: params)
+    if text.isEmpty && (markdownText ?? "").isEmpty && extensionPayload == nil {
+      throw RPCError.invalidParams("text, markdown_text, or extension payload is required")
     }
     guard bridgeAvailable else {
       throw RPCError.internalError("IMCoreBridge not available")
@@ -584,9 +678,20 @@ final class RPCServer {
       attrData = MarkdownComposer.compose(markdownText)
     }
     let editText = text.isEmpty ? (markdownText ?? "") : text
-    try await IMCoreBridge.shared.editMessage(
-      handle: handle, messageGUID: guid, newText: editText, attributedText: attrData)
-    respond(id: id, result: ["ok": true, "handle": handle, "guid": guid, "action": "edited"])
+    let bridgeResult = try await IMCoreBridge.shared.editMessage(
+      handle: handle,
+      messageGUID: guid,
+      newText: editText,
+      attributedText: attrData,
+      extensionPayload: extensionPayload)
+    var result: [String: Any] = ["ok": true, "handle": handle, "guid": guid, "action": "edited"]
+    if let method = stringParam(bridgeResult["method"]) {
+      result["method"] = method
+    }
+    if extensionPayload != nil {
+      result["extension_payload"] = true
+    }
+    respond(id: id, result: result)
   }
 
   private func handleMessageUnsend(params: [String: Any], id: Any?) async throws {
