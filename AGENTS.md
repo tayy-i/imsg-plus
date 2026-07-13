@@ -1,5 +1,13 @@
 # Repository Guidelines
 
+## Communication
+
+When describing this project, including in documentation, code comments, plans, issues, and other project files, use plain terminology that someone who understands the project's scope can follow. Do not use project-specific technical jargon.
+
+## Agent-owned workflow
+
+Routine work is owned by the active primary development agent. That agent is responsible for execution, checking, and keeping work records current. Use a separate review agent that did not implement the work when an independent security or release-readiness review is required. Ask the user only when a decision or action needs the user's authority; do not leave routine work unowned merely because no human assignee was named.
+
 ## Project Structure & Module Organization
 - `Sources/imsg` holds the CLI entrypoint and command wiring.
 - `Sources/IMsgCore` contains SQLite access, watchers, IMCore bridge logic, and helpers.
