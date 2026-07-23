@@ -12,6 +12,10 @@ private enum RPCTestDatabase {
   }
 
   static func makeStore() throws -> MessageStore {
+    try makeMutableStore().store
+  }
+
+  static func makeMutableStore() throws -> (store: MessageStore, db: Connection) {
     let db = try Connection(.inMemory)
     try db.execute(
       """
@@ -21,7 +25,8 @@ private enum RPCTestDatabase {
         text TEXT,
         date INTEGER,
         is_from_me INTEGER,
-        service TEXT
+        service TEXT,
+        account_guid TEXT
       );
       """
     )
@@ -66,15 +71,18 @@ private enum RPCTestDatabase {
     try db.run("INSERT INTO chat_handle_join(chat_id, handle_id) VALUES (1, 1), (1, 2)")
     try db.run(
       """
-      INSERT INTO message(ROWID, handle_id, text, date, is_from_me, service)
-      VALUES (5, 1, 'hello', ?, 0, 'iMessage')
+      INSERT INTO message(ROWID, handle_id, text, date, is_from_me, service, account_guid)
+      VALUES (5, 1, 'hello', ?, 0, 'iMessage', 'account-a')
       """,
       appleEpoch(now)
     )
     try db.run("INSERT INTO chat_message_join(chat_id, message_id) VALUES (1, 5)")
 
-    return try MessageStore(
-      connection: db, path: ":memory:", hasAttributedBody: false, hasReactionColumns: false)
+    return (
+      try MessageStore(
+        connection: db, path: ":memory:", hasAttributedBody: false, hasReactionColumns: false),
+      db
+    )
   }
 }
 
@@ -418,6 +426,12 @@ func rpcWatchSubscribeEmitsNotificationAndUnsubscribe() async throws {
   let result = output.responses.first?["result"] as? [String: Any]
   let subscription = int64Value(result?["subscription"]) ?? 0
   #expect(subscription > 0)
+  #expect(int64Value(result?["since_rowid"]) == -1)
+  #expect(int64Value(result?["max_rowid"]) == 5)
+  #expect((result?["provider_epoch"] as? String)?.hasPrefix(
+    "messages-db-v2:memory:scope:"
+  ) == true)
+  #expect(result?["pending_history_regression"] as? Bool == false)
 
   for _ in 0..<20 {
     if output.notifications.count >= 1 { break }
@@ -433,6 +447,132 @@ func rpcWatchSubscribeEmitsNotificationAndUnsubscribe() async throws {
   await server.handleLineForTesting(unsubscribe)
 
   #expect(output.responses.count >= 2)
+}
+
+@Test
+func rpcWatchRefreshesAudienceMembershipForEveryDeliveredRow() async throws {
+  let (store, db) = try RPCTestDatabase.makeMutableStore()
+  let output = TestRPCOutput()
+  let server = RPCServer(store: store, verbose: false, output: output)
+
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":31,"method":"watch.subscribe","params":{"chat_id":1,"since_rowid":5}}"#
+  )
+  try db.run("INSERT INTO handle(ROWID, id) VALUES (3, '+456')")
+  try db.run("INSERT INTO chat_handle_join(chat_id, handle_id) VALUES (1, 3)")
+  try db.run(
+    "INSERT INTO message(ROWID, handle_id, text, date, is_from_me, service, account_guid) VALUES (6, 1, 'membership changed', ?, 0, 'iMessage', 'account-a')",
+    RPCTestDatabase.appleEpoch(Date().addingTimeInterval(1))
+  )
+  try db.run("INSERT INTO chat_message_join(chat_id, message_id) VALUES (1, 6)")
+
+  var delivered: [String: Any]?
+  for _ in 0..<50 {
+    delivered = output.notifications.compactMap { notification -> [String: Any]? in
+      guard let params = notification["params"] as? [String: Any],
+            let message = params["message"] as? [String: Any],
+            int64Value(message["id"]) == 6 else { return nil }
+      return message
+    }.first
+    if delivered != nil { break }
+    try await Task.sleep(nanoseconds: 50_000_000)
+  }
+
+  #expect((delivered?["participants"] as? [String])?.contains("+456") == true)
+  #expect(delivered?["audience_revision"] as? Int == stableAudienceRevision(
+    chatGUID: "iMessage;+;chat123",
+    participants: ["+123", "+456", "me@icloud.com"],
+    sender: "+123"
+  ))
+}
+
+@Test
+func rpcWatchPinsBeforeDeliveringAReassociatedChat() async throws {
+  let (store, db) = try RPCTestDatabase.makeMutableStore()
+  let output = TestRPCOutput()
+  let server = RPCServer(store: store, verbose: false, output: output)
+
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":32,"method":"watch.subscribe","params":{"chat_id":1,"since_rowid":5}}"#
+  )
+  try db.run(
+    "UPDATE chat SET chat_identifier = 'iMessage;+;reassociated' WHERE ROWID = 1"
+  )
+  try db.run(
+    "INSERT INTO message(ROWID, handle_id, text, date, is_from_me, service, account_guid) VALUES (6, 1, 'must stay quarantined', ?, 0, 'iMessage', 'account-a')",
+    RPCTestDatabase.appleEpoch(Date().addingTimeInterval(1))
+  )
+  try db.run("INSERT INTO chat_message_join(chat_id, message_id) VALUES (1, 6)")
+
+  for _ in 0..<50 {
+    if output.notifications.contains(where: { $0["method"] as? String == "error" }) { break }
+    try await Task.sleep(nanoseconds: 50_000_000)
+  }
+  let deliveredRowSix = output.notifications.contains { notification in
+    guard notification["method"] as? String == "message",
+          let params = notification["params"] as? [String: Any],
+          let message = params["message"] as? [String: Any] else { return false }
+    return int64Value(message["id"]) == 6
+  }
+  let errorText = output.notifications.compactMap { notification -> String? in
+    guard notification["method"] as? String == "error",
+          let params = notification["params"] as? [String: Any],
+          let error = params["error"] as? [String: Any] else { return nil }
+    return error["message"] as? String
+  }.first
+
+  #expect(deliveredRowSix == false)
+  #expect(errorText?.contains("subscription identity changed") == true)
+}
+
+@Test
+func rpcWatchSubscribeReturnsFreshDeterministicBaselineWithoutReplayingHistory() async throws {
+  let store = try RPCTestDatabase.makeStore()
+  let output = TestRPCOutput()
+  let server = RPCServer(store: store, verbose: false, output: output)
+
+  let subscribe =
+    #"{"jsonrpc":"2.0","id":13,"method":"watch.subscribe","params":{"chat_id":1}}"#
+  await server.handleLineForTesting(subscribe)
+
+  let result = output.responses.first?["result"] as? [String: Any]
+  #expect(int64Value(result?["since_rowid"]) == 5)
+  #expect(int64Value(result?["max_rowid"]) == 5)
+  #expect((result?["provider_epoch"] as? String)?.hasPrefix(
+    "messages-db-v2:memory:scope:"
+  ) == true)
+  try await Task.sleep(nanoseconds: 100_000_000)
+  #expect(output.notifications.isEmpty)
+}
+
+@Test
+func providerEpochChangesWithChatAndAccountScope() throws {
+  let (store, db) = try RPCTestDatabase.makeMutableStore()
+  let original = try store.providerEpoch(chatID: 1)
+
+  try db.run("UPDATE message SET account_guid = 'account-b' WHERE ROWID = 5")
+  let changedAccount = try store.providerEpoch(chatID: 1)
+  #expect(changedAccount != original)
+
+  try db.run("UPDATE chat SET chat_identifier = 'iMessage;+;other-chat' WHERE ROWID = 1")
+  let changedChat = try store.providerEpoch(chatID: 1)
+  #expect(changedChat != changedAccount)
+}
+
+@Test
+func rpcWatchSubscribeRejectsACursorAheadOfTheCurrentProvider() async throws {
+  let store = try RPCTestDatabase.makeStore()
+  let output = TestRPCOutput()
+  let server = RPCServer(store: store, verbose: false, output: output)
+
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":14,"method":"watch.subscribe","params":{"since_rowid":99}}"#
+  )
+
+  #expect(output.responses.isEmpty)
+  let error = output.errors.first?["error"] as? [String: Any]
+  #expect(int64Value(error?["code"]) == -32602)
+  #expect((error?["data"] as? String)?.contains("provider reset") == true)
 }
 
 @Test

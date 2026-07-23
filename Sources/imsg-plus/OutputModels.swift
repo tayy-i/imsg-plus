@@ -119,6 +119,7 @@ struct ReactionPayload: Codable {
 }
 
 struct AttachmentPayload: Codable {
+  let attachmentID: Int64?
   let filename: String
   let transferName: String
   let uti: String
@@ -129,6 +130,7 @@ struct AttachmentPayload: Codable {
   let missing: Bool
 
   init(meta: AttachmentMeta) {
+    self.attachmentID = meta.rowID > 0 ? meta.rowID : nil
     self.filename = meta.filename
     self.transferName = meta.transferName
     self.uti = meta.uti
@@ -140,6 +142,7 @@ struct AttachmentPayload: Codable {
   }
 
   enum CodingKeys: String, CodingKey {
+    case attachmentID = "attachment_id"
     case filename = "filename"
     case transferName = "transfer_name"
     case uti = "uti"

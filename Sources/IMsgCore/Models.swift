@@ -233,6 +233,12 @@ public struct Message: Sendable, Equatable {
   public let dateEdited: Date?
   public let threadOriginatorGUID: String?
   public let threadOriginatorPart: String?
+  public let accountGUID: String
+  public let attachmentRevisionEvidence: String
+  /// Set by MessageWatcher for a row first observed above the caller's durable
+  /// cursor. This is independent of whether Messages has already marked that
+  /// row as edited or retracted.
+  public let isNewProviderRow: Bool
 
   public init(
     rowID: Int64,
@@ -250,7 +256,10 @@ public struct Message: Sendable, Equatable {
     isEdited: Bool = false,
     dateEdited: Date? = nil,
     threadOriginatorGUID: String? = nil,
-    threadOriginatorPart: String? = nil
+    threadOriginatorPart: String? = nil,
+    accountGUID: String = "",
+    attachmentRevisionEvidence: String = "",
+    isNewProviderRow: Bool = false
   ) {
     self.rowID = rowID
     self.chatID = chatID
@@ -268,6 +277,38 @@ public struct Message: Sendable, Equatable {
     self.dateEdited = dateEdited
     self.threadOriginatorGUID = threadOriginatorGUID
     self.threadOriginatorPart = threadOriginatorPart
+    self.accountGUID = accountGUID
+    self.attachmentRevisionEvidence = attachmentRevisionEvidence
+    self.isNewProviderRow = isNewProviderRow
+  }
+
+  /// Stable identity for the current contents of one provider row. This is
+  /// deliberately separate from `rowID`: Messages edits and retractions update
+  /// an existing row rather than allocating a new one.
+  public var revisionFingerprint: String {
+    let editedNanoseconds = dateEdited.map {
+      Int64($0.timeIntervalSince1970 * 1_000_000_000)
+    } ?? 0
+    let fields = [
+      "revision-v2",
+      String(rowID),
+      guid,
+      text,
+      markdownText ?? "",
+      replyToGUID ?? "",
+      threadOriginatorGUID ?? "",
+      threadOriginatorPart ?? "",
+      String(attachmentsCount),
+      attachmentRevisionEvidence,
+      isEdited ? "1" : "0",
+      String(editedNanoseconds),
+    ]
+    var hash: UInt64 = 14_695_981_039_346_656_037
+    for byte in fields.joined(separator: "\u{1F}").utf8 {
+      hash ^= UInt64(byte)
+      hash = hash &* 1_099_511_628_211
+    }
+    return "revision-v2-" + String(hash, radix: 16)
   }
 }
 
@@ -395,6 +436,8 @@ public struct FriendLocation: Sendable {
 }
 
 public struct AttachmentMeta: Sendable, Equatable {
+  /// Stable provider row identity for this attachment association.
+  public let rowID: Int64
   public let filename: String
   public let transferName: String
   public let uti: String
@@ -405,6 +448,7 @@ public struct AttachmentMeta: Sendable, Equatable {
   public let missing: Bool
 
   public init(
+    rowID: Int64 = 0,
     filename: String,
     transferName: String,
     uti: String,
@@ -414,6 +458,7 @@ public struct AttachmentMeta: Sendable, Equatable {
     originalPath: String,
     missing: Bool
   ) {
+    self.rowID = rowID
     self.filename = filename
     self.transferName = transferName
     self.uti = uti

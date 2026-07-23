@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import SQLite
 
@@ -21,6 +22,7 @@ public final class MessageStore: @unchecked Sendable {
   let hasAttachmentUserInfo: Bool
   let hasThreadOriginator: Bool
   let hasDateEdited: Bool
+  let hasAccountGUID: Bool
 
   public init(path: String = MessageStore.defaultPath) throws {
     let normalized = NSString(string: path).expandingTildeInPath
@@ -49,6 +51,9 @@ public final class MessageStore: @unchecked Sendable {
       self.hasDateEdited = MessageStore.detectDateEditedColumn(
         connection: self.connection
       )
+      self.hasAccountGUID = MessageStore.detectMessageAccountGUID(
+        connection: self.connection
+      )
     } catch {
       throw MessageStore.enhance(error: error, path: normalized)
     }
@@ -63,7 +68,8 @@ public final class MessageStore: @unchecked Sendable {
     hasAudioMessageColumn: Bool? = nil,
     hasAttachmentUserInfo: Bool? = nil,
     hasThreadOriginator: Bool? = nil,
-    hasDateEdited: Bool? = nil
+    hasDateEdited: Bool? = nil,
+    hasAccountGUID: Bool? = nil
   ) throws {
     self.path = path
     self.queue = DispatchQueue(label: "imsg.db.test", qos: .userInitiated)
@@ -104,6 +110,11 @@ public final class MessageStore: @unchecked Sendable {
       self.hasDateEdited = hasDateEdited
     } else {
       self.hasDateEdited = MessageStore.detectDateEditedColumn(connection: connection)
+    }
+    if let hasAccountGUID {
+      self.hasAccountGUID = hasAccountGUID
+    } else {
+      self.hasAccountGUID = MessageStore.detectMessageAccountGUID(connection: connection)
     }
   }
 
@@ -161,6 +172,29 @@ public final class MessageStore: @unchecked Sendable {
     }
   }
 
+  public func chatInfo(identifierOrGUID value: String) throws -> ChatInfo? {
+    let sql = """
+      SELECT c.ROWID, IFNULL(c.chat_identifier, '') AS identifier, IFNULL(c.guid, '') AS guid,
+             IFNULL(c.display_name, c.chat_identifier) AS name, IFNULL(c.service_name, '') AS service
+      FROM chat c
+      WHERE c.chat_identifier = ? OR c.guid = ?
+      ORDER BY CASE WHEN c.chat_identifier = ? THEN 0 ELSE 1 END, c.ROWID ASC
+      LIMIT 1
+      """
+    return try withConnection { db in
+      for row in try db.prepare(sql, value, value, value) {
+        return ChatInfo(
+          id: int64Value(row[0]) ?? 0,
+          identifier: stringValue(row[1]),
+          guid: stringValue(row[2]),
+          name: stringValue(row[3]),
+          service: stringValue(row[4])
+        )
+      }
+      return nil
+    }
+  }
+
   public func participants(chatID: Int64) throws -> [String] {
     let sql = """
       SELECT h.id
@@ -194,9 +228,41 @@ public final class MessageStore: @unchecked Sendable {
 }
 
 extension MessageStore {
+  func attachmentRevisionEvidence(for messageID: Int64) throws -> String {
+    let attachments = try attachments(for: messageID)
+    let fields = attachments.map { attachment -> String in
+      let availableBytes: Int64
+      if attachment.missing {
+        availableBytes = -1
+      } else if
+        let attributes = try? FileManager.default.attributesOfItem(
+          atPath: attachment.originalPath
+        ),
+        let size = attributes[.size] as? NSNumber
+      {
+        availableBytes = size.int64Value
+      } else {
+        availableBytes = -1
+      }
+      return [
+        String(attachment.rowID),
+        attachment.filename,
+        attachment.transferName,
+        attachment.uti,
+        attachment.mimeType,
+        String(attachment.totalBytes),
+        attachment.isSticker ? "1" : "0",
+        attachment.originalPath,
+        attachment.missing ? "1" : "0",
+        String(availableBytes),
+      ].joined(separator: "\u{1E}")
+    }
+    return fields.sorted().joined(separator: "\u{1D}")
+  }
+
   public func attachments(for messageID: Int64) throws -> [AttachmentMeta] {
     let sql = """
-      SELECT a.filename, a.transfer_name, a.uti, a.mime_type, a.total_bytes, a.is_sticker
+      SELECT a.ROWID, a.filename, a.transfer_name, a.uti, a.mime_type, a.total_bytes, a.is_sticker
       FROM message_attachment_join maj
       JOIN attachment a ON a.ROWID = maj.attachment_id
       WHERE maj.message_id = ?
@@ -204,15 +270,17 @@ extension MessageStore {
     return try withConnection { db in
       var metas: [AttachmentMeta] = []
       for row in try db.prepare(sql, messageID) {
-        let filename = stringValue(row[0])
-        let transferName = stringValue(row[1])
-        let uti = stringValue(row[2])
-        let mimeType = stringValue(row[3])
-        let totalBytes = int64Value(row[4]) ?? 0
-        let isSticker = boolValue(row[5])
+        let rowID = int64Value(row[0]) ?? 0
+        let filename = stringValue(row[1])
+        let transferName = stringValue(row[2])
+        let uti = stringValue(row[3])
+        let mimeType = stringValue(row[4])
+        let totalBytes = int64Value(row[5]) ?? 0
+        let isSticker = boolValue(row[6])
         let resolved = AttachmentResolver.resolve(filename)
         metas.append(
           AttachmentMeta(
+            rowID: rowID,
             filename: filename,
             transferName: transferName,
             uti: uti,
@@ -272,6 +340,112 @@ extension MessageStore {
     return try withConnection { db in
       let value = try db.scalar("SELECT MAX(ROWID) FROM message")
       return int64Value(value) ?? 0
+    }
+  }
+
+  /// Stable identity for the current Messages database file and subscribed
+  /// chat/account scope. A database replacement, chat change, or account
+  /// reassociation gets a different identity even when ROWIDs overlap.
+  public func providerEpoch(chatID: Int64? = nil) throws -> String {
+    let databaseEpoch: String
+    if path == ":memory:" {
+      databaseEpoch = "messages-db-v2:memory"
+    } else {
+      let attributes = try FileManager.default.attributesOfItem(atPath: path)
+      guard
+        let systemNumber = (attributes[.systemNumber] as? NSNumber)?.uint64Value,
+        let fileNumber = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value,
+        let creationDate = attributes[.creationDate] as? Date
+      else {
+        throw NSError(
+          domain: "IMsgCore.MessageStore",
+          code: 1,
+          userInfo: [NSLocalizedDescriptionKey: "Messages database identity is unavailable"]
+        )
+      }
+      let createdMilliseconds = Int64(creationDate.timeIntervalSince1970 * 1_000)
+      databaseEpoch = "messages-db-v2:\(systemNumber):\(fileNumber):\(createdMilliseconds)"
+    }
+
+    guard let chatID else { return databaseEpoch }
+    guard let chat = try chatInfo(chatID: chatID) else {
+      throw NSError(
+        domain: "IMsgCore.MessageStore",
+        code: 2,
+        userInfo: [NSLocalizedDescriptionKey: "Messages chat scope is unavailable"]
+      )
+    }
+    let accountGUIDs: [String]
+    if hasAccountGUID {
+      accountGUIDs = try withConnection { db in
+        var values = Set<String>()
+        for row in try db.prepare(
+          """
+          SELECT DISTINCT IFNULL(m.account_guid, '')
+          FROM message m
+          JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+          WHERE cmj.chat_id = ? AND IFNULL(m.account_guid, '') != ''
+          ORDER BY IFNULL(m.account_guid, '') ASC
+          """,
+          chatID
+        ) {
+          let value = stringValue(row[0])
+          if !value.isEmpty { values.insert(value) }
+        }
+        return values.sorted()
+      }
+    } else {
+      accountGUIDs = []
+    }
+    let scope = ([
+      String(chat.id),
+      chat.identifier,
+      chat.guid,
+      chat.service,
+    ] + accountGUIDs).joined(separator: "\0")
+    let digest = SHA256.hash(data: Data(scope.utf8))
+      .map { String(format: "%02x", $0) }
+      .joined()
+    return "\(databaseEpoch):scope:\(digest)"
+  }
+
+  /// Detects an appended backlog whose provider timestamps precede the row at
+  /// the durable cursor. This is quarantined as imported/restored history rather
+  /// than silently treating it as new host-time input.
+  public func pendingHistoryRegresses(afterRowID rowID: Int64, chatID: Int64? = nil) throws -> Bool {
+    guard rowID >= 0 else { return false }
+    return try withConnection { db in
+      let join = chatID == nil ? "" : " JOIN chat_message_join cmj ON cmj.message_id = m.ROWID"
+      let scope = chatID == nil ? "" : " AND cmj.chat_id = ?"
+      let cursorBindings: [Binding?] = chatID.map { [rowID, $0] } ?? [rowID]
+      let pendingBindings: [Binding?] = chatID.map { [rowID, $0] } ?? [rowID]
+      let cursorDate = try db.prepare(
+        "SELECT MAX(m.date) FROM message m\(join) WHERE m.ROWID <= ?\(scope)",
+        cursorBindings
+      ).compactMap { int64Value($0[0]) }.first
+      let oldestPendingDate = try db.prepare(
+        "SELECT MIN(m.date) FROM message m\(join) WHERE m.ROWID > ?\(scope)",
+        pendingBindings
+      ).compactMap { int64Value($0[0]) }.first
+      guard let oldestPendingDate else { return false }
+      guard let cursorDate else { return true }
+      return oldestPendingDate < cursorDate
+    }
+  }
+
+  public func latestProviderDate(atOrBeforeRowID rowID: Int64, chatID: Int64? = nil) throws
+    -> Date?
+  {
+    guard rowID >= 0 else { return nil }
+    return try withConnection { db in
+      let join = chatID == nil ? "" : " JOIN chat_message_join cmj ON cmj.message_id = m.ROWID"
+      let scope = chatID == nil ? "" : " AND cmj.chat_id = ?"
+      let bindings: [Binding?] = chatID.map { [rowID, $0] } ?? [rowID]
+      let raw = try db.prepare(
+        "SELECT MAX(m.date) FROM message m\(join) WHERE m.ROWID <= ?\(scope)",
+        bindings
+      ).compactMap { int64Value($0[0]) }.first
+      return raw.map { appleDate(from: $0) }
     }
   }
 

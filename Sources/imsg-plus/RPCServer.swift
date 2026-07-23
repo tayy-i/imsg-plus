@@ -165,8 +165,34 @@ final class RPCServer {
       case "locations.list", "location.get":
         try await handleLocationsList(params: params, id: id)
       case "watch.subscribe":
-        let chatID = int64Param(params["chat_id"])
-        let sinceRowID = int64Param(params["since_rowid"])
+        let requestedChatIdentifier = stringParam(params["chat_identifier"])
+        let requestedChatID = int64Param(params["chat_id"])
+        let chatID: Int64?
+        if let requestedChatID {
+          chatID = requestedChatID
+        } else if let requestedChatIdentifier, !requestedChatIdentifier.isEmpty {
+          guard let chat = try store.chatInfo(identifierOrGUID: requestedChatIdentifier) else {
+            throw RPCError.invalidParams("chat_identifier was not found")
+          }
+          chatID = chat.id
+        } else {
+          chatID = nil
+        }
+        let requestedSinceRowID = int64Param(params["since_rowid"])
+        if let requestedSinceRowID, requestedSinceRowID < -1 {
+          throw RPCError.invalidParams("since_rowid must be -1 or greater")
+        }
+        let maxRowID = try store.maxRowID()
+        if let requestedSinceRowID, requestedSinceRowID > maxRowID {
+          throw RPCError.invalidParams(
+            "since_rowid is ahead of the current Messages database; provider reset must be reviewed"
+          )
+        }
+        let sinceRowID = requestedSinceRowID ?? maxRowID
+        let providerEpoch = try store.providerEpoch(chatID: chatID)
+        let pendingHistoryRegression = try requestedSinceRowID.map {
+          try store.pendingHistoryRegresses(afterRowID: $0, chatID: chatID)
+        } ?? false
         let participants = stringArrayParam(params["participants"])
         let startISO = stringParam(params["start"])
         let endISO = stringParam(params["end"])
@@ -176,7 +202,9 @@ final class RPCServer {
           startISO: startISO,
           endISO: endISO
         )
-        let config = MessageWatcherConfiguration()
+        let config = MessageWatcherConfiguration(
+          replayRecentRevisionsOnStart: requestedSinceRowID != nil
+        )
         let subID = nextSubscriptionID
         nextSubscriptionID += 1
         let localStore = store
@@ -188,10 +216,24 @@ final class RPCServer {
         let localSinceRowID = sinceRowID
         let localConfig = config
         let localIncludeAttachments = includeAttachments
+        let localProviderEpoch = providerEpoch
         let localAutoRead = autoRead
         let localBridgeAvailable = bridgeAvailable
         let localVerbose = verbose
         let localResolver = contactResolver
+        // Return the exact baseline before notifications can be emitted. A
+        // durable consumer can save this baseline and resume after it without
+        // racing the subscription startup.
+        respond(
+          id: id,
+          result: [
+            "subscription": subID,
+            "since_rowid": sinceRowID,
+            "max_rowid": maxRowID,
+            "provider_epoch": providerEpoch,
+            "pending_history_regression": pendingHistoryRegression,
+          ]
+        )
         let task = Task {
           do {
             for try await message in localWatcher.stream(
@@ -201,6 +243,21 @@ final class RPCServer {
             ) {
               if Task.isCancelled { return }
               if !localFilter.allows(message) { continue }
+              guard localChatID == nil || message.chatID == localChatID else {
+                throw NSError(
+                  domain: "imsg-plus.RPCServer",
+                  code: 1,
+                  userInfo: [NSLocalizedDescriptionKey: "Messages subscription scope changed"]
+                )
+              }
+              let currentProviderEpoch = try localStore.providerEpoch(chatID: localChatID)
+              guard currentProviderEpoch == localProviderEpoch else {
+                throw NSError(
+                  domain: "imsg-plus.RPCServer",
+                  code: 2,
+                  userInfo: [NSLocalizedDescriptionKey: "Messages subscription identity changed"]
+                )
+              }
               let payload = try buildMessagePayload(
                 store: localStore,
                 cache: localCache,
@@ -248,7 +305,6 @@ final class RPCServer {
           }
         }
         subscriptions[subID] = task
-        respond(id: id, result: ["subscription": subID])
       case "watch.unsubscribe":
         guard let subID = intParam(params["subscription"]) else {
           throw RPCError.invalidParams("subscription is required")
@@ -844,25 +900,25 @@ struct RPCError: Error {
 private final class ChatCache: @unchecked Sendable {
   private let store: MessageStore
   private var infoCache: [Int64: ChatInfo] = [:]
-  private var participantsCache: [Int64: [String]] = [:]
 
   init(store: MessageStore) {
     self.store = store
   }
 
   func info(chatID: Int64) throws -> ChatInfo? {
-    if let cached = infoCache[chatID] { return cached }
+    // Chat identity is authority evidence in watch payloads. Refresh it for
+    // every delivered row instead of trusting a process-long display cache.
     if let info = try store.chatInfo(chatID: chatID) {
       infoCache[chatID] = info
       return info
     }
+    infoCache.removeValue(forKey: chatID)
     return nil
   }
 
   func participants(chatID: Int64) throws -> [String] {
-    if let cached = participantsCache[chatID] { return cached }
-    let participants = try store.participants(chatID: chatID)
-    participantsCache[chatID] = participants
-    return participants
+    // Membership is security evidence, not display metadata. Query it for every
+    // delivered row so a long-lived subscription cannot reuse a stale audience.
+    try store.participants(chatID: chatID)
   }
 }

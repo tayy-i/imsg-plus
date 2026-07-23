@@ -27,6 +27,22 @@ func chatPayload(
   return payload
 }
 
+/// A deterministic revision of the canonical chat audience. It changes when the
+/// chat GUID or participant membership changes and stays within JavaScript's
+/// exactly representable integer range for RPC consumers.
+func stableAudienceRevision(chatGUID: String, participants: [String], sender: String) -> Int {
+  let members = Set((participants + [sender]).filter { !$0.isEmpty }).sorted()
+  guard !chatGUID.isEmpty, !members.isEmpty else { return 0 }
+  let value = ([chatGUID] + members).joined(separator: "\n")
+  var hash: UInt64 = 14_695_981_039_346_656_037
+  for byte in value.utf8 {
+    hash ^= UInt64(byte)
+    hash = hash &* 1_099_511_628_211
+  }
+  let safe = hash & 0x001F_FFFF_FFFF_FFFF
+  return Int(safe == 0 ? 1 : safe)
+}
+
 func messagePayload(
   message: Message,
   chatInfo: ChatInfo?,
@@ -41,6 +57,7 @@ func messagePayload(
   let name = chatInfo?.name ?? ""
   var payload: [String: Any] = [
     "id": message.rowID,
+    "revision_fingerprint": message.revisionFingerprint,
     "chat_id": message.chatID,
     "guid": message.guid,
     "sender": message.sender,
@@ -54,7 +71,19 @@ func messagePayload(
     "chat_name": name,
     "participants": participants,
     "is_group": isGroupHandle(identifier: identifier, guid: guid),
+    "is_new_provider_row": message.isNewProviderRow,
   ]
+  if !message.accountGUID.isEmpty {
+    payload["account_id"] = message.accountGUID
+  }
+  let audienceRevision = stableAudienceRevision(
+    chatGUID: guid,
+    participants: participants,
+    sender: message.sender
+  )
+  if audienceRevision > 0 {
+    payload["audience_revision"] = audienceRevision
+  }
   if let replyToGUID = message.replyToGUID, !replyToGUID.isEmpty {
     payload["reply_to_guid"] = replyToGUID
   }
@@ -77,7 +106,7 @@ func messagePayload(
 }
 
 func attachmentPayload(_ meta: AttachmentMeta) -> [String: Any] {
-  return [
+  var payload: [String: Any] = [
     "filename": meta.filename,
     "transfer_name": meta.transferName,
     "uti": meta.uti,
@@ -87,6 +116,10 @@ func attachmentPayload(_ meta: AttachmentMeta) -> [String: Any] {
     "original_path": meta.originalPath,
     "missing": meta.missing,
   ]
+  if meta.rowID > 0 {
+    payload["attachment_id"] = meta.rowID
+  }
+  return payload
 }
 
 func reactionPayload(_ reaction: Reaction, senderName: String? = nil) -> [String: Any] {

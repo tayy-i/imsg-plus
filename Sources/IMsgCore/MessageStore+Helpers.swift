@@ -82,6 +82,22 @@ extension MessageStore {
     return false
   }
 
+  static func detectMessageAccountGUID(connection: Connection) -> Bool {
+    do {
+      let rows = try connection.prepare("PRAGMA table_info(message)")
+      for row in rows {
+        if let name = row[1] as? String,
+          name.caseInsensitiveCompare("account_guid") == .orderedSame
+        {
+          return true
+        }
+      }
+    } catch {
+      return false
+    }
+    return false
+  }
+
   static func detectAttachmentUserInfo(connection: Connection) -> Bool {
     do {
       let rows = try connection.prepare("PRAGMA table_info(attachment)")

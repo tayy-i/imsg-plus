@@ -42,7 +42,8 @@ func messagePayloadIncludesChatFields() {
     handleID: nil,
     attachmentsCount: 1,
     guid: "msg-guid-5",
-    replyToGUID: "msg-guid-1"
+    replyToGUID: "msg-guid-1",
+    accountGUID: "account-guid-primary"
   )
   let chatInfo = ChatInfo(
     id: 10,
@@ -52,6 +53,7 @@ func messagePayloadIncludesChatFields() {
     service: "iMessage"
   )
   let attachment = AttachmentMeta(
+    rowID: 44,
     filename: "file.dat",
     transferName: "file.dat",
     uti: "public.data",
@@ -82,10 +84,43 @@ func messagePayloadIncludesChatFields() {
   #expect(payload["chat_identifier"] as? String == "iMessage;+;chat123")
   #expect(payload["chat_name"] as? String == "Group")
   #expect(payload["is_group"] as? Bool == true)
+  #expect(payload["id"] as? Int64 == 5)
+  #expect(payload["revision_fingerprint"] as? String == message.revisionFingerprint)
+  #expect(payload["account_id"] as? String == "account-guid-primary")
+  #expect(payload["audience_revision"] as? Int == stableAudienceRevision(
+    chatGUID: "iMessage;+;chat123",
+    participants: ["+111"],
+    sender: "+123"
+  ))
   #expect((payload["attachments"] as? [[String: Any]])?.count == 1)
+  #expect((payload["attachments"] as? [[String: Any]])?.first?["attachment_id"] as? Int64 == 44)
   #expect(
     (payload["reactions"] as? [[String: Any]])?.first?["emoji"] as? String
       == ReactionType.like.emoji)
+}
+
+@Test
+func stableAudienceRevisionIsOrderIndependentAndChangesWithMembership() {
+  let first = stableAudienceRevision(
+    chatGUID: "iMessage;+;chat123",
+    participants: ["+222", "+111"],
+    sender: "+333"
+  )
+  let reordered = stableAudienceRevision(
+    chatGUID: "iMessage;+;chat123",
+    participants: ["+111", "+222"],
+    sender: "+333"
+  )
+  let changed = stableAudienceRevision(
+    chatGUID: "iMessage;+;chat123",
+    participants: ["+111", "+444"],
+    sender: "+333"
+  )
+
+  #expect(first > 0)
+  #expect(first <= 9_007_199_254_740_991)
+  #expect(first == reordered)
+  #expect(first != changed)
 }
 
 @Test
