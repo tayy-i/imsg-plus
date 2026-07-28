@@ -60,6 +60,18 @@ extension MessageStore {
     let threadOriginatorPartColumn = hasThreadOriginator ? "m.thread_originator_part" : "NULL"
     let dateEditedColumn = hasDateEdited ? "m.date_edited" : "NULL"
     let accountGUIDColumn = hasAccountGUID ? "m.account_guid" : "NULL"
+    let reactionRevisionColumn =
+      hasReactionColumns
+      ? """
+        CASE WHEN m.is_from_me = 1 THEN (
+          SELECT IFNULL(MAX(r.ROWID), 0)
+          FROM message r
+          WHERE (r.associated_message_guid = m.guid OR r.associated_message_guid = 'p:0/' || m.guid)
+            AND r.associated_message_type >= 2000
+            AND r.associated_message_type <= 3006
+        ) ELSE 0 END
+        """
+      : "0"
     let reactionFilter =
       hasReactionColumns
       ? " AND (m.associated_message_type IS NULL OR m.associated_message_type < 2000 OR m.associated_message_type > 3006)"
@@ -73,7 +85,8 @@ extension MessageStore {
              \(threadOriginatorColumn) AS thread_originator_guid,
              \(threadOriginatorPartColumn) AS thread_originator_part,
              \(dateEditedColumn) AS date_edited,
-             \(accountGUIDColumn) AS account_guid
+             \(accountGUIDColumn) AS account_guid,
+             \(reactionRevisionColumn) AS reaction_revision
       FROM message m
       JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
       LEFT JOIN handle h ON m.handle_id = h.ROWID
@@ -132,6 +145,7 @@ extension MessageStore {
         let threadOriginatorPart = stringValue(row[15])
         let dateEditedRaw = int64Value(row[16])
         let accountGUID = stringValue(row[17])
+        let reactionRevisionEvidence = String(int64Value(row[18]) ?? 0)
         var resolvedText = text
         var markdownText: String?
         if text.isEmpty {
@@ -168,7 +182,8 @@ extension MessageStore {
             threadOriginatorGUID: threadOriginatorGUID.isEmpty ? nil : threadOriginatorGUID,
             threadOriginatorPart: threadOriginatorPart.isEmpty ? nil : threadOriginatorPart,
             accountGUID: accountGUID,
-            attachmentRevisionEvidence: attachmentRevisionEvidence
+            attachmentRevisionEvidence: attachmentRevisionEvidence,
+            reactionRevisionEvidence: reactionRevisionEvidence
           ))
       }
       return messages
@@ -186,6 +201,18 @@ extension MessageStore {
     let threadOriginatorPartColumn = hasThreadOriginator ? "m.thread_originator_part" : "NULL"
     let dateEditedColumn = hasDateEdited ? "m.date_edited" : "NULL"
     let accountGUIDColumn = hasAccountGUID ? "m.account_guid" : "NULL"
+    let reactionRevisionColumn =
+      hasReactionColumns
+      ? """
+        CASE WHEN m.is_from_me = 1 THEN (
+          SELECT IFNULL(MAX(r.ROWID), 0)
+          FROM message r
+          WHERE (r.associated_message_guid = m.guid OR r.associated_message_guid = 'p:0/' || m.guid)
+            AND r.associated_message_type >= 2000
+            AND r.associated_message_type <= 3006
+        ) ELSE 0 END
+        """
+      : "0"
     let reactionFilter =
       hasReactionColumns
       ? " AND (m.associated_message_type IS NULL OR m.associated_message_type < 2000 OR m.associated_message_type > 3006)"
@@ -199,7 +226,8 @@ extension MessageStore {
              \(threadOriginatorColumn) AS thread_originator_guid,
              \(threadOriginatorPartColumn) AS thread_originator_part,
              \(dateEditedColumn) AS date_edited,
-             \(accountGUIDColumn) AS account_guid
+             \(accountGUIDColumn) AS account_guid,
+             \(reactionRevisionColumn) AS reaction_revision
       FROM message m
       LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
       LEFT JOIN handle h ON m.handle_id = h.ROWID
@@ -241,6 +269,7 @@ extension MessageStore {
         let threadOriginatorPart = stringValue(row[16])
         let dateEditedRaw = int64Value(row[17])
         let accountGUID = stringValue(row[18])
+        let reactionRevisionEvidence = String(int64Value(row[19]) ?? 0)
         var resolvedText = text
         var markdownText: String?
         if text.isEmpty {
@@ -277,7 +306,8 @@ extension MessageStore {
             threadOriginatorGUID: threadOriginatorGUID.isEmpty ? nil : threadOriginatorGUID,
             threadOriginatorPart: threadOriginatorPart.isEmpty ? nil : threadOriginatorPart,
             accountGUID: accountGUID,
-            attachmentRevisionEvidence: attachmentRevisionEvidence
+            attachmentRevisionEvidence: attachmentRevisionEvidence,
+            reactionRevisionEvidence: reactionRevisionEvidence
           ))
       }
       return messages
@@ -300,6 +330,18 @@ extension MessageStore {
     let threadOriginatorPartColumn = hasThreadOriginator ? "m.thread_originator_part" : "NULL"
     let dateEditedColumn = hasDateEdited ? "m.date_edited" : "NULL"
     let accountGUIDColumn = hasAccountGUID ? "m.account_guid" : "NULL"
+    let reactionRevisionColumn =
+      hasReactionColumns
+      ? """
+        CASE WHEN m.is_from_me = 1 THEN (
+          SELECT IFNULL(MAX(r.ROWID), 0)
+          FROM message r
+          WHERE (r.associated_message_guid = m.guid OR r.associated_message_guid = 'p:0/' || m.guid)
+            AND r.associated_message_type >= 2000
+            AND r.associated_message_type <= 3006
+        ) ELSE 0 END
+        """
+      : "0"
     let reactionFilter =
       hasReactionColumns
       ? " AND (m.associated_message_type IS NULL OR m.associated_message_type < 2000 OR m.associated_message_type > 3006)"
@@ -314,7 +356,8 @@ extension MessageStore {
              \(threadOriginatorColumn) AS thread_originator_guid,
              \(threadOriginatorPartColumn) AS thread_originator_part,
              \(dateEditedColumn) AS date_edited,
-             \(accountGUIDColumn) AS account_guid
+             \(accountGUIDColumn) AS account_guid,
+             \(reactionRevisionColumn) AS reaction_revision
       FROM message m
       LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
       LEFT JOIN handle h ON m.handle_id = h.ROWID
@@ -355,6 +398,7 @@ extension MessageStore {
         let threadOriginatorPart = stringValue(row[16])
         let dateEditedRaw = int64Value(row[17])
         let accountGUID = stringValue(row[18])
+        let reactionRevisionEvidence = String(int64Value(row[19]) ?? 0)
         var resolvedText = text
         var markdownText: String?
         if text.isEmpty {
@@ -391,7 +435,8 @@ extension MessageStore {
             threadOriginatorGUID: threadOriginatorGUID.isEmpty ? nil : threadOriginatorGUID,
             threadOriginatorPart: threadOriginatorPart.isEmpty ? nil : threadOriginatorPart,
             accountGUID: accountGUID,
-            attachmentRevisionEvidence: attachmentRevisionEvidence
+            attachmentRevisionEvidence: attachmentRevisionEvidence,
+            reactionRevisionEvidence: reactionRevisionEvidence
           ))
       }
       return messages
@@ -406,10 +451,27 @@ extension MessageStore {
     afterRowID: Int64,
     atOrBeforeRowID rowID: Int64,
     chatID: Int64?,
+    reactionReplayAfter: Date?,
     limit: Int
   ) throws -> [Message] {
     guard limit > 0, rowID >= 0 else { return [] }
     let editedPredicate = hasDateEdited ? "IFNULL(m.date_edited, 0) > 0" : "0"
+    let reactedPredicate =
+      hasReactionColumns && reactionReplayAfter != nil
+      ? """
+        (
+          m.is_from_me = 1
+          AND m.date >= ?
+          AND EXISTS (
+          SELECT 1
+          FROM message r
+          WHERE (r.associated_message_guid = m.guid OR r.associated_message_guid = 'p:0/' || m.guid)
+            AND r.associated_message_type >= 2000
+            AND r.associated_message_type <= 3006
+          )
+        )
+        """
+      : "0"
     var sql = """
       SELECT m.ROWID
       FROM message m
@@ -420,9 +482,13 @@ extension MessageStore {
           OR EXISTS (
             SELECT 1 FROM message_attachment_join maj WHERE maj.message_id = m.ROWID
           )
+          OR \(reactedPredicate)
         )
       """
     var bindings: [Binding?] = [afterRowID, rowID]
+    if hasReactionColumns, let reactionReplayAfter {
+      bindings.append(MessageStore.appleEpoch(reactionReplayAfter))
+    }
     if let chatID {
       sql += " AND cmj.chat_id = ?"
       bindings.append(chatID)

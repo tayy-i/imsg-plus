@@ -22,6 +22,9 @@ private enum WatcherTestDatabase {
         ROWID INTEGER PRIMARY KEY,
         handle_id INTEGER,
         text TEXT,
+        guid TEXT,
+        associated_message_guid TEXT,
+        associated_message_type INTEGER,
         date INTEGER,
         is_from_me INTEGER,
         service TEXT,
@@ -51,17 +54,98 @@ private enum WatcherTestDatabase {
     try db.run("INSERT INTO handle(ROWID, id) VALUES (1, '+123')")
     try db.run(
       """
-      INSERT INTO message(ROWID, handle_id, text, date, is_from_me, service)
-      VALUES (1, 1, 'hello', ?, 0, 'iMessage')
+      INSERT INTO message(ROWID, handle_id, text, guid, date, is_from_me, service)
+      VALUES (1, 1, 'hello', 'message-guid-1', ?, 0, 'iMessage')
       """,
       appleEpoch(now)
     )
     try db.run("INSERT INTO chat_message_join(chat_id, message_id) VALUES (1, 1)")
 
     let store = try MessageStore(
-      connection: db, path: ":memory:", hasAttributedBody: false, hasReactionColumns: false)
+      connection: db, path: ":memory:", hasAttributedBody: false, hasReactionColumns: true)
     return (store, db)
   }
+}
+
+@Test
+func messageWatcherEmitsAnOutgoingMessageRevisionWhenATapbackChanges() async throws {
+  let (store, db) = try WatcherTestDatabase.makeMutableStore()
+  try db.run("UPDATE message SET is_from_me = 1 WHERE ROWID = 1")
+  let stream = MessageWatcher(store: store).stream(
+    chatID: 1,
+    sinceRowID: -1,
+    configuration: MessageWatcherConfiguration(
+      debounceInterval: 0.01,
+      batchLimit: 10,
+      revisionScanLimit: 10,
+      fallbackPollInterval: 0.01
+    )
+  )
+  var iterator = stream.makeAsyncIterator()
+  let original = try await iterator.next()
+  #expect(original?.rowID == 1)
+  try db.run(
+    """
+    INSERT INTO message(
+      ROWID, handle_id, text, guid, associated_message_guid,
+      associated_message_type, date, is_from_me, service
+    ) VALUES (2, 1, 'Liked', 'reaction-guid-1', 'p:0/message-guid-1', 2001, ?, 0, 'iMessage')
+    """,
+    WatcherTestDatabase.appleEpoch(Date().addingTimeInterval(1))
+  )
+
+  let reacted = try await iterator.next()
+  #expect(reacted?.rowID == 1)
+  #expect(reacted?.guid == "message-guid-1")
+  #expect(reacted?.isFromMe == true)
+  #expect(reacted?.isNewProviderRow == false)
+  #expect(reacted?.reactionRevisionEvidence == "2")
+}
+
+@Test
+func offlineReactionReplayStaysWithinThePendingApprovalWindow() throws {
+  let (store, db) = try WatcherTestDatabase.makeMutableStore()
+  let now = Date()
+  try db.run(
+    "UPDATE message SET is_from_me = 1, date = ? WHERE ROWID = 1",
+    WatcherTestDatabase.appleEpoch(now.addingTimeInterval(-3_600))
+  )
+  try db.run(
+    """
+    INSERT INTO message(ROWID, handle_id, text, guid, date, is_from_me, service)
+    VALUES (2, 1, 'recent approval', 'message-guid-2', ?, 1, 'iMessage')
+    """,
+    WatcherTestDatabase.appleEpoch(now.addingTimeInterval(-60))
+  )
+  try db.run("INSERT INTO chat_message_join(chat_id, message_id) VALUES (1, 2)")
+  try db.run(
+    """
+    INSERT INTO message(
+      ROWID, handle_id, text, guid, associated_message_guid,
+      associated_message_type, date, is_from_me, service
+    ) VALUES (3, 1, 'Liked', 'old-reaction', 'p:0/message-guid-1', 2001, ?, 1, 'iMessage')
+    """,
+    WatcherTestDatabase.appleEpoch(now.addingTimeInterval(-30))
+  )
+  try db.run(
+    """
+    INSERT INTO message(
+      ROWID, handle_id, text, guid, associated_message_guid,
+      associated_message_type, date, is_from_me, service
+    ) VALUES (4, 1, 'Liked', 'recent-reaction', 'p:0/message-guid-2', 2001, ?, 1, 'iMessage')
+    """,
+    WatcherTestDatabase.appleEpoch(now.addingTimeInterval(-20))
+  )
+
+  let replayed = try store.revisedMessages(
+    afterRowID: 0,
+    atOrBeforeRowID: 4,
+    chatID: 1,
+    reactionReplayAfter: now.addingTimeInterval(-600),
+    limit: 10
+  )
+
+  #expect(replayed.map(\.rowID) == [2])
 }
 
 @Test

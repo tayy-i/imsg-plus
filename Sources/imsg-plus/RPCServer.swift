@@ -1,7 +1,7 @@
 import Foundation
 import IMsgCore
 
-let currentRoseMessagesAdapterContract = "rose-imsg-plus-rpc-v1"
+let currentRoseMessagesAdapterContract = "rose-imsg-plus-rpc-v2"
 
 protocol RPCOutput: Sendable {
   func sendResponse(id: Any, result: Any)

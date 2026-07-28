@@ -52,6 +52,10 @@ public final class MessageWatcher: @unchecked Sendable {
 }
 
 private final class WatchState: @unchecked Sendable {
+  // Rose approvals expire after five minutes. A ten-minute recovery window
+  // covers a restart around that deadline without replaying lifetime tapbacks.
+  private static let reactionReplayWindow: TimeInterval = 10 * 60
+
   private let store: MessageStore
   private let chatID: Int64?
   private let configuration: MessageWatcherConfiguration
@@ -260,6 +264,7 @@ private final class WatchState: @unchecked Sendable {
         afterRowID: afterRowID,
         atOrBeforeRowID: cursor,
         chatID: chatID,
+        reactionReplayAfter: Date().addingTimeInterval(-Self.reactionReplayWindow),
         limit: batchLimit
       )
       for message in messages {
@@ -306,6 +311,7 @@ private extension Message {
       threadOriginatorPart: threadOriginatorPart,
       accountGUID: accountGUID,
       attachmentRevisionEvidence: attachmentRevisionEvidence,
+      reactionRevisionEvidence: reactionRevisionEvidence,
       isNewProviderRow: true
     )
   }
@@ -330,6 +336,7 @@ private extension Message {
       threadOriginatorPart: threadOriginatorPart,
       accountGUID: accountGUID,
       attachmentRevisionEvidence: attachmentRevisionEvidence,
+      reactionRevisionEvidence: reactionRevisionEvidence,
       isNewProviderRow: false
     )
   }

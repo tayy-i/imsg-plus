@@ -235,6 +235,7 @@ public struct Message: Sendable, Equatable {
   public let threadOriginatorPart: String?
   public let accountGUID: String
   public let attachmentRevisionEvidence: String
+  public let reactionRevisionEvidence: String
   /// Set by MessageWatcher for a row first observed above the caller's durable
   /// cursor. This is independent of whether Messages has already marked that
   /// row as edited or retracted.
@@ -259,6 +260,7 @@ public struct Message: Sendable, Equatable {
     threadOriginatorPart: String? = nil,
     accountGUID: String = "",
     attachmentRevisionEvidence: String = "",
+    reactionRevisionEvidence: String = "",
     isNewProviderRow: Bool = false
   ) {
     self.rowID = rowID
@@ -279,6 +281,7 @@ public struct Message: Sendable, Equatable {
     self.threadOriginatorPart = threadOriginatorPart
     self.accountGUID = accountGUID
     self.attachmentRevisionEvidence = attachmentRevisionEvidence
+    self.reactionRevisionEvidence = reactionRevisionEvidence
     self.isNewProviderRow = isNewProviderRow
   }
 
@@ -290,7 +293,7 @@ public struct Message: Sendable, Equatable {
       Int64($0.timeIntervalSince1970 * 1_000_000_000)
     } ?? 0
     let fields = [
-      "revision-v2",
+      "revision-v3",
       String(rowID),
       guid,
       text,
@@ -300,6 +303,7 @@ public struct Message: Sendable, Equatable {
       threadOriginatorPart ?? "",
       String(attachmentsCount),
       attachmentRevisionEvidence,
+      reactionRevisionEvidence,
       isEdited ? "1" : "0",
       String(editedNanoseconds),
     ]
@@ -308,7 +312,7 @@ public struct Message: Sendable, Equatable {
       hash ^= UInt64(byte)
       hash = hash &* 1_099_511_628_211
     }
-    return "revision-v2-" + String(hash, radix: 16)
+    return "revision-v3-" + String(hash, radix: 16)
   }
 }
 
