@@ -1,6 +1,8 @@
 import Foundation
 import IMsgCore
 
+let currentRoseMessagesAdapterContract = "rose-imsg-plus-rpc-v1"
+
 protocol RPCOutput: Sendable {
   func sendResponse(id: Any, result: Any)
   func sendError(id: Any?, error: RPCError)
@@ -232,6 +234,7 @@ final class RPCServer {
             "max_rowid": maxRowID,
             "provider_epoch": providerEpoch,
             "pending_history_regression": pendingHistoryRegression,
+            "adapter_contract": currentRoseMessagesAdapterContract,
           ]
         )
         let task = Task {

@@ -38,7 +38,11 @@ Params:
 - `start` / `end` (ISO8601, optional)
 - `attachments` (bool, default false)
 Result:
-- `{ "subscription": 1 }`
+- `{ "subscription": 1, "since_rowid": 42, "max_rowid": 42, "provider_epoch": "...", "pending_history_regression": false, "adapter_contract": "rose-imsg-plus-rpc-v1" }`
+
+Consumers must require the exact `adapter_contract`. Missing or different
+contracts are hard version errors; current Rose does not silently consume an
+older Messages stream.
 Notifications:
 - `{"jsonrpc":"2.0","method":"message","params":{"subscription":1,"message":<Message>}}`
 

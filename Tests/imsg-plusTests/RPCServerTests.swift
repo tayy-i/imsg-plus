@@ -432,6 +432,7 @@ func rpcWatchSubscribeEmitsNotificationAndUnsubscribe() async throws {
     "messages-db-v2:memory:scope:"
   ) == true)
   #expect(result?["pending_history_regression"] as? Bool == false)
+  #expect(result?["adapter_contract"] as? String == currentRoseMessagesAdapterContract)
 
   for _ in 0..<20 {
     if output.notifications.count >= 1 { break }
