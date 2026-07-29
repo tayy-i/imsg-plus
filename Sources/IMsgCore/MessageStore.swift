@@ -4,6 +4,13 @@ import SQLite
 
 public final class MessageStore: @unchecked Sendable {
   public static let appleEpochOffset: TimeInterval = 978_307_200
+  static let reactionAssociationPredicate = """
+    (
+      r.associated_message_guid = m.guid
+      OR r.associated_message_guid LIKE '%/' || m.guid
+      OR r.associated_message_guid = 'bp:' || m.guid
+    )
+    """
 
   public static var defaultPath: String {
     let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -453,15 +460,13 @@ extension MessageStore {
     guard hasReactionColumns else { return [] }
     // Reactions are stored as messages with associated_message_type in range 2000-2006
     // 2000-2005 are standard tapbacks, 2006 is custom emoji reactions
-    // They reference the original message via associated_message_guid which has format "p:X/GUID"
-    // where X is the part index (0 for single-part messages) and GUID matches the original message's guid
+    // Ordinary reactions use "p:X/GUID". Reactions on app-extension balloons use "bp:GUID".
     let bodyColumn = hasAttributedBody ? "r.attributedBody" : "NULL"
     let sql = """
       SELECT r.ROWID, r.associated_message_type, h.id, r.is_from_me, r.date, IFNULL(r.text, '') as text,
              \(bodyColumn) AS body
       FROM message m
-      JOIN message r ON r.associated_message_guid = m.guid
-        OR r.associated_message_guid LIKE '%/' || m.guid
+      JOIN message r ON \(Self.reactionAssociationPredicate)
       LEFT JOIN handle h ON r.handle_id = h.ROWID
       WHERE m.ROWID = ?
         AND m.guid IS NOT NULL

@@ -103,6 +103,41 @@ func messageWatcherEmitsAnOutgoingMessageRevisionWhenATapbackChanges() async thr
 }
 
 @Test
+func messageWatcherEmitsAnOutgoingBalloonRevisionWhenATapbackChanges() async throws {
+  let (store, db) = try WatcherTestDatabase.makeMutableStore()
+  try db.run("UPDATE message SET is_from_me = 1 WHERE ROWID = 1")
+  let stream = MessageWatcher(store: store).stream(
+    chatID: 1,
+    sinceRowID: -1,
+    configuration: MessageWatcherConfiguration(
+      debounceInterval: 0.01,
+      batchLimit: 10,
+      revisionScanLimit: 10,
+      fallbackPollInterval: 0.01
+    )
+  )
+  var iterator = stream.makeAsyncIterator()
+  let original = try await iterator.next()
+  #expect(original?.rowID == 1)
+  try db.run(
+    """
+    INSERT INTO message(
+      ROWID, handle_id, text, guid, associated_message_guid,
+      associated_message_type, date, is_from_me, service
+    ) VALUES (2, 1, 'Liked', 'reaction-guid-1', 'bp:message-guid-1', 2001, ?, 0, 'iMessage')
+    """,
+    WatcherTestDatabase.appleEpoch(Date().addingTimeInterval(1))
+  )
+
+  let reacted = try await iterator.next()
+  #expect(reacted?.rowID == 1)
+  #expect(reacted?.guid == "message-guid-1")
+  #expect(reacted?.isFromMe == true)
+  #expect(reacted?.isNewProviderRow == false)
+  #expect(reacted?.reactionRevisionEvidence == "2")
+}
+
+@Test
 func offlineReactionReplayStaysWithinThePendingApprovalWindow() throws {
   let (store, db) = try WatcherTestDatabase.makeMutableStore()
   let now = Date()
@@ -132,7 +167,7 @@ func offlineReactionReplayStaysWithinThePendingApprovalWindow() throws {
     INSERT INTO message(
       ROWID, handle_id, text, guid, associated_message_guid,
       associated_message_type, date, is_from_me, service
-    ) VALUES (4, 1, 'Liked', 'recent-reaction', 'p:0/message-guid-2', 2001, ?, 1, 'iMessage')
+    ) VALUES (4, 1, 'Liked', 'recent-reaction', 'bp:message-guid-2', 2001, ?, 1, 'iMessage')
     """,
     WatcherTestDatabase.appleEpoch(now.addingTimeInterval(-20))
   )

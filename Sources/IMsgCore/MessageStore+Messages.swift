@@ -66,7 +66,7 @@ extension MessageStore {
         CASE WHEN m.is_from_me = 1 THEN (
           SELECT IFNULL(MAX(r.ROWID), 0)
           FROM message r
-          WHERE (r.associated_message_guid = m.guid OR r.associated_message_guid = 'p:0/' || m.guid)
+          WHERE \(Self.reactionAssociationPredicate)
             AND r.associated_message_type >= 2000
             AND r.associated_message_type <= 3006
         ) ELSE 0 END
@@ -207,7 +207,7 @@ extension MessageStore {
         CASE WHEN m.is_from_me = 1 THEN (
           SELECT IFNULL(MAX(r.ROWID), 0)
           FROM message r
-          WHERE (r.associated_message_guid = m.guid OR r.associated_message_guid = 'p:0/' || m.guid)
+          WHERE \(Self.reactionAssociationPredicate)
             AND r.associated_message_type >= 2000
             AND r.associated_message_type <= 3006
         ) ELSE 0 END
@@ -336,7 +336,7 @@ extension MessageStore {
         CASE WHEN m.is_from_me = 1 THEN (
           SELECT IFNULL(MAX(r.ROWID), 0)
           FROM message r
-          WHERE (r.associated_message_guid = m.guid OR r.associated_message_guid = 'p:0/' || m.guid)
+          WHERE \(Self.reactionAssociationPredicate)
             AND r.associated_message_type >= 2000
             AND r.associated_message_type <= 3006
         ) ELSE 0 END
@@ -465,7 +465,7 @@ extension MessageStore {
           AND EXISTS (
           SELECT 1
           FROM message r
-          WHERE (r.associated_message_guid = m.guid OR r.associated_message_guid = 'p:0/' || m.guid)
+          WHERE \(Self.reactionAssociationPredicate)
             AND r.associated_message_type >= 2000
             AND r.associated_message_type <= 3006
           )
