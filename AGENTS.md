@@ -50,9 +50,8 @@ The dylib uses Objective-C runtime to access IMCore classes:
 ### Implementation Status
 - ✅ **Typing indicators**: Working via `IMChat.setLocalUserIsTyping:`
 - ✅ **Read receipts**: Working via `IMChat.markAllMessagesAsRead`
-- ❌ **Tapbacks**: In progress - GUID-to-chat-item lookup needs work
-  - Issue: `chatItems` array search doesn't find messages by GUID
-  - May need alternative approach or different IMCore method
+- ✅ **Tapbacks**: Sending and removal are available through
+  `imsg-plus react` and the `tapback.send` RPC method
 
 ### Testing Notes
 - Must launch Messages.app with dylib: `DYLD_INSERT_LIBRARIES=.build/release/imsg-plus-helper.dylib /System/Applications/Messages.app/Contents/MacOS/Messages &`
