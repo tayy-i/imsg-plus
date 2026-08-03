@@ -32,9 +32,13 @@ public final class MessagesLauncher: @unchecked Sendable {
   /// Path to the dylib to inject
   public var dylibPath: String = ".build/release/imsg-plus-helper.dylib"
 
+  /// Optional exact chat lock passed into the injected helper.
+  public var allowedChat: String?
+
   private init() {
     // Look for dylib in multiple locations
     let possiblePaths = [
+      Self.siblingHelperPath,
       ".build/release/imsg-plus-helper.dylib",
       ".build/debug/imsg-plus-helper.dylib",
       "/usr/local/lib/imsg-plus-helper.dylib",
@@ -47,6 +51,14 @@ public final class MessagesLauncher: @unchecked Sendable {
         break
       }
     }
+  }
+
+  public static var siblingHelperPath: String {
+    let executable = URL(fileURLWithPath: ProcessInfo.processInfo.arguments[0])
+      .standardizedFileURL
+    return executable.deletingLastPathComponent()
+      .appendingPathComponent("imsg-plus-helper.dylib")
+      .path
   }
 
   /// Check if Messages.app is running with our dylib (lock file exists)
@@ -124,6 +136,11 @@ public final class MessagesLauncher: @unchecked Sendable {
     // Set environment for dylib injection
     var environment = ProcessInfo.processInfo.environment
     environment["DYLD_INSERT_LIBRARIES"] = absoluteDylibPath
+    if let allowedChat = allowedChat?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !allowedChat.isEmpty
+    {
+      environment["IMSG_PLUS_ALLOWED_CHAT"] = allowedChat
+    }
     task.environment = environment
 
     // Don't wait for the process (it runs in background)
@@ -222,8 +239,12 @@ public final class MessagesLauncher: @unchecked Sendable {
 
   /// Send a command asynchronously
   public func sendCommand(action: String, params: [String: Any]) async throws -> [String: Any] {
-    // Ensure Messages.app is running with injection
-    try ensureRunning()
+    // Provider operations must never relaunch Messages and then continue into
+    // dispatch. Relaunch is a separate explicit control-plane action followed
+    // by a fresh helper/chat preflight.
+    guard isInjectedAndReady() else {
+      throw MessagesLauncherError.relaunchRequired
+    }
 
     return try queue.sync {
       try self.sendCommandSync(action: action, params: params)
@@ -234,6 +255,7 @@ public final class MessagesLauncher: @unchecked Sendable {
 public enum MessagesLauncherError: Error, CustomStringConvertible {
   case dylibNotFound(String)
   case launchFailed(String)
+  case relaunchRequired
   case socketTimeout
   case socketError(String)
   case invalidResponse
@@ -245,9 +267,11 @@ public enum MessagesLauncherError: Error, CustomStringConvertible {
         "imsg-plus-helper.dylib not found at \(path). Build with: make build-dylib"
     case .launchFailed(let reason):
       return "Failed to launch Messages.app: \(reason)"
+    case .relaunchRequired:
+      return "Messages helper relaunch is required; no Messages operation was sent"
     case .socketTimeout:
       return
-        "Timeout waiting for Messages.app to initialize. Ensure SIP is disabled and Messages.app has necessary permissions."
+        "Timeout waiting for Messages.app to initialize. Verify the reviewed guest SIP and library-validation posture, then check the exact helper permissions."
     case .socketError(let reason):
       return "IPC error: \(reason)"
     case .invalidResponse:

@@ -12,16 +12,20 @@ enum LaunchCommand {
       Waits for the lock file to confirm successful injection.
 
       The dylib is searched in order:
-        1. /usr/local/lib/imsg-plus-helper.dylib
-        2. .build/release/imsg-plus-helper.dylib (relative to cwd)
-        3. Custom path via --dylib flag
+        1. Custom path via --dylib, when provided
+        2. imsg-plus-helper.dylib beside the executable
+        3. /usr/local/lib/imsg-plus-helper.dylib
+        4. .build/release/imsg-plus-helper.dylib (relative to cwd)
       """,
     signature: CommandSignatures.withRuntimeFlags(
       CommandSignature(
         options: [
           .make(
             label: "dylib", names: [.long("dylib")],
-            help: "Custom path to imsg-plus-helper.dylib")
+            help: "Custom path to imsg-plus-helper.dylib"),
+          .make(
+            label: "allowedChat", names: [.long("allowed-chat")],
+            help: "Lock the injected helper to one exact chat"),
         ],
         flags: [
           .make(
@@ -37,6 +41,7 @@ enum LaunchCommand {
       "imsg-plus launch",
       "imsg-plus launch --kill-only",
       "imsg-plus launch --dylib /path/to/dylib",
+      "imsg-plus launch --allowed-chat user@example.com",
       "imsg-plus launch --json",
       "imsg-plus launch --quiet",
     ]
@@ -48,6 +53,10 @@ enum LaunchCommand {
     let killOnly = values.flags.contains("killOnly")
     let quiet = values.flags.contains("quiet")
     let customDylib = values.option("dylib")
+    let allowedChat = values.option("allowedChat")?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if values.option("allowedChat") != nil && (allowedChat ?? "").isEmpty {
+      throw IMsgError.invalidArgument("allowed-chat must not be empty")
+    }
 
     let launcher = MessagesLauncher.shared
 
@@ -80,6 +89,7 @@ enum LaunchCommand {
     guard let resolvedPath = dylibPath else {
       let error =
         "imsg-plus-helper.dylib not found. Searched:\n"
+        + "  - beside the imsg-plus executable\n"
         + "  - /usr/local/lib/imsg-plus-helper.dylib\n"
         + "  - .build/release/imsg-plus-helper.dylib\n"
         + "Run 'make build-dylib' or specify --dylib <path>"
@@ -99,6 +109,7 @@ enum LaunchCommand {
 
     // Set the dylib path on the launcher
     launcher.dylibPath = resolvedPath
+    launcher.allowedChat = allowedChat
 
     if !quiet && !runtime.jsonOutput {
       print("📦 Using dylib: \(resolvedPath)")
@@ -154,6 +165,7 @@ enum LaunchCommand {
     }
 
     let searchPaths = [
+      MessagesLauncher.siblingHelperPath,
       "/usr/local/lib/imsg-plus-helper.dylib",
       ".build/release/imsg-plus-helper.dylib",
     ]

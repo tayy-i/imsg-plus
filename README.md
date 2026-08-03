@@ -215,13 +215,23 @@ Sending, typing, read receipt, tapback, edit, unsend, and location features requ
 
 ### Prerequisites
 
-1. **Disable SIP** (System Integrity Protection):
+1. **Review the host security decision before changing it.** Helper injection
+   weakens macOS process protections. Use a dedicated test machine or VM, keep
+   it isolated from general activity, and do not automate this decision.
+
+2. **Disable SIP** (System Integrity Protection), only after that review:
    - Reboot into Recovery Mode (hold Cmd+R during startup, or power button on Apple Silicon)
    - Open Terminal from the Utilities menu
    - Run: `csrutil disable`
    - Reboot normally
 
-2. **Full Disk Access**: Grant your terminal FDA permission in System Settings → Privacy & Security → Full Disk Access
+3. **Library validation**: current macOS releases may also block the reviewed
+   helper even with SIP disabled. The macOS 26.6 staging guest required the
+   system library-validation exception as a second explicit security decision.
+
+4. **Full Disk Access**: grant it to the narrowest exact executable that needs
+   Messages database access. Avoid granting it to a general interactive
+   terminal for a durable service.
 
 ### Setup
 
@@ -249,9 +259,11 @@ That's it. The `launch` command replaces the manual `DYLD_INSERT_LIBRARIES` danc
 
 **Security Warning**
 - These features use Apple's private IMCore framework
-- Requires SIP disabled, which reduces system security
+- Helper injection requires reduced SIP and, on the current staging guest,
+  library-validation protections; both reduce system security
 - Intended for personal use and testing only
-- Re-enable SIP when not needed: `csrutil enable` (from Recovery Mode)
+- Re-enable the changed protections when the dedicated test environment is no
+  longer needed
 
 ## Clawdbot Integration
 
