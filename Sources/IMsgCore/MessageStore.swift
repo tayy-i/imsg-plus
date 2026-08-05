@@ -351,19 +351,24 @@ extension MessageStore {
 
   /// Stable identity for the current Messages database file and subscribed
   /// chat scope. A database replacement or chat reassociation gets a different
-  /// identity even when ROWIDs overlap. Per-message account values are excluded:
-  /// normal inbound and outbound rows can legitimately carry different values,
-  /// while the locked helper preflight separately pins the active local account.
+  /// identity even when ROWIDs overlap. The stable volume UUID is used instead
+  /// of the mount-specific device number, which can change after a normal boot.
+  /// Per-message account values are excluded: normal inbound and outbound rows
+  /// can legitimately carry different values, while the locked helper preflight
+  /// separately pins the active local account.
   public func providerEpoch(chatID: Int64? = nil) throws -> String {
     let databaseEpoch: String
     if path == ":memory:" {
-      databaseEpoch = "messages-db-v3:memory"
+      databaseEpoch = "messages-db-v4:memory"
     } else {
       let attributes = try FileManager.default.attributesOfItem(atPath: path)
+      let resourceValues = try URL(fileURLWithPath: path).resourceValues(
+        forKeys: [.volumeUUIDStringKey]
+      )
       guard
-        let systemNumber = (attributes[.systemNumber] as? NSNumber)?.uint64Value,
         let fileNumber = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value,
-        let creationDate = attributes[.creationDate] as? Date
+        let creationDate = attributes[.creationDate] as? Date,
+        let volumeUUID = resourceValues.volumeUUIDString
       else {
         throw NSError(
           domain: "IMsgCore.MessageStore",
@@ -371,8 +376,11 @@ extension MessageStore {
           userInfo: [NSLocalizedDescriptionKey: "Messages database identity is unavailable"]
         )
       }
-      let createdMilliseconds = Int64(creationDate.timeIntervalSince1970 * 1_000)
-      databaseEpoch = "messages-db-v3:\(systemNumber):\(fileNumber):\(createdMilliseconds)"
+      databaseEpoch = try ProviderIdentity.databaseEpoch(
+        volumeUUID: volumeUUID,
+        fileNumber: fileNumber,
+        creationDate: creationDate
+      )
     }
 
     guard let chatID else { return databaseEpoch }

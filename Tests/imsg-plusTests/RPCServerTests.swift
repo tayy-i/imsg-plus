@@ -797,7 +797,7 @@ func rpcWatchSubscribeEmitsNotificationAndUnsubscribe() async throws {
   #expect(int64Value(result?["max_rowid"]) == 5)
   #expect(
     (result?["provider_epoch"] as? String)?.hasPrefix(
-      "messages-db-v3:memory:scope:"
+      "messages-db-v4:memory:scope:"
     ) == true)
   #expect(result?["pending_history_regression"] as? Bool == false)
   #expect(result?["adapter_contract"] as? String == currentRoseMessagesAdapterContract)
@@ -979,7 +979,7 @@ func rpcWatchSubscribeReturnsFreshDeterministicBaselineWithoutReplayingHistory()
   #expect(int64Value(result?["max_rowid"]) == 5)
   #expect(
     (result?["provider_epoch"] as? String)?.hasPrefix(
-      "messages-db-v3:memory:scope:"
+      "messages-db-v4:memory:scope:"
     ) == true)
   try await Task.sleep(nanoseconds: 100_000_000)
   #expect(output.notifications.isEmpty)
@@ -1001,6 +1001,40 @@ func providerEpochStaysStableForNewMessageAccountValuesAndChangesWithChatScope()
   try db.run("UPDATE chat SET chat_identifier = 'iMessage;+;other-chat' WHERE ROWID = 1")
   let changedChat = try store.providerEpoch(chatID: 1)
   #expect(changedChat != afterNewAccountValue)
+}
+
+@Test
+func providerDatabaseEpochUsesStableVolumeIdentity() throws {
+  let created = Date(timeIntervalSince1970: 1_700_000_000.125)
+  let original = try ProviderIdentity.databaseEpoch(
+    volumeUUID: "A1B2-C3D4",
+    fileNumber: 42,
+    creationDate: created
+  )
+  let sameAfterRemount = try ProviderIdentity.databaseEpoch(
+    volumeUUID: "a1b2-c3d4",
+    fileNumber: 42,
+    creationDate: created
+  )
+  let replacement = try ProviderIdentity.databaseEpoch(
+    volumeUUID: "a1b2-c3d4",
+    fileNumber: 43,
+    creationDate: created
+  )
+  let subMillisecondReplacement = try ProviderIdentity.databaseEpoch(
+    volumeUUID: "a1b2-c3d4",
+    fileNumber: 42,
+    creationDate: created.addingTimeInterval(0.000_5)
+  )
+  let creationIdentity = String(
+    format: "%016llx",
+    created.timeIntervalSinceReferenceDate.bitPattern
+  )
+
+  #expect(original == "messages-db-v4:a1b2-c3d4:42:\(creationIdentity)")
+  #expect(sameAfterRemount == original)
+  #expect(replacement != original)
+  #expect(subMillisecondReplacement != original)
 }
 
 @Test
