@@ -116,6 +116,23 @@ final class TestRPCOutput: RPCOutput, @unchecked Sendable {
   }
 }
 
+private final class LockedValue<Value>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value: Value
+
+  init(_ value: Value) {
+    self.value = value
+  }
+
+  func get() -> Value {
+    lock.withLock { value }
+  }
+
+  func set(_ newValue: Value) {
+    lock.withLock { value = newValue }
+  }
+}
+
 private func int64Value(_ value: Any?) -> Int64? {
   if let value = value as? Int64 { return value }
   if let value = value as? Int { return Int64(value) }
@@ -269,6 +286,326 @@ func rpcSendRejectsBridgeChatNotFound() async throws {
 }
 
 @Test
+func rpcAllowedChatLockRejectsAnotherSubscriptionAndSendBeforeBridge() async throws {
+  let store = try RPCTestDatabase.makeStore()
+  let output = TestRPCOutput()
+  var preflightCalls = 0
+  var sendCalls = 0
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    autoTyping: false,
+    output: output,
+    bridgeSendMessage: { _, _, _, _, _, _, _ in
+      sendCalls += 1
+      return ["guid": "must-not-send"]
+    },
+    bridgeAvailable: true,
+    allowedChat: "iMessage;+;chat123",
+    bridgePreflightAllowedChat: { _, _, _, _ in
+      preflightCalls += 1
+      return completeAllowedChatPreflight()
+    }
+  )
+
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"lock-watch","method":"watch.subscribe","params":{"chat_identifier":"other@example.com","attachments":false}}"#
+  )
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"lock-send","method":"send","params":{"to":"other@example.com","text":"must not send"}}"#
+  )
+
+  #expect(output.errors.count == 2)
+  #expect(
+    output.errors.allSatisfy {
+      let error = $0["error"] as? [String: Any]
+      return int64Value(error?["code"]) == -32602
+    })
+  #expect(preflightCalls == 0)
+  #expect(sendCalls == 0)
+}
+
+@Test
+func rpcAllowedChatLockRejectsBroadMessagesReads() async throws {
+  let store = try RPCTestDatabase.makeStore()
+  let output = TestRPCOutput()
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    autoTyping: false,
+    output: output,
+    bridgeAvailable: true,
+    allowedChat: "iMessage;+;chat123",
+    bridgePreflightAllowedChat: { _, _, _, _ in completeAllowedChatPreflight() }
+  )
+
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"locked-chats","method":"chats.list","params":{"limit":10}}"#
+  )
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"locked-history","method":"messages.history","params":{"chat_id":1,"limit":5}}"#
+  )
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"locked-status","method":"bridge.status","params":{}}"#
+  )
+
+  #expect(output.responses.isEmpty)
+  #expect(output.errors.count == 3)
+  #expect(
+    output.errors.allSatisfy {
+      let error = $0["error"] as? [String: Any]
+      return int64Value(error?["code"]) == -32602
+    })
+}
+
+@Test
+func rpcAllowedChatPreflightsEveryTargetedProviderOperation() async throws {
+  let store = try RPCTestDatabase.makeStore()
+  let output = TestRPCOutput()
+  var preflightCalls = 0
+  var locationCalls = 0
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    autoTyping: false,
+    output: output,
+    bridgeAvailable: true,
+    allowedChat: "iMessage;+;chat123",
+    bridgePreflightAllowedChat: { _, _, _, _ in
+      preflightCalls += 1
+      throw IMCoreBridgeError.operationFailed("blocked before provider dispatch")
+    },
+    getLocations: { _ in
+      locationCalls += 1
+      return []
+    }
+  )
+
+  let requests = [
+    #"{"jsonrpc":"2.0","id":"locked-typing","method":"typing.set","params":{"handle":"iMessage;+;chat123","state":"on"}}"#,
+    #"{"jsonrpc":"2.0","id":"locked-read","method":"messages.markRead","params":{"handle":"iMessage;+;chat123"}}"#,
+    #"{"jsonrpc":"2.0","id":"locked-tapback","method":"tapback.send","params":{"handle":"iMessage;+;chat123","guid":"guid-1","type":"love"}}"#,
+    #"{"jsonrpc":"2.0","id":"locked-rename","method":"group.rename","params":{"handle":"iMessage;+;chat123","name":"Test"}}"#,
+    #"{"jsonrpc":"2.0","id":"locked-edit","method":"message.edit","params":{"handle":"iMessage;+;chat123","guid":"guid-1","text":"edited"}}"#,
+    #"{"jsonrpc":"2.0","id":"locked-unsend","method":"message.unsend","params":{"handle":"iMessage;+;chat123","guid":"guid-1"}}"#,
+    #"{"jsonrpc":"2.0","id":"locked-location","method":"location.get","params":{"handle":"iMessage;+;chat123"}}"#,
+  ]
+  for request in requests {
+    await server.handleLineForTesting(request)
+  }
+
+  #expect(output.responses.isEmpty)
+  #expect(output.errors.count == requests.count)
+  #expect(preflightCalls == requests.count - 1)
+  #expect(locationCalls == 0)
+  let errorCodes = output.errors.compactMap {
+    int64Value(($0["error"] as? [String: Any])?["code"])
+  }
+  #expect(errorCodes.filter { $0 == -32011 }.count == requests.count - 1)
+  #expect(errorCodes.filter { $0 == -32602 }.count == 1)
+}
+
+@Test
+func rpcAllowedChatPreflightsImmediatelyBeforeSend() async throws {
+  let store = try RPCTestDatabase.makeStore()
+  let output = TestRPCOutput()
+  var boundaries: [String] = []
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    autoTyping: false,
+    output: output,
+    bridgeSendMessage: { handle, _, _, _, _, _, _ in
+      boundaries.append("send:\(handle)")
+      return ["guid": "locked-guid"]
+    },
+    bridgeAvailable: true,
+    allowedChat: "iMessage;+;chat123",
+    bridgePreflightAllowedChat: { handle, _, _, _ in
+      boundaries.append("preflight:\(handle)")
+      return completeAllowedChatPreflight()
+    }
+  )
+
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"locked-send","method":"send","params":{"chat_id":1,"text":"safe"}}"#
+  )
+
+  #expect(
+    boundaries == [
+      "preflight:iMessage;+;chat123",
+      "send:iMessage;+;chat123",
+    ])
+  let result = output.responses.first?["result"] as? [String: Any]
+  #expect(result?["guid"] as? String == "locked-guid")
+}
+
+@Test
+func rpcBridgePreflightReturnsOnlyContentFreeReadiness() async throws {
+  let store = try RPCTestDatabase.makeStore()
+  let output = TestRPCOutput()
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    autoTyping: false,
+    output: output,
+    bridgeAvailable: true,
+    allowedChat: "iMessage;+;chat123",
+    bridgePreflightAllowedChat: { _, _, _, _ in completeAllowedChatPreflight() }
+  )
+
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"preflight","method":"bridge.preflight"}"#
+  )
+
+  let result = output.responses.first?["result"] as? [String: Any]
+  #expect(result?["helper_ready"] as? Bool == true)
+  #expect(result?["allowed_chat_locked"] as? Bool == true)
+  #expect(result?["direct_chat"] as? Bool == true)
+  #expect(result?.values.allSatisfy { $0 is Bool } == true)
+  #expect(String(describing: result).contains("chat123") == false)
+}
+
+@Test
+func rpcEnrolledIdentityPreflightsBeforeAnyBaselineOrSubscription() async throws {
+  let store = try RPCTestDatabase.makeStore()
+  let output = TestRPCOutput()
+  let localAccount = String(repeating: "1", count: 64)
+  let helper = String(repeating: "2", count: 64)
+  let chat = String(repeating: "3", count: 64)
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    autoRead: false,
+    autoTyping: false,
+    output: output,
+    bridgeAvailable: true,
+    allowedChat: "iMessage;+;chat123",
+    expectedLocalAccountFingerprint: localAccount,
+    expectedHelperSHA256: helper,
+    expectedChatFingerprint: chat,
+    bridgePreflightAllowedChat: { _, expectedLocal, expectedHelper, expectedChat in
+      #expect(expectedLocal == localAccount)
+      #expect(expectedHelper == helper)
+      #expect(expectedChat == chat)
+      return completeEnrolledChatPreflight(
+        localAccount: localAccount,
+        helper: helper,
+        chat: chat
+      )
+    }
+  )
+
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"early-baseline","method":"watch.baseline","params":{"chat_identifier":"iMessage;+;chat123"}}"#
+  )
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"early-subscribe","method":"watch.subscribe","params":{"chat_identifier":"iMessage;+;chat123"}}"#
+  )
+  #expect(output.responses.isEmpty)
+  #expect(output.errors.count == 2)
+  #expect(
+    output.errors.allSatisfy {
+      int64Value(($0["error"] as? [String: Any])?["code"]) == -32011
+    })
+
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"preflight","method":"bridge.preflight"}"#
+  )
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"baseline","method":"watch.baseline","params":{"chat_identifier":"iMessage;+;chat123"}}"#
+  )
+
+  #expect(output.responses.count == 2)
+  let preflight = output.responses[0]["result"] as? [String: Any]
+  #expect(preflight?["local_account_fingerprint"] as? String == localAccount)
+  #expect(preflight?["loaded_helper_sha256"] as? String == helper)
+  #expect(preflight?["chat_fingerprint"] as? String == chat)
+  let baseline = output.responses[1]["result"] as? [String: Any]
+  #expect(int64Value(baseline?["since_rowid"]) == 5)
+  #expect(baseline?["adapter_contract"] as? String == currentRoseMessagesAdapterContract)
+  #expect(output.notifications.isEmpty)
+}
+
+@Test
+func rpcMissingHelperIsDefinitelyNotSentBeforeBridgeDispatch() async throws {
+  let store = try RPCTestDatabase.makeStore()
+  let output = TestRPCOutput()
+  var sendCalls = 0
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    autoTyping: false,
+    output: output,
+    bridgeSendMessage: { _, _, _, _, _, _, _ in
+      sendCalls += 1
+      return ["guid": "must-not-send"]
+    },
+    bridgeAvailable: true,
+    allowedChat: "iMessage;+;chat123",
+    bridgePreflightAllowedChat: { _, _, _, _ in
+      throw IMCoreBridgeError.relaunchRequired
+    }
+  )
+
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"missing-helper","method":"send","params":{"chat_id":1,"text":"must not send"}}"#
+  )
+
+  #expect(sendCalls == 0)
+  let error = output.errors.first?["error"] as? [String: Any]
+  #expect(int64Value(error?["code"]) == -32010)
+  #expect(error?["data"] as? String == "definitely_not_sent")
+}
+
+@Test
+func rpcChangedHelperGenerationIsDefinitelyNotSentBeforeBridgeDispatch() async throws {
+  let store = try RPCTestDatabase.makeStore()
+  let output = TestRPCOutput()
+  let localAccount = String(repeating: "1", count: 64)
+  let helper = String(repeating: "2", count: 64)
+  let chat = String(repeating: "3", count: 64)
+  var generation = String(repeating: "5", count: 64)
+  var sendCalls = 0
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    autoTyping: false,
+    output: output,
+    bridgeSendMessage: { _, _, _, _, _, _, _ in
+      sendCalls += 1
+      return ["guid": "must-not-send"]
+    },
+    bridgeAvailable: true,
+    allowedChat: "iMessage;+;chat123",
+    expectedLocalAccountFingerprint: localAccount,
+    expectedHelperSHA256: helper,
+    expectedChatFingerprint: chat,
+    bridgePreflightAllowedChat: { _, _, _, _ in
+      completeEnrolledChatPreflight(
+        localAccount: localAccount,
+        helper: helper,
+        chat: chat,
+        generation: generation
+      )
+    }
+  )
+
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"preflight","method":"bridge.preflight"}"#
+  )
+  generation = String(repeating: "6", count: 64)
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"changed-helper","method":"send","params":{"chat_id":1,"text":"must not send"}}"#
+  )
+
+  #expect(sendCalls == 0)
+  let error = output.errors.first?["error"] as? [String: Any]
+  #expect(int64Value(error?["code"]) == -32010)
+  #expect(error?["data"] as? String == "definitely_not_sent")
+}
+
+@Test
 func rpcSendRejectsMissingTextAndFile() async throws {
   let store = try RPCTestDatabase.makeStore()
   let output = TestRPCOutput()
@@ -280,6 +617,36 @@ func rpcSendRejectsMissingTextAndFile() async throws {
   #expect(output.errors.count == 1)
   let error = output.errors[0]["error"] as? [String: Any]
   #expect(int64Value(error?["code"]) == -32602)
+}
+
+private func completeAllowedChatPreflight() -> [String: Any] {
+  [
+    "allowed_chat_locked": true,
+    "expected_chat_match": true,
+    "chat_found": true,
+    "direct_chat": true,
+    "chat_identifier_match": true,
+    "participant_match": true,
+    "chat_guid_present": true,
+  ]
+}
+
+private func completeEnrolledChatPreflight(
+  localAccount: String,
+  helper: String,
+  chat: String,
+  generation: String = String(repeating: "5", count: 64)
+) -> [String: Any] {
+  var result = completeAllowedChatPreflight()
+  result["local_account_match"] = true
+  result["loaded_helper_match"] = true
+  result["chat_fingerprint_match"] = true
+  result["local_account_fingerprint"] = localAccount
+  result["loaded_helper_sha256"] = helper
+  result["chat_fingerprint"] = chat
+  result["helper_process_fingerprint"] = String(repeating: "4", count: 64)
+  result["helper_generation_fingerprint"] = generation
+  return result
 }
 
 @Test
@@ -428,9 +795,10 @@ func rpcWatchSubscribeEmitsNotificationAndUnsubscribe() async throws {
   #expect(subscription > 0)
   #expect(int64Value(result?["since_rowid"]) == -1)
   #expect(int64Value(result?["max_rowid"]) == 5)
-  #expect((result?["provider_epoch"] as? String)?.hasPrefix(
-    "messages-db-v2:memory:scope:"
-  ) == true)
+  #expect(
+    (result?["provider_epoch"] as? String)?.hasPrefix(
+      "messages-db-v4:memory:scope:"
+    ) == true)
   #expect(result?["pending_history_regression"] as? Bool == false)
   #expect(result?["adapter_contract"] as? String == currentRoseMessagesAdapterContract)
 
@@ -469,22 +837,26 @@ func rpcWatchRefreshesAudienceMembershipForEveryDeliveredRow() async throws {
 
   var delivered: [String: Any]?
   for _ in 0..<50 {
-    delivered = output.notifications.compactMap { notification -> [String: Any]? in
-      guard let params = notification["params"] as? [String: Any],
-            let message = params["message"] as? [String: Any],
-            int64Value(message["id"]) == 6 else { return nil }
-      return message
-    }.first
+    delivered =
+      output.notifications.compactMap { notification -> [String: Any]? in
+        guard let params = notification["params"] as? [String: Any],
+          let message = params["message"] as? [String: Any],
+          int64Value(message["id"]) == 6
+        else { return nil }
+        return message
+      }.first
     if delivered != nil { break }
     try await Task.sleep(nanoseconds: 50_000_000)
   }
 
   #expect((delivered?["participants"] as? [String])?.contains("+456") == true)
-  #expect(delivered?["audience_revision"] as? Int == stableAudienceRevision(
-    chatGUID: "iMessage;+;chat123",
-    participants: ["+123", "+456", "me@icloud.com"],
-    sender: "+123"
-  ))
+  #expect(
+    delivered?["audience_revision"] as? Int
+      == stableAudienceRevision(
+        chatGUID: "iMessage;+;chat123",
+        participants: ["+123", "+456", "me@icloud.com"],
+        sender: "+123"
+      ))
 }
 
 @Test
@@ -511,14 +883,80 @@ func rpcWatchPinsBeforeDeliveringAReassociatedChat() async throws {
   }
   let deliveredRowSix = output.notifications.contains { notification in
     guard notification["method"] as? String == "message",
-          let params = notification["params"] as? [String: Any],
-          let message = params["message"] as? [String: Any] else { return false }
+      let params = notification["params"] as? [String: Any],
+      let message = params["message"] as? [String: Any]
+    else { return false }
     return int64Value(message["id"]) == 6
   }
   let errorText = output.notifications.compactMap { notification -> String? in
     guard notification["method"] as? String == "error",
-          let params = notification["params"] as? [String: Any],
-          let error = params["error"] as? [String: Any] else { return nil }
+      let params = notification["params"] as? [String: Any],
+      let error = params["error"] as? [String: Any]
+    else { return nil }
+    return error["message"] as? String
+  }.first
+
+  #expect(deliveredRowSix == false)
+  #expect(errorText?.contains("subscription identity changed") == true)
+}
+
+@Test
+func rpcWatchPinsBeforeDeliveringAfterEnrolledHelperIdentityChanges() async throws {
+  let (store, db) = try RPCTestDatabase.makeMutableStore()
+  let output = TestRPCOutput()
+  let localAccount = String(repeating: "1", count: 64)
+  let helper = String(repeating: "2", count: 64)
+  let chat = String(repeating: "3", count: 64)
+  let generation = LockedValue(String(repeating: "5", count: 64))
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    autoTyping: false,
+    output: output,
+    bridgeAvailable: true,
+    allowedChat: "iMessage;+;chat123",
+    expectedLocalAccountFingerprint: localAccount,
+    expectedHelperSHA256: helper,
+    expectedChatFingerprint: chat,
+    bridgePreflightAllowedChat: { _, _, _, _ in
+      completeEnrolledChatPreflight(
+        localAccount: localAccount,
+        helper: helper,
+        chat: chat,
+        generation: generation.get()
+      )
+    }
+  )
+
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"preflight","method":"bridge.preflight"}"#
+  )
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"subscribe","method":"watch.subscribe","params":{"chat_identifier":"iMessage;+;chat123","since_rowid":5}}"#
+  )
+  generation.set(String(repeating: "6", count: 64))
+  try db.run(
+    "INSERT INTO message(ROWID, handle_id, text, date, is_from_me, service, account_guid) VALUES (6, 1, 'must stay quarantined', ?, 0, 'iMessage', 'account-b')",
+    RPCTestDatabase.appleEpoch(Date().addingTimeInterval(1))
+  )
+  try db.run("INSERT INTO chat_message_join(chat_id, message_id) VALUES (1, 6)")
+
+  for _ in 0..<50 {
+    if output.notifications.contains(where: { $0["method"] as? String == "error" }) { break }
+    try await Task.sleep(nanoseconds: 50_000_000)
+  }
+  let deliveredRowSix = output.notifications.contains { notification in
+    guard notification["method"] as? String == "message",
+      let params = notification["params"] as? [String: Any],
+      let message = params["message"] as? [String: Any]
+    else { return false }
+    return int64Value(message["id"]) == 6
+  }
+  let errorText = output.notifications.compactMap { notification -> String? in
+    guard notification["method"] as? String == "error",
+      let params = notification["params"] as? [String: Any],
+      let error = params["error"] as? [String: Any]
+    else { return nil }
     return error["message"] as? String
   }.first
 
@@ -539,25 +977,64 @@ func rpcWatchSubscribeReturnsFreshDeterministicBaselineWithoutReplayingHistory()
   let result = output.responses.first?["result"] as? [String: Any]
   #expect(int64Value(result?["since_rowid"]) == 5)
   #expect(int64Value(result?["max_rowid"]) == 5)
-  #expect((result?["provider_epoch"] as? String)?.hasPrefix(
-    "messages-db-v2:memory:scope:"
-  ) == true)
+  #expect(
+    (result?["provider_epoch"] as? String)?.hasPrefix(
+      "messages-db-v4:memory:scope:"
+    ) == true)
   try await Task.sleep(nanoseconds: 100_000_000)
   #expect(output.notifications.isEmpty)
 }
 
 @Test
-func providerEpochChangesWithChatAndAccountScope() throws {
+func providerEpochStaysStableForNewMessageAccountValuesAndChangesWithChatScope() throws {
   let (store, db) = try RPCTestDatabase.makeMutableStore()
   let original = try store.providerEpoch(chatID: 1)
 
-  try db.run("UPDATE message SET account_guid = 'account-b' WHERE ROWID = 5")
-  let changedAccount = try store.providerEpoch(chatID: 1)
-  #expect(changedAccount != original)
+  try db.run(
+    "INSERT INTO message(ROWID, handle_id, text, date, is_from_me, service, account_guid) VALUES (6, 1, 'new direction', ?, 1, 'iMessage', 'account-b')",
+    RPCTestDatabase.appleEpoch(Date().addingTimeInterval(1))
+  )
+  try db.run("INSERT INTO chat_message_join(chat_id, message_id) VALUES (1, 6)")
+  let afterNewAccountValue = try store.providerEpoch(chatID: 1)
+  #expect(afterNewAccountValue == original)
 
   try db.run("UPDATE chat SET chat_identifier = 'iMessage;+;other-chat' WHERE ROWID = 1")
   let changedChat = try store.providerEpoch(chatID: 1)
-  #expect(changedChat != changedAccount)
+  #expect(changedChat != afterNewAccountValue)
+}
+
+@Test
+func providerDatabaseEpochUsesStableVolumeIdentity() throws {
+  let created = Date(timeIntervalSince1970: 1_700_000_000.125)
+  let original = try ProviderIdentity.databaseEpoch(
+    volumeUUID: "A1B2-C3D4",
+    fileNumber: 42,
+    creationDate: created
+  )
+  let sameAfterRemount = try ProviderIdentity.databaseEpoch(
+    volumeUUID: "a1b2-c3d4",
+    fileNumber: 42,
+    creationDate: created
+  )
+  let replacement = try ProviderIdentity.databaseEpoch(
+    volumeUUID: "a1b2-c3d4",
+    fileNumber: 43,
+    creationDate: created
+  )
+  let subMillisecondReplacement = try ProviderIdentity.databaseEpoch(
+    volumeUUID: "a1b2-c3d4",
+    fileNumber: 42,
+    creationDate: created.addingTimeInterval(0.000_5)
+  )
+  let creationIdentity = String(
+    format: "%016llx",
+    created.timeIntervalSinceReferenceDate.bitPattern
+  )
+
+  #expect(original == "messages-db-v4:a1b2-c3d4:42:\(creationIdentity)")
+  #expect(sameAfterRemount == original)
+  #expect(replacement != original)
+  #expect(subMillisecondReplacement != original)
 }
 
 @Test

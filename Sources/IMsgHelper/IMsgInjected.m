@@ -9,6 +9,7 @@
 
 #import <Foundation/Foundation.h>
 #import <CoreLocation/CoreLocation.h>
+#import <CommonCrypto/CommonDigest.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <unistd.h>
@@ -20,6 +21,8 @@
 static NSString *kCommandFile = nil;
 static NSString *kResponseFile = nil;
 static NSString *kLockFile = nil;
+static NSString *kAllowedChat = nil;
+static NSString *kHelperGenerationFingerprint = nil;
 static dispatch_source_t fileWatchSource = nil;
 static NSTimer *fileWatchTimer = nil;
 static int lockFd = -1;
@@ -33,6 +36,150 @@ static void initFilePaths(void) {
         kResponseFile = [containerPath stringByAppendingPathComponent:@".imsg-plus-response.json"];
         kLockFile = [containerPath stringByAppendingPathComponent:@".imsg-plus-ready"];
     }
+}
+
+static NSString* normalizedChatTarget(NSString *value) {
+    if (![value isKindOfClass:[NSString class]]) {
+        return @"";
+    }
+    return [[value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
+}
+
+static BOOL allowedChatMatches(NSString *value) {
+    if (!kAllowedChat || kAllowedChat.length == 0) {
+        return YES;
+    }
+    return [normalizedChatTarget(value) isEqualToString:normalizedChatTarget(kAllowedChat)];
+}
+
+static NSString* sha256Hex(NSData *data) {
+    if (!data) return @"";
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+    NSMutableString *hex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+    for (NSUInteger index = 0; index < CC_SHA256_DIGEST_LENGTH; index++) {
+        [hex appendFormat:@"%02x", digest[index]];
+    }
+    return hex;
+}
+
+static NSString* fingerprintValue(NSString *domain, NSString *value) {
+    if (!domain || !value) return @"";
+    NSMutableData *data = [NSMutableData data];
+    [data appendData:[domain dataUsingEncoding:NSUTF8StringEncoding]];
+    const unsigned char separator = 0;
+    [data appendBytes:&separator length:1];
+    [data appendData:[value dataUsingEncoding:NSUTF8StringEncoding]];
+    return sha256Hex(data);
+}
+
+static BOOL isSHA256(NSString *value) {
+    if (![value isKindOfClass:[NSString class]] || value.length != 64) return NO;
+    NSCharacterSet *invalid = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"] invertedSet];
+    return [value rangeOfCharacterFromSet:invalid].location == NSNotFound;
+}
+
+static NSString* loadedHelperSHA256(void) {
+    Dl_info info = {0};
+    if (dladdr((const void *)&loadedHelperSHA256, &info) == 0 || !info.dli_fname) {
+        return @"";
+    }
+    NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:info.dli_fname]];
+    return sha256Hex(data);
+}
+
+static NSString* helperProcessFingerprint(void) {
+    return fingerprintValue(@"rose-helper-process-v1", [NSString stringWithFormat:@"%d", getpid()]);
+}
+
+static void addAccountIdentityCandidates(NSMutableSet<NSString *> *candidates, id value) {
+    if (!value || value == [NSNull null]) return;
+    if ([value isKindOfClass:[NSString class]]) {
+        NSString *normalized = normalizedChatTarget((NSString *)value);
+        if (normalized.length > 0) [candidates addObject:normalized];
+        return;
+    }
+    if ([value isKindOfClass:[NSArray class]] || [value isKindOfClass:[NSSet class]]) {
+        for (id entry in value) addAccountIdentityCandidates(candidates, entry);
+        return;
+    }
+    if ([value respondsToSelector:@selector(ID)]) {
+        addAccountIdentityCandidates(
+            candidates,
+            ((id (*)(id, SEL))objc_msgSend)(value, @selector(ID))
+        );
+    }
+}
+
+static NSSet<NSString *>* activeLocalAccountFingerprints(void) {
+    NSMutableSet<NSString *> *identities = [NSMutableSet set];
+    Class serviceClass = NSClassFromString(@"IMServiceImpl");
+    Class accountControllerClass = NSClassFromString(@"IMAccountController");
+    if (!serviceClass || !accountControllerClass) return [NSSet set];
+
+    id service = [serviceClass performSelector:@selector(iMessageService)];
+    id accountController = [accountControllerClass performSelector:@selector(sharedInstance)];
+    if (!service || !accountController ||
+        ![accountController respondsToSelector:@selector(bestAccountForService:)]) {
+        return [NSSet set];
+    }
+    id account = [accountController performSelector:@selector(bestAccountForService:) withObject:service];
+    if (!account) return [NSSet set];
+
+    NSArray<NSString *> *selectors = @[
+        @"login",
+        @"serviceLogin",
+        @"uniqueID",
+        @"accountID",
+        @"ID",
+        @"aliases",
+        @"vettedAliases",
+        @"handles",
+        @"imHandles",
+    ];
+    for (NSString *key in selectors) {
+        @try {
+            addAccountIdentityCandidates(identities, [account valueForKey:key]);
+        } @catch (NSException *exception) {
+            // Private IMCore account shapes vary by macOS release. Missing
+            // identity fields are ignored; the expected enrolled alias must
+            // still match one of the fields that is actually available.
+        }
+    }
+
+    NSMutableSet<NSString *> *fingerprints = [NSMutableSet set];
+    for (NSString *identity in identities) {
+        [fingerprints addObject:fingerprintValue(@"rose-local-account-v1", identity)];
+    }
+    return fingerprints;
+}
+
+static NSString* directChatFingerprint(id chat) {
+    if (!chat) return @"";
+    NSString *chatGUID = @"";
+    NSString *chatIdentifier = @"";
+    if ([chat respondsToSelector:@selector(guid)]) {
+        chatGUID = [chat performSelector:@selector(guid)] ?: @"";
+    }
+    if ([chat respondsToSelector:@selector(chatIdentifier)]) {
+        chatIdentifier = [chat performSelector:@selector(chatIdentifier)] ?: @"";
+    }
+    NSMutableArray<NSString *> *participants = [NSMutableArray array];
+    if ([chat respondsToSelector:@selector(participants)]) {
+        for (id participant in [chat performSelector:@selector(participants)] ?: @[]) {
+            if ([participant respondsToSelector:@selector(ID)]) {
+                NSString *participantID = [participant performSelector:@selector(ID)];
+                NSString *normalized = normalizedChatTarget(participantID);
+                if (normalized.length > 0) [participants addObject:normalized];
+            }
+        }
+    }
+    [participants sortUsingSelector:@selector(compare:)];
+    NSString *binding = [NSString stringWithFormat:@"%@\n%@\n%@",
+        normalizedChatTarget(chatGUID),
+        normalizedChatTarget(chatIdentifier),
+        [participants componentsJoinedByString:@"\n"]];
+    return fingerprintValue(@"rose-direct-chat-v1", binding);
 }
 
 #pragma mark - Forward Declarations for IMCore Classes
@@ -347,7 +494,7 @@ static id findChat(NSString *identifier) {
         if ([identifier containsString:@";"]) {
             chat = [registry performSelector:guidSel withObject:identifier];
             if (chat) {
-                NSLog(@"[imsg-plus] Found chat via existingChatWithGUID: %@", identifier);
+                NSLog(@"[imsg-plus] Found chat via existingChatWithGUID");
                 return chat;
             }
         }
@@ -358,7 +505,7 @@ static id findChat(NSString *identifier) {
             NSString *fullGUID = [prefix stringByAppendingString:identifier];
             chat = [registry performSelector:guidSel withObject:fullGUID];
             if (chat) {
-                NSLog(@"[imsg-plus] Found chat via existingChatWithGUID: %@", fullGUID);
+                NSLog(@"[imsg-plus] Found chat via constructed GUID");
                 return chat;
             }
         }
@@ -369,7 +516,7 @@ static id findChat(NSString *identifier) {
     if ([registry respondsToSelector:identSel]) {
         chat = [registry performSelector:identSel withObject:identifier];
         if (chat) {
-            NSLog(@"[imsg-plus] Found chat via existingChatWithChatIdentifier: %@", identifier);
+            NSLog(@"[imsg-plus] Found chat via existingChatWithChatIdentifier");
             return chat;
         }
     }
@@ -382,7 +529,7 @@ static id findChat(NSString *identifier) {
             NSLog(@"[imsg-plus] allExistingChats returned nil");
             return nil;
         }
-        NSLog(@"[imsg-plus] Searching %lu chats for identifier: %@", (unsigned long)allChats.count, identifier);
+        NSLog(@"[imsg-plus] Searching %lu chats for an exact target", (unsigned long)allChats.count);
 
         // Normalize the search identifier (strip non-digit chars for phone numbers)
         NSString *normalizedIdentifier = nil;
@@ -403,7 +550,7 @@ static id findChat(NSString *identifier) {
             if ([aChat respondsToSelector:@selector(guid)]) {
                 NSString *chatGUID = [aChat performSelector:@selector(guid)];
                 if ([chatGUID isEqualToString:identifier]) {
-                    NSLog(@"[imsg-plus] Found chat by GUID exact match: %@", chatGUID);
+                    NSLog(@"[imsg-plus] Found chat by GUID exact match");
                     return aChat;
                 }
             }
@@ -412,7 +559,7 @@ static id findChat(NSString *identifier) {
             if ([aChat respondsToSelector:@selector(chatIdentifier)]) {
                 NSString *chatId = [aChat performSelector:@selector(chatIdentifier)];
                 if ([chatId isEqualToString:identifier]) {
-                    NSLog(@"[imsg-plus] Found chat by chatIdentifier exact match: %@", chatId);
+                    NSLog(@"[imsg-plus] Found chat by chatIdentifier exact match");
                     return aChat;
                 }
             }
@@ -428,7 +575,7 @@ static id findChat(NSString *identifier) {
                         NSString *handleID = [handle performSelector:@selector(ID)];
                         // Exact match
                         if ([handleID isEqualToString:identifier]) {
-                            NSLog(@"[imsg-plus] Found chat by participant exact match: %@", handleID);
+                            NSLog(@"[imsg-plus] Found chat by participant exact match");
                             return aChat;
                         }
                         // Normalized phone number match (compare digits only)
@@ -441,9 +588,9 @@ static id findChat(NSString *identifier) {
                                 }
                             }
                             if (handleDigits.length >= 10 &&
-                                [handleDigits hasSuffix:normalizedIdentifier] ||
-                                [normalizedIdentifier hasSuffix:handleDigits]) {
-                                NSLog(@"[imsg-plus] Found chat by normalized phone match: %@ ~ %@", handleID, identifier);
+                                ([handleDigits hasSuffix:normalizedIdentifier] ||
+                                 [normalizedIdentifier hasSuffix:handleDigits])) {
+                                NSLog(@"[imsg-plus] Found chat by normalized phone match");
                                 return aChat;
                             }
                         }
@@ -453,7 +600,7 @@ static id findChat(NSString *identifier) {
         }
     }
 
-    NSLog(@"[imsg-plus] Chat not found for identifier: %@", identifier);
+    NSLog(@"[imsg-plus] Chat not found for exact target");
     return nil;
 }
 
@@ -971,9 +1118,95 @@ static NSDictionary* handleStatus(NSInteger requestId, NSDictionary *params) {
         @"edit_message_available": @(hasRegistry),
         @"unsend_message_available": @(hasRegistry),
         @"attachment_send_available": @(hasFileTransferCenter),
+        @"allowed_chat_locked": @(kAllowedChat.length > 0),
     } mutableCopy];
-    if (_diagLog.count > 0) {
-        result[@"send_diag"] = [_diagLog copy];
+    return successResponse(requestId, result);
+}
+
+static NSDictionary* handlePreflightAllowedChat(NSInteger requestId, NSDictionary *params) {
+    if (!kAllowedChat || kAllowedChat.length == 0) {
+        return errorResponse(requestId, @"Allowed chat lock is not configured");
+    }
+
+    NSString *expectedHandle = params[@"expected_handle"];
+    if (!allowedChatMatches(expectedHandle)) {
+        return errorResponse(requestId, @"Expected chat does not match the helper lock");
+    }
+
+    id chat = findChat(kAllowedChat);
+    if (!chat) {
+        return errorResponse(requestId, @"Allowed chat was not found");
+    }
+
+    NSString *chatGUID = @"";
+    NSString *chatIdentifier = @"";
+    if ([chat respondsToSelector:@selector(guid)]) {
+        chatGUID = [chat performSelector:@selector(guid)] ?: @"";
+    }
+    if ([chat respondsToSelector:@selector(chatIdentifier)]) {
+        chatIdentifier = [chat performSelector:@selector(chatIdentifier)] ?: @"";
+    }
+
+    BOOL participantMatch = NO;
+    if ([chat respondsToSelector:@selector(participants)]) {
+        NSArray *participants = [chat performSelector:@selector(participants)];
+        for (id participant in participants ?: @[]) {
+            if ([participant respondsToSelector:@selector(ID)]) {
+                NSString *participantID = [participant performSelector:@selector(ID)];
+                if (allowedChatMatches(participantID)) {
+                    participantMatch = YES;
+                    break;
+                }
+            }
+        }
+    }
+
+    BOOL identifierMatch = allowedChatMatches(chatIdentifier);
+    BOOL directChat = ![chatGUID containsString:@";+;"] && ![chatIdentifier hasPrefix:@"chat"];
+    NSString *expectedLocalAccountFingerprint = params[@"expected_local_account_fingerprint"];
+    NSString *expectedHelperSHA256 = params[@"expected_helper_sha256"];
+    NSString *expectedChatFingerprint = params[@"expected_chat_fingerprint"];
+    BOOL identityExpectationProvided = expectedLocalAccountFingerprint ||
+        expectedHelperSHA256 || expectedChatFingerprint;
+    if (identityExpectationProvided &&
+        (!isSHA256(expectedLocalAccountFingerprint) || !isSHA256(expectedHelperSHA256) ||
+         (expectedChatFingerprint && !isSHA256(expectedChatFingerprint)))) {
+        return errorResponse(requestId, @"Expected identity fingerprints are invalid");
+    }
+
+    NSString *loadedHelperHash = loadedHelperSHA256();
+    NSString *chatFingerprint = directChatFingerprint(chat);
+    if (!isSHA256(loadedHelperHash) || !isSHA256(chatFingerprint) ||
+        !isSHA256(kHelperGenerationFingerprint)) {
+        return errorResponse(requestId, @"Messages identity preflight failed");
+    }
+
+    NSMutableDictionary *result = [@{
+        @"allowed_chat_locked": @YES,
+        @"expected_chat_match": @YES,
+        @"chat_found": @YES,
+        @"direct_chat": @(directChat),
+        @"chat_identifier_match": @(identifierMatch),
+        @"participant_match": @(participantMatch),
+        @"chat_guid_present": @(chatGUID.length > 0),
+        @"loaded_helper_sha256": loadedHelperHash,
+        @"chat_fingerprint": chatFingerprint,
+        @"helper_process_fingerprint": helperProcessFingerprint(),
+        @"helper_generation_fingerprint": kHelperGenerationFingerprint,
+    } mutableCopy];
+    if (identityExpectationProvided) {
+        NSSet<NSString *> *localAccountFingerprints = activeLocalAccountFingerprints();
+        BOOL localAccountMatch = [localAccountFingerprints containsObject:expectedLocalAccountFingerprint];
+        BOOL loadedHelperMatch = [loadedHelperHash isEqualToString:expectedHelperSHA256];
+        BOOL chatFingerprintMatch = !expectedChatFingerprint ||
+            [chatFingerprint isEqualToString:expectedChatFingerprint];
+        if (!localAccountMatch || !loadedHelperMatch || !chatFingerprintMatch) {
+            return errorResponse(requestId, @"Messages identity preflight failed");
+        }
+        result[@"local_account_match"] = @YES;
+        result[@"local_account_fingerprint"] = expectedLocalAccountFingerprint;
+        result[@"loaded_helper_match"] = @YES;
+        result[@"chat_fingerprint_match"] = @(chatFingerprintMatch);
     }
     return successResponse(requestId, result);
 }
@@ -3780,6 +4013,38 @@ static NSDictionary* handleGetLocations(NSInteger requestId, NSDictionary *param
 
 #pragma mark - Command Router
 
+static NSDictionary* enforceAllowedChatForCommand(
+    NSInteger requestId,
+    NSString *action,
+    NSDictionary *params
+) {
+    if (!kAllowedChat || kAllowedChat.length == 0) {
+        return nil;
+    }
+
+    if ([action isEqualToString:@"ping"] ||
+        [action isEqualToString:@"status"] ||
+        [action isEqualToString:@"preflight_allowed_chat"]) {
+        return nil;
+    }
+
+    NSSet *targetedActions = [NSSet setWithArray:@[
+        @"typing",
+        @"read",
+        @"react",
+        @"rename_chat",
+        @"remove_participant",
+        @"send_message",
+        @"edit_message",
+        @"unsend_message",
+    ]];
+    if ([targetedActions containsObject:action] && allowedChatMatches(params[@"handle"])) {
+        return nil;
+    }
+
+    return errorResponse(requestId, @"Operation is outside the configured allowed chat");
+}
+
 static NSDictionary* processCommand(NSDictionary *command) {
     NSNumber *requestIdNum = command[@"id"];
     NSInteger requestId = requestIdNum ? [requestIdNum integerValue] : 0;
@@ -3787,6 +4052,11 @@ static NSDictionary* processCommand(NSDictionary *command) {
     NSDictionary *params = command[@"params"] ?: @{};
 
     NSLog(@"[imsg-plus] Processing command: %@ (id=%ld)", action, (long)requestId);
+
+    NSDictionary *lockError = enforceAllowedChatForCommand(requestId, action, params);
+    if (lockError) {
+        return lockError;
+    }
 
     if ([action isEqualToString:@"typing"]) {
         return handleTyping(requestId, params);
@@ -3796,6 +4066,8 @@ static NSDictionary* processCommand(NSDictionary *command) {
         return handleReact(requestId, params);
     } else if ([action isEqualToString:@"status"]) {
         return handleStatus(requestId, params);
+    } else if ([action isEqualToString:@"preflight_allowed_chat"]) {
+        return handlePreflightAllowedChat(requestId, params);
     } else if ([action isEqualToString:@"list_chats"]) {
         return handleListChats(requestId, params);
     } else if ([action isEqualToString:@"create_chat"]) {
@@ -3919,6 +4191,19 @@ static void startFileWatcher(void) {
 __attribute__((constructor))
 static void injectedInit(void) {
     NSLog(@"[imsg-plus] Dylib injected into %@", [[NSProcessInfo processInfo] processName]);
+    NSString *generationSeed = [NSString stringWithFormat:@"%d:%f:%@",
+        getpid(),
+        [NSProcessInfo processInfo].systemUptime,
+        [[NSUUID UUID] UUIDString]];
+    kHelperGenerationFingerprint = fingerprintValue(@"rose-helper-generation-v1", generationSeed);
+
+    NSString *configuredAllowedChat = [NSProcessInfo processInfo].environment[@"IMSG_PLUS_ALLOWED_CHAT"];
+    configuredAllowedChat = [configuredAllowedChat stringByTrimmingCharactersInSet:
+        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (configuredAllowedChat.length > 0) {
+        kAllowedChat = [configuredAllowedChat copy];
+        NSLog(@"[imsg-plus] Allowed-chat lock enabled");
+    }
 
     // Inject compatibility methods for IMCore
     injectCompatibilityMethods();

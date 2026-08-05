@@ -21,11 +21,17 @@ final class RPCServer {
   private let autoRead: Bool
   private let autoTyping: Bool
   private let bridgeAvailable: Bool
+  private let allowedChat: String?
+  private let expectedLocalAccountFingerprint: String?
+  private let expectedHelperSHA256: String?
+  private let expectedChatFingerprint: String?
+  private let bridgePreflightAllowedChat: BridgePreflightOperation
   private let contactResolver: ContactResolving?
   private let getLocations: (String?) async throws -> [FriendLocation]
   private let getLocationsResponse: (String?, Bool) async throws -> [[String: Any]]
   private var nextSubscriptionID = 1
   private var subscriptions: [Int: Task<Void, Never>] = [:]
+  private var enrolledHelperGenerationFingerprint: String?
 
   init(
     store: MessageStore,
@@ -39,6 +45,19 @@ final class RPCServer {
       ) async throws -> [String: Any] = RPCServer.defaultBridgeSendMessage,
     contactResolver: ContactResolving? = ContactResolver(),
     bridgeAvailable: Bool? = nil,
+    allowedChat: String? = nil,
+    expectedLocalAccountFingerprint: String? = nil,
+    expectedHelperSHA256: String? = nil,
+    expectedChatFingerprint: String? = nil,
+    bridgePreflightAllowedChat:
+      @escaping (String, String?, String?, String?) async throws -> [String: Any] = {
+        try await IMCoreBridge.shared.preflightAllowedChat(
+          handle: $0,
+          expectedLocalAccountFingerprint: $1,
+          expectedHelperSHA256: $2,
+          expectedChatFingerprint: $3
+        )
+      },
     getLocations: @escaping (String?) async throws -> [FriendLocation] = {
       try await IMCoreBridge.shared.getLocations(handle: $0)
     },
@@ -57,6 +76,12 @@ final class RPCServer {
     self.bridgeAvailable = available
     self.autoRead = autoRead ?? available
     self.autoTyping = autoTyping ?? available
+    let normalizedAllowedChat = allowedChat?.trimmingCharacters(in: .whitespacesAndNewlines)
+    self.allowedChat = normalizedAllowedChat?.isEmpty == false ? normalizedAllowedChat : nil
+    self.expectedLocalAccountFingerprint = expectedLocalAccountFingerprint
+    self.expectedHelperSHA256 = expectedHelperSHA256
+    self.expectedChatFingerprint = expectedChatFingerprint
+    self.bridgePreflightAllowedChat = BridgePreflightOperation(bridgePreflightAllowedChat)
     self.getLocations = getLocations
     self.getLocationsResponse = getLocationsResponse
   }
@@ -105,6 +130,7 @@ final class RPCServer {
     let id = request["id"]
 
     do {
+      try enforceAllowedChatReadScope(method)
       switch method {
       case "chats.list":
         let limit = intParam(params["limit"]) ?? 20
@@ -166,9 +192,22 @@ final class RPCServer {
         respond(id: id, result: ["messages": payloads])
       case "locations.list", "location.get":
         try await handleLocationsList(params: params, id: id)
+      case "watch.baseline":
+        try requireEnrolledBridgePreflight()
+        try handleWatchBaseline(params: params, id: id)
       case "watch.subscribe":
+        try requireEnrolledBridgePreflight()
         let requestedChatIdentifier = stringParam(params["chat_identifier"])
         let requestedChatID = int64Param(params["chat_id"])
+        if let allowedChat {
+          guard requestedChatID == nil,
+            let requestedChatIdentifier,
+            chatTargetsMatch(requestedChatIdentifier, allowedChat)
+          else {
+            throw RPCError.invalidParams(
+              "watch subscription is outside the configured allowed chat")
+          }
+        }
         let chatID: Int64?
         if let requestedChatID {
           chatID = requestedChatID
@@ -192,9 +231,10 @@ final class RPCServer {
         }
         let sinceRowID = requestedSinceRowID ?? maxRowID
         let providerEpoch = try store.providerEpoch(chatID: chatID)
-        let pendingHistoryRegression = try requestedSinceRowID.map {
-          try store.pendingHistoryRegresses(afterRowID: $0, chatID: chatID)
-        } ?? false
+        let pendingHistoryRegression =
+          try requestedSinceRowID.map {
+            try store.pendingHistoryRegresses(afterRowID: $0, chatID: chatID)
+          } ?? false
         let participants = stringArrayParam(params["participants"])
         let startISO = stringParam(params["start"])
         let endISO = stringParam(params["end"])
@@ -223,6 +263,24 @@ final class RPCServer {
         let localBridgeAvailable = bridgeAvailable
         let localVerbose = verbose
         let localResolver = contactResolver
+        let localEnrolledBridgePreflight: SubscriptionBridgePreflight?
+        if requiresEnrolledBridgePreflight {
+          guard let allowedChat, let enrolledHelperGenerationFingerprint else {
+            throw RPCError.preflightFailed()
+          }
+          localEnrolledBridgePreflight = SubscriptionBridgePreflight(
+            handle: allowedChat,
+            expectation: BridgePreflightExpectation(
+              localAccountFingerprint: expectedLocalAccountFingerprint,
+              helperSHA256: expectedHelperSHA256,
+              chatFingerprint: expectedChatFingerprint,
+              helperGenerationFingerprint: enrolledHelperGenerationFingerprint
+            )
+          )
+        } else {
+          localEnrolledBridgePreflight = nil
+        }
+        let localBridgePreflightAllowedChat = bridgePreflightAllowedChat
         // Return the exact baseline before notifications can be emitted. A
         // durable consumer can save this baseline and resume after it without
         // racing the subscription startup.
@@ -245,7 +303,6 @@ final class RPCServer {
               configuration: localConfig
             ) {
               if Task.isCancelled { return }
-              if !localFilter.allows(message) { continue }
               guard localChatID == nil || message.chatID == localChatID else {
                 throw NSError(
                   domain: "imsg-plus.RPCServer",
@@ -261,6 +318,27 @@ final class RPCServer {
                   userInfo: [NSLocalizedDescriptionKey: "Messages subscription identity changed"]
                 )
               }
+              if let localEnrolledBridgePreflight {
+                do {
+                  let status = try await localBridgePreflightAllowedChat.call(
+                    handle: localEnrolledBridgePreflight.handle,
+                    expectation: localEnrolledBridgePreflight.expectation
+                  )
+                  _ = try validateBridgePreflightStatus(
+                    status,
+                    expectation: localEnrolledBridgePreflight.expectation
+                  )
+                } catch {
+                  throw NSError(
+                    domain: "imsg-plus.RPCServer",
+                    code: 3,
+                    userInfo: [
+                      NSLocalizedDescriptionKey: "Messages subscription identity changed"
+                    ]
+                  )
+                }
+              }
+              if !localFilter.allows(message) { continue }
               let payload = try buildMessagePayload(
                 store: localStore,
                 cache: localCache,
@@ -335,6 +413,8 @@ final class RPCServer {
       case "bridge.status":
         let status = try await IMCoreBridge.shared.getStatus()
         respond(id: id, result: status)
+      case "bridge.preflight":
+        try await handleBridgePreflight(id: id)
       default:
         output.sendError(id: id, error: RPCError.methodNotFound(method))
       }
@@ -403,33 +483,6 @@ final class RPCServer {
       throw RPCError.invalidParams("missing chat identifier or guid")
     }
 
-    // Auto-typing: simulate typing before sending
-    if autoTyping && bridgeAvailable {
-      let typingHandle = resolveTypingHandle(
-        recipient: recipient,
-        chatIdentifier: resolvedChatIdentifier,
-        chatGUID: resolvedChatGUID
-      )
-      if let handle = typingHandle {
-        do {
-          try await IMCoreBridge.shared.setTyping(for: handle, typing: true)
-          if verbose {
-            FileHandle.standardError.write(Data("[auto-typing] ON for \(handle)\n".utf8))
-          }
-          // Delay based on message length: ~1.5s base + up to 2.5s for longer messages, cap at 4s
-          let charCount = Double(text.count)
-          let baseDelay = 1.5
-          let extraDelay = min(charCount / 80.0 * 2.5, 2.5)
-          let totalDelay = min(baseDelay + extraDelay, 4.0)
-          try await Task.sleep(nanoseconds: UInt64(totalDelay * 1_000_000_000))
-        } catch {
-          if verbose {
-            FileHandle.standardError.write(Data("[auto-typing] error: \(error)\n".utf8))
-          }
-        }
-      }
-    }
-
     // Parse optional reply_to_guid
     let replyToGUID = stringParam(params["reply_to_guid"])
 
@@ -446,7 +499,9 @@ final class RPCServer {
     }
 
     guard bridgeAvailable else {
-      throw RPCError.internalError("IMCoreBridge not available (required for send)")
+      throw allowedChat == nil
+        ? RPCError.internalError("IMCoreBridge not available (required for send)")
+        : RPCError.preflightFailed()
     }
 
     let handle = resolveTypingHandle(
@@ -457,7 +512,30 @@ final class RPCServer {
     guard let handle else {
       throw RPCError.invalidParams("missing send handle")
     }
+    try enforceAllowedChat(handle)
+    try await preflightBridgeForAllowedChat(handle)
     let attachment: String? = file.isEmpty ? nil : file
+
+    // Auto-typing can cross the provider boundary, so it runs only after the
+    // exact helper/chat preflight. Roseclaw disables this automatic behavior
+    // and controls any typing state explicitly.
+    if autoTyping {
+      do {
+        try await IMCoreBridge.shared.setTyping(for: handle, typing: true)
+        if verbose {
+          FileHandle.standardError.write(Data("[auto-typing] ON for \(handle)\n".utf8))
+        }
+        let charCount = Double(text.count)
+        let baseDelay = 1.5
+        let extraDelay = min(charCount / 80.0 * 2.5, 2.5)
+        let totalDelay = min(baseDelay + extraDelay, 4.0)
+        try await Task.sleep(nanoseconds: UInt64(totalDelay * 1_000_000_000))
+      } catch {
+        if verbose {
+          FileHandle.standardError.write(Data("[auto-typing] error: \(error)\n".utf8))
+        }
+      }
+    }
 
     let sendStartedAt = Date()
     do {
@@ -467,11 +545,12 @@ final class RPCServer {
         stringParam(bridgeResult["guid"])
         ?? stringParam(bridgeResult["message_guid"])
         ?? stringParam(bridgeResult["messageGUID"])
-      let messageGUID = await resolvePersistedExtensionGUID(
-        chatID: chatID,
-        extensionPayload: extensionPayload,
-        since: sendStartedAt
-      ) ?? transientGUID
+      let messageGUID =
+        await resolvePersistedExtensionGUID(
+          chatID: chatID,
+          extensionPayload: extensionPayload,
+          since: sendStartedAt
+        ) ?? transientGUID
 
       // Turn off typing after send (fire-and-forget)
       if autoTyping && bridgeAvailable {
@@ -512,7 +591,7 @@ final class RPCServer {
       }
       respond(id: id, result: result)
     } catch {
-      throw RPCError.internalError(describeBridgeSendError(error))
+      throw rpcSendError(error)
     }
   }
 
@@ -630,9 +709,7 @@ final class RPCServer {
     guard let state = stringParam(params["state"]), state == "on" || state == "off" else {
       throw RPCError.invalidParams("state must be 'on' or 'off'")
     }
-    guard bridgeAvailable else {
-      throw RPCError.internalError("IMCoreBridge not available")
-    }
+    try await preflightProviderOperation(handle)
     try await IMCoreBridge.shared.setTyping(for: handle, typing: state == "on")
     respond(id: id, result: ["ok": true])
   }
@@ -641,9 +718,7 @@ final class RPCServer {
     guard let handle = stringParam(params["handle"]), !handle.isEmpty else {
       throw RPCError.invalidParams("handle is required")
     }
-    guard bridgeAvailable else {
-      throw RPCError.internalError("IMCoreBridge not available")
-    }
+    try await preflightProviderOperation(handle)
     try await IMCoreBridge.shared.markAsRead(handle: handle)
     respond(id: id, result: ["ok": true])
   }
@@ -665,9 +740,7 @@ final class RPCServer {
         "invalid reaction type: '\(typeStr)'. Valid: love, thumbsup, thumbsdown, haha, emphasis, question, or any emoji"
       )
     }
-    guard bridgeAvailable else {
-      throw RPCError.internalError("IMCoreBridge not available")
-    }
+    try await preflightProviderOperation(handle)
     try await IMCoreBridge.shared.sendTapback(to: handle, messageGUID: guid, type: tapbackType)
     var result: [String: Any] = [
       "ok": true,
@@ -683,6 +756,9 @@ final class RPCServer {
   }
 
   private func handleGroupCreate(params: [String: Any], id: Any?) async throws {
+    if allowedChat != nil {
+      throw RPCError.invalidParams("group creation is unavailable with an allowed chat lock")
+    }
     let addresses = stringArrayParam(params["addresses"])
     if addresses.isEmpty {
       throw RPCError.invalidParams("addresses is required (array of phone/email)")
@@ -709,9 +785,7 @@ final class RPCServer {
     guard let name = stringParam(params["name"]), !name.isEmpty else {
       throw RPCError.invalidParams("name is required")
     }
-    guard bridgeAvailable else {
-      throw RPCError.internalError("IMCoreBridge not available")
-    }
+    try await preflightProviderOperation(handle)
     try await IMCoreBridge.shared.renameChat(handle: handle, name: name)
     respond(id: id, result: ["ok": true, "handle": handle, "name": name])
   }
@@ -729,14 +803,12 @@ final class RPCServer {
     if text.isEmpty && (markdownText ?? "").isEmpty && extensionPayload == nil {
       throw RPCError.invalidParams("text, markdown_text, or extension payload is required")
     }
-    guard bridgeAvailable else {
-      throw RPCError.internalError("IMCoreBridge not available")
-    }
     var attrData: Data? = nil
     if let markdownText, !markdownText.isEmpty {
       attrData = MarkdownComposer.compose(markdownText)
     }
     let editText = text.isEmpty ? (markdownText ?? "") : text
+    try await preflightProviderOperation(handle)
     let bridgeResult = try await IMCoreBridge.shared.editMessage(
       handle: handle,
       messageGUID: guid,
@@ -760,10 +832,8 @@ final class RPCServer {
     guard let guid = stringParam(params["guid"]), !guid.isEmpty else {
       throw RPCError.invalidParams("guid is required")
     }
-    guard bridgeAvailable else {
-      throw RPCError.internalError("IMCoreBridge not available")
-    }
     let partIndex = intParam(params["part_index"]) ?? 0
+    try await preflightProviderOperation(handle)
     try await IMCoreBridge.shared.unsendMessage(
       handle: handle, messageGUID: guid, partIndex: partIndex)
     respond(
@@ -771,11 +841,13 @@ final class RPCServer {
   }
 
   private func handleLocationsList(params: [String: Any], id: Any?) async throws {
-    guard bridgeAvailable else {
+    let handle = stringParam(params["handle"])
+    if allowedChat != nil {
+      throw RPCError.invalidParams(
+        "location lookup is unavailable with a Messages destination lock")
+    } else if !bridgeAvailable {
       throw RPCError.internalError("IMCoreBridge not available")
     }
-
-    let handle = stringParam(params["handle"])
     let raw = boolParam(params["raw"]) ?? false
 
     if raw {
@@ -788,6 +860,57 @@ final class RPCServer {
     respond(id: id, result: ["locations": locations])
   }
 
+  private func handleWatchBaseline(params: [String: Any], id: Any?) throws {
+    let requestedChatIdentifier = stringParam(params["chat_identifier"])
+    let requestedChatID = int64Param(params["chat_id"])
+    if let allowedChat {
+      guard requestedChatID == nil,
+        let requestedChatIdentifier,
+        chatTargetsMatch(requestedChatIdentifier, allowedChat)
+      else {
+        throw RPCError.invalidParams(
+          "watch baseline is outside the configured allowed chat")
+      }
+    }
+    let chatID: Int64?
+    if let requestedChatID {
+      chatID = requestedChatID
+    } else if let requestedChatIdentifier, !requestedChatIdentifier.isEmpty {
+      guard let chat = try store.chatInfo(identifierOrGUID: requestedChatIdentifier) else {
+        throw RPCError.invalidParams("chat_identifier was not found")
+      }
+      chatID = chat.id
+    } else {
+      chatID = nil
+    }
+    let requestedSinceRowID = int64Param(params["since_rowid"])
+    if let requestedSinceRowID, requestedSinceRowID < -1 {
+      throw RPCError.invalidParams("since_rowid must be -1 or greater")
+    }
+    let maxRowID = try store.maxRowID()
+    if let requestedSinceRowID, requestedSinceRowID > maxRowID {
+      throw RPCError.invalidParams(
+        "since_rowid is ahead of the current Messages database; provider reset must be reviewed"
+      )
+    }
+    let sinceRowID = requestedSinceRowID ?? maxRowID
+    let providerEpoch = try store.providerEpoch(chatID: chatID)
+    let pendingHistoryRegression =
+      try requestedSinceRowID.map {
+        try store.pendingHistoryRegresses(afterRowID: $0, chatID: chatID)
+      } ?? false
+    respond(
+      id: id,
+      result: [
+        "since_rowid": sinceRowID,
+        "max_rowid": maxRowID,
+        "provider_epoch": providerEpoch,
+        "pending_history_regression": pendingHistoryRegression,
+        "adapter_contract": currentRoseMessagesAdapterContract,
+      ]
+    )
+  }
+
   /// Resolve the best handle for typing/read from send params
   private func resolveTypingHandle(recipient: String, chatIdentifier: String, chatGUID: String)
     -> String?
@@ -798,6 +921,235 @@ final class RPCServer {
     return nil
   }
 
+  private func handleBridgePreflight(id: Any?) async throws {
+    guard let allowedChat else {
+      throw RPCError.invalidParams("bridge preflight requires an allowed chat lock")
+    }
+    let status = try await preflightBridgeForAllowedChat(
+      allowedChat,
+      establishGeneration: true
+    )
+    respond(id: id, result: status)
+  }
+
+  @discardableResult
+  private func preflightBridgeForAllowedChat(
+    _ handle: String,
+    establishGeneration: Bool = false
+  ) async throws -> [String: Any] {
+    guard allowedChat != nil else { return [:] }
+    try enforceAllowedChat(handle)
+
+    let status: [String: Any]
+    do {
+      status = try await bridgePreflightAllowedChat.call(
+        handle: handle,
+        expectation: BridgePreflightExpectation(
+          localAccountFingerprint: expectedLocalAccountFingerprint,
+          helperSHA256: expectedHelperSHA256,
+          chatFingerprint: expectedChatFingerprint,
+          helperGenerationFingerprint: nil
+        )
+      )
+    } catch let error as IMCoreBridgeError {
+      if case .relaunchRequired = error {
+        throw RPCError.relaunchRequired()
+      }
+      throw RPCError.preflightFailed()
+    } catch {
+      throw RPCError.preflightFailed()
+    }
+
+    if requiresEnrolledBridgePreflight && !establishGeneration
+      && enrolledHelperGenerationFingerprint == nil
+    {
+      throw RPCError.relaunchRequired()
+    }
+    let validation = try validateBridgePreflightStatus(
+      status,
+      expectation: BridgePreflightExpectation(
+        localAccountFingerprint: expectedLocalAccountFingerprint,
+        helperSHA256: expectedHelperSHA256,
+        chatFingerprint: expectedChatFingerprint,
+        helperGenerationFingerprint: establishGeneration
+          ? nil : enrolledHelperGenerationFingerprint
+      )
+    )
+    if establishGeneration {
+      enrolledHelperGenerationFingerprint = validation.helperGenerationFingerprint
+    }
+    return validation.result
+  }
+
+  private var requiresEnrolledBridgePreflight: Bool {
+    expectedLocalAccountFingerprint != nil || expectedHelperSHA256 != nil
+      || expectedChatFingerprint != nil
+  }
+
+  private func requireEnrolledBridgePreflight() throws {
+    if requiresEnrolledBridgePreflight && enrolledHelperGenerationFingerprint == nil {
+      throw RPCError.preflightFailed()
+    }
+  }
+
+  private func enforceAllowedChat(_ target: String) throws {
+    guard let allowedChat else { return }
+    guard chatTargetsMatch(target, allowedChat) else {
+      throw RPCError.invalidParams("Messages operation is outside the configured allowed chat")
+    }
+  }
+
+  private func enforceAllowedChatReadScope(_ method: String) throws {
+    guard allowedChat != nil else { return }
+    if method == "chats.list" || method == "messages.history" || method == "bridge.status" {
+      throw RPCError.invalidParams(
+        "broad Messages reads are unavailable with an allowed chat lock")
+    }
+  }
+
+  private func preflightProviderOperation(_ handle: String) async throws {
+    try enforceAllowedChat(handle)
+    try requireEnrolledBridgePreflight()
+    guard bridgeAvailable else {
+      throw allowedChat == nil
+        ? RPCError.internalError("IMCoreBridge not available")
+        : RPCError.preflightFailed()
+    }
+    try await preflightBridgeForAllowedChat(handle)
+  }
+
+  private func rpcSendError(_ error: Error) -> RPCError {
+    if let rpcError = error as? RPCError {
+      return rpcError
+    }
+    if let bridgeError = error as? IMCoreBridgeError,
+      case .relaunchRequired = bridgeError
+    {
+      return RPCError.relaunchRequired()
+    }
+    return RPCError.internalError(describeBridgeSendError(error))
+  }
+
+}
+
+private func chatTargetsMatch(_ left: String, _ right: String) -> Bool {
+  left.trimmingCharacters(in: .whitespacesAndNewlines)
+    .localizedLowercase
+    == right.trimmingCharacters(in: .whitespacesAndNewlines).localizedLowercase
+}
+
+private struct BridgePreflightExpectation: Sendable {
+  let localAccountFingerprint: String?
+  let helperSHA256: String?
+  let chatFingerprint: String?
+  let helperGenerationFingerprint: String?
+
+  var requiresEnrollment: Bool {
+    localAccountFingerprint != nil || helperSHA256 != nil || chatFingerprint != nil
+  }
+}
+
+private struct SubscriptionBridgePreflight: Sendable {
+  let handle: String
+  let expectation: BridgePreflightExpectation
+}
+
+private struct BridgePreflightValidation {
+  let result: [String: Any]
+  let helperGenerationFingerprint: String?
+}
+
+private final class BridgePreflightOperation: @unchecked Sendable {
+  private let operation: (String, String?, String?, String?) async throws -> [String: Any]
+
+  init(_ operation: @escaping (String, String?, String?, String?) async throws -> [String: Any]) {
+    self.operation = operation
+  }
+
+  func call(
+    handle: String,
+    expectation: BridgePreflightExpectation
+  ) async throws -> [String: Any] {
+    try await operation(
+      handle,
+      expectation.localAccountFingerprint,
+      expectation.helperSHA256,
+      expectation.chatFingerprint
+    )
+  }
+}
+
+private func validateBridgePreflightStatus(
+  _ status: [String: Any],
+  expectation: BridgePreflightExpectation
+) throws -> BridgePreflightValidation {
+  let required = [
+    "allowed_chat_locked",
+    "expected_chat_match",
+    "chat_found",
+    "direct_chat",
+    "chat_identifier_match",
+    "participant_match",
+    "chat_guid_present",
+  ]
+  guard required.allSatisfy({ status[$0] as? Bool == true }) else {
+    throw RPCError.preflightFailed()
+  }
+  var result: [String: Any] = [
+    "helper_ready": true,
+    "allowed_chat_locked": true,
+    "expected_chat_match": true,
+    "chat_found": true,
+    "direct_chat": true,
+    "chat_identifier_match": true,
+    "participant_match": true,
+    "chat_guid_present": true,
+  ]
+  guard expectation.requiresEnrollment else {
+    return BridgePreflightValidation(result: result, helperGenerationFingerprint: nil)
+  }
+
+  guard let expectedLocalAccountFingerprint = expectation.localAccountFingerprint,
+    let expectedHelperSHA256 = expectation.helperSHA256,
+    isSHA256(expectedLocalAccountFingerprint),
+    isSHA256(expectedHelperSHA256),
+    status["local_account_match"] as? Bool == true,
+    status["loaded_helper_match"] as? Bool == true,
+    status["chat_fingerprint_match"] as? Bool == true,
+    status["local_account_fingerprint"] as? String == expectedLocalAccountFingerprint,
+    status["loaded_helper_sha256"] as? String == expectedHelperSHA256,
+    let chatFingerprint = status["chat_fingerprint"] as? String,
+    isSHA256(chatFingerprint),
+    expectation.chatFingerprint == nil || chatFingerprint == expectation.chatFingerprint,
+    let helperProcessFingerprint = status["helper_process_fingerprint"] as? String,
+    isSHA256(helperProcessFingerprint),
+    let helperGenerationFingerprint = status["helper_generation_fingerprint"] as? String,
+    isSHA256(helperGenerationFingerprint)
+  else {
+    throw RPCError.preflightFailed()
+  }
+  if let expectedHelperGenerationFingerprint = expectation.helperGenerationFingerprint,
+    expectedHelperGenerationFingerprint != helperGenerationFingerprint
+  {
+    throw RPCError.relaunchRequired()
+  }
+  result["local_account_match"] = true
+  result["loaded_helper_match"] = true
+  result["chat_fingerprint_match"] = true
+  result["local_account_fingerprint"] = expectedLocalAccountFingerprint
+  result["loaded_helper_sha256"] = expectedHelperSHA256
+  result["chat_fingerprint"] = chatFingerprint
+  result["helper_process_fingerprint"] = helperProcessFingerprint
+  result["helper_generation_fingerprint"] = helperGenerationFingerprint
+  return BridgePreflightValidation(
+    result: result,
+    helperGenerationFingerprint: helperGenerationFingerprint
+  )
+}
+
+private func isSHA256(_ value: String?) -> Bool {
+  guard let value, value.count == 64 else { return false }
+  return value.allSatisfy { "0123456789abcdef".contains($0) }
 }
 
 private func buildMessagePayload(
@@ -886,6 +1238,22 @@ struct RPCError: Error {
 
   static func internalError(_ message: String) -> RPCError {
     RPCError(code: -32603, message: "Internal error", data: message)
+  }
+
+  static func relaunchRequired() -> RPCError {
+    RPCError(
+      code: -32010,
+      message: "Messages helper relaunch required",
+      data: "definitely_not_sent"
+    )
+  }
+
+  static func preflightFailed() -> RPCError {
+    RPCError(
+      code: -32011,
+      message: "Messages helper/chat preflight failed",
+      data: "definitely_not_sent"
+    )
   }
 
   func asDictionary() -> [String: Any] {

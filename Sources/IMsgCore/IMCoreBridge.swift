@@ -233,6 +233,7 @@ public struct MessageExtensionPayload: Equatable, Sendable {
 public enum IMCoreBridgeError: Error, CustomStringConvertible {
   case frameworkNotAvailable
   case dylibNotFound
+  case relaunchRequired
   case connectionFailed(String)
   case chatNotFound(String)
   case messageNotFound(String)
@@ -241,10 +242,13 @@ public enum IMCoreBridgeError: Error, CustomStringConvertible {
   public var description: String {
     switch self {
     case .frameworkNotAvailable:
-      return "IMCore framework not available. Advanced features require SIP disabled."
+      return
+        "IMCore framework not available. Helper injection requires a separately reviewed macOS security posture."
     case .dylibNotFound:
       return
         "imsg-plus-helper.dylib not found. Build with: make build-dylib"
+    case .relaunchRequired:
+      return "Messages helper relaunch is required; no Messages operation was sent."
     case .connectionFailed(let error):
       return "Connection to Messages.app failed: \(error)"
     case .chatNotFound(let id):
@@ -270,6 +274,7 @@ public final class IMCoreBridge: @unchecked Sendable {
   public var isAvailable: Bool {
     // Check if dylib exists
     let possiblePaths = [
+      MessagesLauncher.siblingHelperPath,
       ".build/release/imsg-plus-helper.dylib",
       ".build/debug/imsg-plus-helper.dylib",
       "/usr/local/lib/imsg-plus-helper.dylib",
@@ -307,6 +312,9 @@ public final class IMCoreBridge: @unchecked Sendable {
         throw IMCoreBridgeError.operationFailed(error)
       }
     } catch let error as MessagesLauncherError {
+      if case .relaunchRequired = error {
+        throw IMCoreBridgeError.relaunchRequired
+      }
       throw IMCoreBridgeError.connectionFailed(error.description)
     }
   }
@@ -356,6 +364,7 @@ public final class IMCoreBridge: @unchecked Sendable {
   public func checkAvailability() -> (available: Bool, message: String) {
     // Check if dylib exists
     let possiblePaths = [
+      MessagesLauncher.siblingHelperPath,
       ".build/release/imsg-plus-helper.dylib",
       ".build/debug/imsg-plus-helper.dylib",
       "/usr/local/lib/imsg-plus-helper.dylib",
@@ -389,20 +398,39 @@ public final class IMCoreBridge: @unchecked Sendable {
       return (true, "Connected to Messages.app. IMCore features available.")
     }
 
-    // Try to get status
-    do {
-      try launcher.ensureRunning()
-      return (true, "Messages.app launched with injection. IMCore features available.")
-    } catch let error as MessagesLauncherError {
-      return (false, error.description)
-    } catch {
-      return (false, "Failed to connect to Messages.app: \(error.localizedDescription)")
-    }
+    return (
+      false,
+      "Messages helper is not ready. Relaunch it as a separate action, then run preflight again."
+    )
   }
 
   /// Get detailed status from the injected helper
   public func getStatus() async throws -> [String: Any] {
     return try await sendCommand(action: "status", params: [:])
+  }
+
+  /// Verify that the injected helper is locked to and can resolve the expected
+  /// direct chat. The helper returns only content-free readiness booleans.
+  public func preflightAllowedChat(
+    handle: String,
+    expectedLocalAccountFingerprint: String? = nil,
+    expectedHelperSHA256: String? = nil,
+    expectedChatFingerprint: String? = nil
+  ) async throws -> [String: Any] {
+    var params = ["expected_handle": handle]
+    if let expectedLocalAccountFingerprint {
+      params["expected_local_account_fingerprint"] = expectedLocalAccountFingerprint
+    }
+    if let expectedHelperSHA256 {
+      params["expected_helper_sha256"] = expectedHelperSHA256
+    }
+    if let expectedChatFingerprint {
+      params["expected_chat_fingerprint"] = expectedChatFingerprint
+    }
+    return try await sendCommand(
+      action: "preflight_allowed_chat",
+      params: params
+    )
   }
 
   /// Get FindMy friend locations via Messages.app with optional raw debug payloads.

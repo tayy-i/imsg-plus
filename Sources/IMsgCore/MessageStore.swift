@@ -241,10 +241,9 @@ extension MessageStore {
       let availableBytes: Int64
       if attachment.missing {
         availableBytes = -1
-      } else if
-        let attributes = try? FileManager.default.attributesOfItem(
-          atPath: attachment.originalPath
-        ),
+      } else if let attributes = try? FileManager.default.attributesOfItem(
+        atPath: attachment.originalPath
+      ),
         let size = attributes[.size] as? NSNumber
       {
         availableBytes = size.int64Value
@@ -351,18 +350,25 @@ extension MessageStore {
   }
 
   /// Stable identity for the current Messages database file and subscribed
-  /// chat/account scope. A database replacement, chat change, or account
-  /// reassociation gets a different identity even when ROWIDs overlap.
+  /// chat scope. A database replacement or chat reassociation gets a different
+  /// identity even when ROWIDs overlap. The stable volume UUID is used instead
+  /// of the mount-specific device number, which can change after a normal boot.
+  /// Per-message account values are excluded: normal inbound and outbound rows
+  /// can legitimately carry different values, while the locked helper preflight
+  /// separately pins the active local account.
   public func providerEpoch(chatID: Int64? = nil) throws -> String {
     let databaseEpoch: String
     if path == ":memory:" {
-      databaseEpoch = "messages-db-v2:memory"
+      databaseEpoch = "messages-db-v4:memory"
     } else {
       let attributes = try FileManager.default.attributesOfItem(atPath: path)
+      let resourceValues = try URL(fileURLWithPath: path).resourceValues(
+        forKeys: [.volumeUUIDStringKey]
+      )
       guard
-        let systemNumber = (attributes[.systemNumber] as? NSNumber)?.uint64Value,
         let fileNumber = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value,
-        let creationDate = attributes[.creationDate] as? Date
+        let creationDate = attributes[.creationDate] as? Date,
+        let volumeUUID = resourceValues.volumeUUIDString
       else {
         throw NSError(
           domain: "IMsgCore.MessageStore",
@@ -370,8 +376,11 @@ extension MessageStore {
           userInfo: [NSLocalizedDescriptionKey: "Messages database identity is unavailable"]
         )
       }
-      let createdMilliseconds = Int64(creationDate.timeIntervalSince1970 * 1_000)
-      databaseEpoch = "messages-db-v2:\(systemNumber):\(fileNumber):\(createdMilliseconds)"
+      databaseEpoch = try ProviderIdentity.databaseEpoch(
+        volumeUUID: volumeUUID,
+        fileNumber: fileNumber,
+        creationDate: creationDate
+      )
     }
 
     guard let chatID else { return databaseEpoch }
@@ -382,34 +391,12 @@ extension MessageStore {
         userInfo: [NSLocalizedDescriptionKey: "Messages chat scope is unavailable"]
       )
     }
-    let accountGUIDs: [String]
-    if hasAccountGUID {
-      accountGUIDs = try withConnection { db in
-        var values = Set<String>()
-        for row in try db.prepare(
-          """
-          SELECT DISTINCT IFNULL(m.account_guid, '')
-          FROM message m
-          JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-          WHERE cmj.chat_id = ? AND IFNULL(m.account_guid, '') != ''
-          ORDER BY IFNULL(m.account_guid, '') ASC
-          """,
-          chatID
-        ) {
-          let value = stringValue(row[0])
-          if !value.isEmpty { values.insert(value) }
-        }
-        return values.sorted()
-      }
-    } else {
-      accountGUIDs = []
-    }
-    let scope = ([
+    let scope = [
       String(chat.id),
       chat.identifier,
       chat.guid,
       chat.service,
-    ] + accountGUIDs).joined(separator: "\0")
+    ].joined(separator: "\0")
     let digest = SHA256.hash(data: Data(scope.utf8))
       .map { String(format: "%02x", $0) }
       .joined()
@@ -419,7 +406,8 @@ extension MessageStore {
   /// Detects an appended backlog whose provider timestamps precede the row at
   /// the durable cursor. This is quarantined as imported/restored history rather
   /// than silently treating it as new host-time input.
-  public func pendingHistoryRegresses(afterRowID rowID: Int64, chatID: Int64? = nil) throws -> Bool {
+  public func pendingHistoryRegresses(afterRowID rowID: Int64, chatID: Int64? = nil) throws -> Bool
+  {
     guard rowID >= 0 else { return false }
     return try withConnection { db in
       let join = chatID == nil ? "" : " JOIN chat_message_join cmj ON cmj.message_id = m.ROWID"
