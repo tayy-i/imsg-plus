@@ -19,6 +19,12 @@ public final class MessagesLauncher: @unchecked Sendable {
     return containerPath + "/.imsg-plus-response.json"
   }
 
+  private var commandLockFile: String {
+    let containerPath =
+      NSHomeDirectory() + "/Library/Containers/com.apple.MobileSMS/Data"
+    return containerPath + "/.imsg-plus-command.lock"
+  }
+
   private var lockFile: String {
     let containerPath =
       NSHomeDirectory() + "/Library/Containers/com.apple.MobileSMS/Data"
@@ -175,6 +181,19 @@ public final class MessagesLauncher: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
 
+    do {
+      return try CrossProcessFileLock.withExclusiveLock(at: commandLockFile) {
+        try sendLockedCommandSync(action: action, params: params)
+      }
+    } catch is CrossProcessFileLockError {
+      throw MessagesLauncherError.socketError("Unable to lock Messages helper command channel")
+    }
+  }
+
+  private func sendLockedCommandSync(
+    action: String,
+    params: [String: Any]
+  ) throws -> [String: Any] {
     // Build command
     let requestID = Int(Date().timeIntervalSince1970 * 1000)
     let command: [String: Any] = [
