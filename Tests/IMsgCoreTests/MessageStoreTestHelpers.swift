@@ -11,10 +11,12 @@ enum TestDatabase {
 
   static func makeStore(
     includeAttributedBody: Bool = false,
-    includeReactionColumns: Bool = false
+    includeReactionColumns: Bool = false,
+    includeBalloonBundleID: Bool = false
   ) throws -> MessageStore {
     let db = try Connection(.inMemory)
     let attributedBodyColumn = includeAttributedBody ? "attributedBody BLOB," : ""
+    let balloonBundleIDColumn = includeBalloonBundleID ? "balloon_bundle_id TEXT," : ""
 
     let reactionColumns: String
     if includeReactionColumns {
@@ -31,6 +33,7 @@ enum TestDatabase {
         text TEXT,
         \(attributedBodyColumn)
         \(reactionColumns)
+        \(balloonBundleIDColumn)
         date INTEGER,
         is_from_me INTEGER,
         service TEXT
@@ -125,6 +128,9 @@ enum TestDatabase {
           row.0
         )
       }
+    }
+    if includeBalloonBundleID {
+      try db.run("UPDATE message SET balloon_bundle_id = 'bundle.id' WHERE ROWID = 1")
     }
 
     return try MessageStore(connection: db, path: ":memory:")

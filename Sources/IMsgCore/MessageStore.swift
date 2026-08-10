@@ -30,6 +30,7 @@ public final class MessageStore: @unchecked Sendable {
   let hasThreadOriginator: Bool
   let hasDateEdited: Bool
   let hasAccountGUID: Bool
+  let hasBalloonBundleID: Bool
 
   public init(path: String = MessageStore.defaultPath) throws {
     let normalized = NSString(string: path).expandingTildeInPath
@@ -59,6 +60,9 @@ public final class MessageStore: @unchecked Sendable {
         connection: self.connection
       )
       self.hasAccountGUID = MessageStore.detectMessageAccountGUID(
+        connection: self.connection
+      )
+      self.hasBalloonBundleID = MessageStore.detectMessageBalloonBundleID(
         connection: self.connection
       )
     } catch {
@@ -123,6 +127,7 @@ public final class MessageStore: @unchecked Sendable {
     } else {
       self.hasAccountGUID = MessageStore.detectMessageAccountGUID(connection: connection)
     }
+    self.hasBalloonBundleID = MessageStore.detectMessageBalloonBundleID(connection: connection)
   }
 
   public func listChats(limit: Int) throws -> [Chat] {

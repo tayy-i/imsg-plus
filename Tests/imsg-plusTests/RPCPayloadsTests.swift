@@ -43,7 +43,8 @@ func messagePayloadIncludesChatFields() {
     attachmentsCount: 1,
     guid: "msg-guid-5",
     replyToGUID: "msg-guid-1",
-    accountGUID: "account-guid-primary"
+    accountGUID: "account-guid-primary",
+    balloonBundleID: "bundle.id"
   )
   let chatInfo = ChatInfo(
     id: 10,
@@ -87,6 +88,7 @@ func messagePayloadIncludesChatFields() {
   #expect(payload["id"] as? Int64 == 5)
   #expect(payload["revision_fingerprint"] as? String == message.revisionFingerprint)
   #expect(payload["account_id"] as? String == "account-guid-primary")
+  #expect(payload["balloon_bundle_id"] as? String == "bundle.id")
   #expect(payload["audience_revision"] as? Int == stableAudienceRevision(
     chatGUID: "iMessage;+;chat123",
     participants: ["+111"],

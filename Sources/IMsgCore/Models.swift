@@ -234,6 +234,7 @@ public struct Message: Sendable, Equatable {
   public let threadOriginatorGUID: String?
   public let threadOriginatorPart: String?
   public let accountGUID: String
+  public let balloonBundleID: String?
   public let attachmentRevisionEvidence: String
   public let reactionRevisionEvidence: String
   /// Set by MessageWatcher for a row first observed above the caller's durable
@@ -259,6 +260,7 @@ public struct Message: Sendable, Equatable {
     threadOriginatorGUID: String? = nil,
     threadOriginatorPart: String? = nil,
     accountGUID: String = "",
+    balloonBundleID: String? = nil,
     attachmentRevisionEvidence: String = "",
     reactionRevisionEvidence: String = "",
     isNewProviderRow: Bool = false
@@ -280,6 +282,7 @@ public struct Message: Sendable, Equatable {
     self.threadOriginatorGUID = threadOriginatorGUID
     self.threadOriginatorPart = threadOriginatorPart
     self.accountGUID = accountGUID
+    self.balloonBundleID = balloonBundleID
     self.attachmentRevisionEvidence = attachmentRevisionEvidence
     self.reactionRevisionEvidence = reactionRevisionEvidence
     self.isNewProviderRow = isNewProviderRow

@@ -97,6 +97,7 @@ extension MessageStore {
     let threadOriginatorPartColumn = hasThreadOriginator ? "m.thread_originator_part" : "NULL"
     let dateEditedColumn = hasDateEdited ? "m.date_edited" : "NULL"
     let accountGUIDColumn = hasAccountGUID ? "m.account_guid" : "NULL"
+    let balloonBundleIDColumn = hasBalloonBundleID ? "m.balloon_bundle_id" : "NULL"
     let reactionRevisionColumn =
       hasReactionColumns
       ? """
@@ -123,7 +124,8 @@ extension MessageStore {
              \(threadOriginatorPartColumn) AS thread_originator_part,
              \(dateEditedColumn) AS date_edited,
              \(accountGUIDColumn) AS account_guid,
-             \(reactionRevisionColumn) AS reaction_revision
+             \(reactionRevisionColumn) AS reaction_revision,
+             \(balloonBundleIDColumn) AS balloon_bundle_id
       FROM message m
       JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
       LEFT JOIN handle h ON m.handle_id = h.ROWID
@@ -184,6 +186,7 @@ extension MessageStore {
         let dateEditedRaw = int64Value(row[16])
         let accountGUID = stringValue(row[17])
         let reactionRevisionEvidence = String(int64Value(row[18]) ?? 0)
+        let balloonBundleID = stringValue(row[19])
         let resolvedBody = resolvedMessageBody(text: text, attributedBody: body)
         var resolvedText = resolvedBody.text
         var markdownText = resolvedBody.markdown
@@ -216,6 +219,7 @@ extension MessageStore {
             threadOriginatorGUID: threadOriginatorGUID.isEmpty ? nil : threadOriginatorGUID,
             threadOriginatorPart: threadOriginatorPart.isEmpty ? nil : threadOriginatorPart,
             accountGUID: accountGUID,
+            balloonBundleID: balloonBundleID.isEmpty ? nil : balloonBundleID,
             attachmentRevisionEvidence: attachmentRevisionEvidence,
             reactionRevisionEvidence: reactionRevisionEvidence
           ))
@@ -235,6 +239,7 @@ extension MessageStore {
     let threadOriginatorPartColumn = hasThreadOriginator ? "m.thread_originator_part" : "NULL"
     let dateEditedColumn = hasDateEdited ? "m.date_edited" : "NULL"
     let accountGUIDColumn = hasAccountGUID ? "m.account_guid" : "NULL"
+    let balloonBundleIDColumn = hasBalloonBundleID ? "m.balloon_bundle_id" : "NULL"
     let reactionRevisionColumn =
       hasReactionColumns
       ? """
@@ -261,7 +266,8 @@ extension MessageStore {
              \(threadOriginatorPartColumn) AS thread_originator_part,
              \(dateEditedColumn) AS date_edited,
              \(accountGUIDColumn) AS account_guid,
-             \(reactionRevisionColumn) AS reaction_revision
+             \(reactionRevisionColumn) AS reaction_revision,
+             \(balloonBundleIDColumn) AS balloon_bundle_id
       FROM message m
       LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
       LEFT JOIN handle h ON m.handle_id = h.ROWID
@@ -305,6 +311,7 @@ extension MessageStore {
         let dateEditedRaw = int64Value(row[17])
         let accountGUID = stringValue(row[18])
         let reactionRevisionEvidence = String(int64Value(row[19]) ?? 0)
+        let balloonBundleID = stringValue(row[20])
         let resolvedBody = resolvedMessageBody(text: text, attributedBody: body)
         var resolvedText = resolvedBody.text
         var markdownText = resolvedBody.markdown
@@ -337,6 +344,7 @@ extension MessageStore {
             threadOriginatorGUID: threadOriginatorGUID.isEmpty ? nil : threadOriginatorGUID,
             threadOriginatorPart: threadOriginatorPart.isEmpty ? nil : threadOriginatorPart,
             accountGUID: accountGUID,
+            balloonBundleID: balloonBundleID.isEmpty ? nil : balloonBundleID,
             attachmentRevisionEvidence: attachmentRevisionEvidence,
             reactionRevisionEvidence: reactionRevisionEvidence
           ))
@@ -361,6 +369,7 @@ extension MessageStore {
     let threadOriginatorPartColumn = hasThreadOriginator ? "m.thread_originator_part" : "NULL"
     let dateEditedColumn = hasDateEdited ? "m.date_edited" : "NULL"
     let accountGUIDColumn = hasAccountGUID ? "m.account_guid" : "NULL"
+    let balloonBundleIDColumn = hasBalloonBundleID ? "m.balloon_bundle_id" : "NULL"
     let reactionRevisionColumn =
       hasReactionColumns
       ? """
@@ -388,7 +397,8 @@ extension MessageStore {
              \(threadOriginatorPartColumn) AS thread_originator_part,
              \(dateEditedColumn) AS date_edited,
              \(accountGUIDColumn) AS account_guid,
-             \(reactionRevisionColumn) AS reaction_revision
+             \(reactionRevisionColumn) AS reaction_revision,
+             \(balloonBundleIDColumn) AS balloon_bundle_id
       FROM message m
       LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
       LEFT JOIN handle h ON m.handle_id = h.ROWID
@@ -431,6 +441,7 @@ extension MessageStore {
         let dateEditedRaw = int64Value(row[17])
         let accountGUID = stringValue(row[18])
         let reactionRevisionEvidence = String(int64Value(row[19]) ?? 0)
+        let balloonBundleID = stringValue(row[20])
         let resolvedBody = resolvedMessageBody(text: text, attributedBody: body)
         var resolvedText = resolvedBody.text
         var markdownText = resolvedBody.markdown
@@ -463,6 +474,7 @@ extension MessageStore {
             threadOriginatorGUID: threadOriginatorGUID.isEmpty ? nil : threadOriginatorGUID,
             threadOriginatorPart: threadOriginatorPart.isEmpty ? nil : threadOriginatorPart,
             accountGUID: accountGUID,
+            balloonBundleID: balloonBundleID.isEmpty ? nil : balloonBundleID,
             attachmentRevisionEvidence: attachmentRevisionEvidence,
             reactionRevisionEvidence: reactionRevisionEvidence
           ))

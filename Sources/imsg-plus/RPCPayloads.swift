@@ -76,6 +76,9 @@ func messagePayload(
   if !message.accountGUID.isEmpty {
     payload["account_id"] = message.accountGUID
   }
+  if let balloonBundleID = message.balloonBundleID, !balloonBundleID.isEmpty {
+    payload["balloon_bundle_id"] = balloonBundleID
+  }
   let audienceRevision = stableAudienceRevision(
     chatGUID: guid,
     participants: participants,

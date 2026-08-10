@@ -64,6 +64,13 @@ func messagesByChatReturnsMessages() throws {
 }
 
 @Test
+func messagesExposeBalloonBundleID() throws {
+  let store = try TestDatabase.makeStore(includeBalloonBundleID: true)
+  let messages = try store.messages(chatID: 1, limit: 10)
+  #expect(messages.first { $0.rowID == 1 }?.balloonBundleID == "bundle.id")
+}
+
+@Test
 func messagesByChatAppliesDateFilterBeforeLimit() throws {
   let store = try TestDatabase.makeStore()
   let all = try store.messages(chatID: 1, limit: 10)
