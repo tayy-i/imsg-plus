@@ -214,10 +214,6 @@ func rpcSendResolvesChatID() async throws {
       captured = (handle, text)
       return ["guid": "msg-guid-1"]
     },
-    resolvePersistedSend: { chatID, transientGUID, _, _ in
-      #expect(chatID == 1)
-      return transientGUID
-    },
     bridgeAvailable: true
   )
 
@@ -293,9 +289,10 @@ func rpcSendReportsBridgeTimeout() async throws {
 }
 
 @Test
-func rpcSendRejectsAnUnpersistedProviderMessage() async throws {
+func rpcSendAcceptsBridgeSuccessWithoutWaitingForDatabasePersistence() async throws {
   let store = try RPCTestDatabase.makeStore()
   let output = TestRPCOutput()
+  var attemptedPersistenceLookup = false
   let server = RPCServer(
     store: store,
     verbose: false,
@@ -304,19 +301,22 @@ func rpcSendRejectsAnUnpersistedProviderMessage() async throws {
     bridgeSendMessage: { _, _, _, _, _, _, _ in
       ["guid": "transient-guid"]
     },
-    resolvePersistedSend: { _, _, _, _ in nil },
+    resolvePersistedSend: { _, _, _, _ in
+      attemptedPersistenceLookup = true
+      return nil
+    },
     bridgeAvailable: true
   )
 
   await server.handleLineForTesting(
-    #"{"jsonrpc":"2.0","id":"unpersisted","method":"send","params":{"chat_id":1,"text":"yo"}}"#
+    #"{"jsonrpc":"2.0","id":"bridge-success","method":"send","params":{"chat_id":1,"text":"yo"}}"#
   )
 
-  #expect(output.responses.isEmpty)
-  #expect(output.errors.count == 1)
-  let error = output.errors[0]["error"] as? [String: Any]
-  #expect(int64Value(error?["code"]) == -32603)
-  #expect(error?["data"] as? String == "Messages did not persist the outgoing message")
+  let result = output.responses.first?["result"] as? [String: Any]
+  #expect(result?["ok"] as? Bool == true)
+  #expect(result?["guid"] as? String == "transient-guid")
+  #expect(output.errors.isEmpty)
+  #expect(attemptedPersistenceLookup == false)
 }
 
 @Test
@@ -477,7 +477,6 @@ func rpcAllowedChatPreflightsImmediatelyBeforeSend() async throws {
       boundaries.append("send:\(handle)")
       return ["guid": "locked-guid"]
     },
-    resolvePersistedSend: { _, transientGUID, _, _ in transientGUID },
     bridgeAvailable: true,
     allowedChat: "iMessage;+;chat123",
     bridgePreflightAllowedChat: { handle, _, _, _ in

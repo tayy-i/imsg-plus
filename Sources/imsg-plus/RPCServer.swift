@@ -545,24 +545,23 @@ final class RPCServer {
         stringParam(bridgeResult["guid"])
         ?? stringParam(bridgeResult["message_guid"])
         ?? stringParam(bridgeResult["messageGUID"])
-      guard let transientGUID, !transientGUID.isEmpty else {
-        throw RPCError.internalError("Messages did not identify the outgoing message")
-      }
-      let persistenceChatID: Int64?
-      if let chatID {
-        persistenceChatID = chatID
+      let messageGUID: String?
+      if extensionPayload != nil {
+        let persistenceChatID: Int64?
+        if let chatID {
+          persistenceChatID = chatID
+        } else {
+          persistenceChatID = try store.chatInfo(identifierOrGUID: handle)?.id
+        }
+        messageGUID =
+          await resolvePersistedSend(
+            persistenceChatID,
+            transientGUID,
+            extensionPayload,
+            sendStartedAt
+          ) ?? transientGUID
       } else {
-        persistenceChatID = try store.chatInfo(identifierOrGUID: handle)?.id
-      }
-      guard
-        let messageGUID = await resolvePersistedSend(
-          persistenceChatID,
-          transientGUID,
-          extensionPayload,
-          sendStartedAt
-        )
-      else {
-        throw RPCError.internalError("Messages did not persist the outgoing message")
+        messageGUID = transientGUID
       }
 
       // Turn off typing after send (fire-and-forget)
@@ -596,8 +595,10 @@ final class RPCServer {
       if extensionPayload != nil {
         result["extension_payload"] = true
       }
-      result["guid"] = messageGUID
-      if transientGUID != messageGUID {
+      if let messageGUID, !messageGUID.isEmpty {
+        result["guid"] = messageGUID
+      }
+      if let transientGUID, let messageGUID, transientGUID != messageGUID {
         result["transient_guid"] = transientGUID
       }
       respond(id: id, result: result)
