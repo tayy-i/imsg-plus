@@ -1758,11 +1758,12 @@ static id sendComposedMessageViaCKConversation(
         nil
     );
     if (!composition || ![composition respondsToSelector:messagesSelector]) return nil;
+    NSString *firstGUID = [[NSUUID UUID] UUIDString];
     typedef id (*MessagesFromCompositionType)(id, SEL, id, id);
     id messages = ((MessagesFromCompositionType)objc_msgSend)(
         composition,
         messagesSelector,
-        nil,
+        firstGUID,
         service
     );
     if (![messages isKindOfClass:[NSArray class]] || [messages count] != 1) return nil;
