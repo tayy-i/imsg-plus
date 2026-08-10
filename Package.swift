@@ -25,6 +25,10 @@ let package = Package(
                 .linkedFramework("Contacts"),
             ]
         ),
+        .executableTarget(
+            name: "LockHolderFixture",
+            path: "Tests/LockHolderFixture"
+        ),
     .executableTarget(
         name: "imsg-plus",
         dependencies: [
@@ -47,6 +51,7 @@ let package = Package(
             name: "IMsgCoreTests",
             dependencies: [
                 "IMsgCore",
+                "LockHolderFixture",
             ]
         ),
         .testTarget(

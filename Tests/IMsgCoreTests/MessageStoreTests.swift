@@ -388,6 +388,52 @@ func recentOutgoingExtensionMessageGUIDMatchesPayload() throws {
 }
 
 @Test
+func recentOutgoingMessageGUIDRequiresTheExactPersistedChatRow() throws {
+  let db = try Connection(.inMemory)
+  try db.execute(
+    """
+    CREATE TABLE message (
+      ROWID INTEGER PRIMARY KEY,
+      guid TEXT,
+      date INTEGER,
+      is_from_me INTEGER
+    );
+    """
+  )
+  try db.execute("CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);")
+  let now = Date()
+  try db.run(
+    "INSERT INTO message(ROWID, guid, date, is_from_me) VALUES (1, 'wanted', ?, 1), (2, 'incoming', ?, 0)",
+    TestDatabase.appleEpoch(now),
+    TestDatabase.appleEpoch(now)
+  )
+  try db.run("INSERT INTO chat_message_join(chat_id, message_id) VALUES (7, 1), (7, 2)")
+  let store = try MessageStore(connection: db, path: ":memory:")
+
+  #expect(
+    try store.recentOutgoingMessageGUID(
+      chatID: 7,
+      guid: "wanted",
+      since: now.addingTimeInterval(-1)
+    ) == "wanted"
+  )
+  #expect(
+    try store.recentOutgoingMessageGUID(
+      chatID: 8,
+      guid: "wanted",
+      since: now.addingTimeInterval(-1)
+    ) == nil
+  )
+  #expect(
+    try store.recentOutgoingMessageGUID(
+      chatID: 7,
+      guid: "incoming",
+      since: now.addingTimeInterval(-1)
+    ) == nil
+  )
+}
+
+@Test
 func longRepeatedPatternMessage() throws {
   // Test the exact pattern that causes crashes: repeated "aaaaaaaaaaaa " pattern
   // This reproduces the UInt8 overflow bug when segment.count > 256

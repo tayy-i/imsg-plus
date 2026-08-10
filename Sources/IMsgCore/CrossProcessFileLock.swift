@@ -2,7 +2,13 @@ import Darwin
 import Foundation
 
 enum CrossProcessFileLock {
-  static func withExclusiveLock<T>(at path: String, _ body: () throws -> T) throws -> T {
+  static let defaultTimeout: TimeInterval = 5
+
+  static func withExclusiveLock<T>(
+    at path: String,
+    timeout: TimeInterval = defaultTimeout,
+    _ body: () throws -> T
+  ) throws -> T {
     let flags = O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW
     let descriptor = path.withCString {
       Darwin.open($0, flags, S_IRUSR | S_IWUSR)
@@ -15,17 +21,24 @@ enum CrossProcessFileLock {
     guard Darwin.fchmod(descriptor, S_IRUSR | S_IWUSR) == 0 else {
       throw CrossProcessFileLockError.permissionFailed
     }
-    try lock(descriptor)
+    try lock(descriptor, timeout: timeout)
     defer { unlock(descriptor) }
 
     return try body()
   }
 
-  private static func lock(_ descriptor: Int32) throws {
-    while flock(descriptor, LOCK_EX) != 0 {
-      guard errno == EINTR else {
+  private static func lock(_ descriptor: Int32, timeout: TimeInterval) throws {
+    guard timeout > 0 else { throw CrossProcessFileLockError.timedOut }
+    let deadline = Date().addingTimeInterval(timeout)
+    while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+      if errno == EINTR { continue }
+      guard errno == EWOULDBLOCK || errno == EAGAIN else {
         throw CrossProcessFileLockError.lockFailed
       }
+      guard Date() < deadline else {
+        throw CrossProcessFileLockError.timedOut
+      }
+      Thread.sleep(forTimeInterval: 0.05)
     }
   }
 
@@ -38,4 +51,5 @@ enum CrossProcessFileLockError: Error {
   case openFailed
   case permissionFailed
   case lockFailed
+  case timedOut
 }

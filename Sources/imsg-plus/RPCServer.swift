@@ -1,7 +1,23 @@
+// This existing command server intentionally keeps its request dispatch in one
+// type while the transport contract is being stabilized.
+// swiftlint:disable file_length type_body_length
+
 import Foundation
 import IMsgCore
 
 let currentRoseMessagesAdapterContract = "rose-imsg-plus-rpc-v2"
+let roseRPCOperationBudgetsMs: [String: Int] = [
+  // One bridge command can wait for the in-process lock, the file lock, and
+  // the helper response. IMCoreBridge currently performs a readiness ping and
+  // then the requested helper command.
+  "bridge.preflight": 40_000,
+  "watch.subscribe": 10_000,
+  // An enrolled extension send performs preflight, dispatch, and the bounded
+  // persisted-GUID lookup. Keep the complete child budget visible to callers.
+  "send": 105_000,
+  "typing.set": 85_000,
+  "messages.markRead": 85_000,
+]
 
 protocol RPCOutput: Sendable {
   func sendResponse(id: Any, result: Any)
@@ -18,6 +34,8 @@ final class RPCServer {
   private let bridgeSendMessage:
     (String, String, String?, String?, MessageEffect?, String?, MessageExtensionPayload?)
       async throws -> [String: Any]
+  private let resolvePersistedSend:
+    (Int64?, String?, MessageExtensionPayload?, Date) async -> String?
   private let autoRead: Bool
   private let autoTyping: Bool
   private let bridgeAvailable: Bool
@@ -43,6 +61,8 @@ final class RPCServer {
       @escaping (
         String, String, String?, String?, MessageEffect?, String?, MessageExtensionPayload?
       ) async throws -> [String: Any] = RPCServer.defaultBridgeSendMessage,
+    resolvePersistedSend:
+      ((Int64?, String?, MessageExtensionPayload?, Date) async -> String?)? = nil,
     contactResolver: ContactResolving? = ContactResolver(),
     bridgeAvailable: Bool? = nil,
     allowedChat: String? = nil,
@@ -71,6 +91,16 @@ final class RPCServer {
     self.verbose = verbose
     self.output = output
     self.bridgeSendMessage = bridgeSendMessage
+    self.resolvePersistedSend =
+      resolvePersistedSend ?? { chatID, transientGUID, payload, since in
+        await RPCServer.resolvePersistedSend(
+          store: store,
+          chatID: chatID,
+          transientGUID: transientGUID,
+          extensionPayload: payload,
+          since: since
+        )
+      }
     self.contactResolver = contactResolver
     let available = bridgeAvailable ?? IMCoreBridge.shared.isAvailable
     self.bridgeAvailable = available
@@ -132,6 +162,14 @@ final class RPCServer {
     do {
       try enforceAllowedChatReadScope(method)
       switch method {
+      case "rpc.capabilities":
+        respond(
+          id: id,
+          result: [
+            "adapter_contract": currentRoseMessagesAdapterContract,
+            "operation_budgets_ms": roseRPCOperationBudgetsMs,
+          ]
+        )
       case "chats.list":
         let limit = intParam(params["limit"]) ?? 20
         let chats = try store.listChats(limit: max(limit, 1))
@@ -263,24 +301,6 @@ final class RPCServer {
         let localBridgeAvailable = bridgeAvailable
         let localVerbose = verbose
         let localResolver = contactResolver
-        let localEnrolledBridgePreflight: SubscriptionBridgePreflight?
-        if requiresEnrolledBridgePreflight {
-          guard let allowedChat, let enrolledHelperGenerationFingerprint else {
-            throw RPCError.preflightFailed()
-          }
-          localEnrolledBridgePreflight = SubscriptionBridgePreflight(
-            handle: allowedChat,
-            expectation: BridgePreflightExpectation(
-              localAccountFingerprint: expectedLocalAccountFingerprint,
-              helperSHA256: expectedHelperSHA256,
-              chatFingerprint: expectedChatFingerprint,
-              helperGenerationFingerprint: enrolledHelperGenerationFingerprint
-            )
-          )
-        } else {
-          localEnrolledBridgePreflight = nil
-        }
-        let localBridgePreflightAllowedChat = bridgePreflightAllowedChat
         // Return the exact baseline before notifications can be emitted. A
         // durable consumer can save this baseline and resume after it without
         // racing the subscription startup.
@@ -317,26 +337,6 @@ final class RPCServer {
                   code: 2,
                   userInfo: [NSLocalizedDescriptionKey: "Messages subscription identity changed"]
                 )
-              }
-              if let localEnrolledBridgePreflight {
-                do {
-                  let status = try await localBridgePreflightAllowedChat.call(
-                    handle: localEnrolledBridgePreflight.handle,
-                    expectation: localEnrolledBridgePreflight.expectation
-                  )
-                  _ = try validateBridgePreflightStatus(
-                    status,
-                    expectation: localEnrolledBridgePreflight.expectation
-                  )
-                } catch {
-                  throw NSError(
-                    domain: "imsg-plus.RPCServer",
-                    code: 3,
-                    userInfo: [
-                      NSLocalizedDescriptionKey: "Messages subscription identity changed"
-                    ]
-                  )
-                }
               }
               if !localFilter.allows(message) { continue }
               let payload = try buildMessagePayload(
@@ -545,12 +545,25 @@ final class RPCServer {
         stringParam(bridgeResult["guid"])
         ?? stringParam(bridgeResult["message_guid"])
         ?? stringParam(bridgeResult["messageGUID"])
-      let messageGUID =
-        await resolvePersistedExtensionGUID(
-          chatID: chatID,
-          extensionPayload: extensionPayload,
-          since: sendStartedAt
-        ) ?? transientGUID
+      guard let transientGUID, !transientGUID.isEmpty else {
+        throw RPCError.internalError("Messages did not identify the outgoing message")
+      }
+      let persistenceChatID: Int64?
+      if let chatID {
+        persistenceChatID = chatID
+      } else {
+        persistenceChatID = try store.chatInfo(identifierOrGUID: handle)?.id
+      }
+      guard
+        let messageGUID = await resolvePersistedSend(
+          persistenceChatID,
+          transientGUID,
+          extensionPayload,
+          sendStartedAt
+        )
+      else {
+        throw RPCError.internalError("Messages did not persist the outgoing message")
+      }
 
       // Turn off typing after send (fire-and-forget)
       if autoTyping && bridgeAvailable {
@@ -583,10 +596,8 @@ final class RPCServer {
       if extensionPayload != nil {
         result["extension_payload"] = true
       }
-      if let messageGUID, !messageGUID.isEmpty {
-        result["guid"] = messageGUID
-      }
-      if let transientGUID, let messageGUID, transientGUID != messageGUID {
+      result["guid"] = messageGUID
+      if transientGUID != messageGUID {
         result["transient_guid"] = transientGUID
       }
       respond(id: id, result: result)
@@ -595,23 +606,34 @@ final class RPCServer {
     }
   }
 
-  private func resolvePersistedExtensionGUID(
+  private static func resolvePersistedSend(
+    store: MessageStore,
     chatID: Int64?,
+    transientGUID: String?,
     extensionPayload: MessageExtensionPayload?,
     since: Date
   ) async -> String? {
-    guard let extensionPayload else {
-      return nil
-    }
     let querySince = since.addingTimeInterval(-5)
     let deadline = Date().addingTimeInterval(20)
     while Date() < deadline {
-      if let guid = try? store.recentOutgoingExtensionMessageGUID(
-        chatID: chatID,
-        balloonBundleID: extensionPayload.balloonBundleID,
-        payloadData: extensionPayload.payloadData,
-        since: querySince
-      ), !guid.isEmpty {
+      let persistedGUID: String?
+      if let extensionPayload {
+        persistedGUID = try? store.recentOutgoingExtensionMessageGUID(
+          chatID: chatID,
+          balloonBundleID: extensionPayload.balloonBundleID,
+          payloadData: extensionPayload.payloadData,
+          since: querySince
+        )
+      } else if let transientGUID {
+        persistedGUID = try? store.recentOutgoingMessageGUID(
+          chatID: chatID,
+          guid: transientGUID,
+          since: querySince
+        )
+      } else {
+        persistedGUID = nil
+      }
+      if let guid = persistedGUID, !guid.isEmpty {
         return guid
       }
       try? await Task.sleep(nanoseconds: 250_000_000)
@@ -1047,11 +1069,6 @@ private struct BridgePreflightExpectation: Sendable {
   var requiresEnrollment: Bool {
     localAccountFingerprint != nil || helperSHA256 != nil || chatFingerprint != nil
   }
-}
-
-private struct SubscriptionBridgePreflight: Sendable {
-  let handle: String
-  let expectation: BridgePreflightExpectation
 }
 
 private struct BridgePreflightValidation {

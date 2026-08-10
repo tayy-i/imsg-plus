@@ -1,5 +1,4 @@
 import Foundation
-
 /// Tapback reaction types for iMessage
 ///
 /// These values correspond to Apple's IMCore framework's `associatedMessageType` field.
@@ -587,7 +586,6 @@ public final class IMCoreBridge: @unchecked Sendable {
     }
     return try await sendCommand(action: "edit_message", params: params)
   }
-
   /// Unsend (retract) a previously sent message
   public func unsendMessage(
     handle: String, messageGUID: String, partIndex: Int = 0

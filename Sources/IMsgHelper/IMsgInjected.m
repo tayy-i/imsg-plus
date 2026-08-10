@@ -111,19 +111,32 @@ static void addAccountIdentityCandidates(NSMutableSet<NSString *> *candidates, i
     }
 }
 
-static NSSet<NSString *>* activeLocalAccountFingerprints(void) {
-    NSMutableSet<NSString *> *identities = [NSMutableSet set];
+static id activeIMessageAccount(void) {
     Class serviceClass = NSClassFromString(@"IMServiceImpl");
     Class accountControllerClass = NSClassFromString(@"IMAccountController");
-    if (!serviceClass || !accountControllerClass) return [NSSet set];
+    if (!serviceClass || !accountControllerClass) return nil;
 
     id service = [serviceClass performSelector:@selector(iMessageService)];
     id accountController = [accountControllerClass performSelector:@selector(sharedInstance)];
     if (!service || !accountController ||
         ![accountController respondsToSelector:@selector(bestAccountForService:)]) {
-        return [NSSet set];
+        return nil;
     }
-    id account = [accountController performSelector:@selector(bestAccountForService:) withObject:service];
+    return [accountController performSelector:@selector(bestAccountForService:) withObject:service];
+}
+
+static BOOL boolProperty(id object, SEL selector, BOOL *available) {
+    if (!object || ![object respondsToSelector:selector]) {
+        if (available) *available = NO;
+        return NO;
+    }
+    if (available) *available = YES;
+    return ((BOOL (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static NSSet<NSString *>* activeLocalAccountFingerprints(void) {
+    NSMutableSet<NSString *> *identities = [NSMutableSet set];
+    id account = activeIMessageAccount();
     if (!account) return [NSSet set];
 
     NSArray<NSString *> *selectors = @[
@@ -274,7 +287,12 @@ static IMP _orig_CKConv_sendMessage_newComposition = NULL;
 static IMP _orig_CKConv_sendMessage_onService_newComposition = NULL;
 static IMP _orig_IMChat_sendMessage = NULL;
 
-static void swizzled_CKConv_sendMessage_newComposition(id self, SEL _cmd, id message, id composition) {
+static void swizzled_CKConv_sendMessage_newComposition(
+    id self,
+    SEL _cmd,
+    id message,
+    BOOL newComposition
+) {
     if (!_diagLog) _diagLog = [NSMutableArray array];
     [_diagLog addObject:@"=== SWIZZLE: CKConversation sendMessage:newComposition: ==="];
     [_diagLog addObject:[NSString stringWithFormat:@"self=%@ class=%@", self, [self class]]];
@@ -307,61 +325,22 @@ static void swizzled_CKConv_sendMessage_newComposition(id self, SEL _cmd, id mes
         [_diagLog addObject:@"message=nil"];
     }
 
-    // Log composition properties
-    if (composition) {
-        [_diagLog addObject:[NSString stringWithFormat:@"composition class=%@", [composition class]]];
-        @try {
-            if ([composition respondsToSelector:@selector(expressiveSendStyleID)]) {
-                [_diagLog addObject:[NSString stringWithFormat:@"  expressiveSendStyleID=%@",
-                      [composition performSelector:@selector(expressiveSendStyleID)]]];
-            }
-            if ([composition respondsToSelector:@selector(text)]) {
-                id compText = [composition performSelector:@selector(text)];
-                if ([compText isKindOfClass:[NSAttributedString class]]) {
-                    NSAttributedString *at = (NSAttributedString *)compText;
-                    [_diagLog addObject:[NSString stringWithFormat:@"  text.string=%@ (len=%lu)", at.string, (unsigned long)at.length]];
-                    if (at.length > 0) {
-                        // Log all attributes across the full range
-                        [at enumerateAttributesInRange:NSMakeRange(0, at.length) options:0
-                            usingBlock:^(NSDictionary *attrs, NSRange range, BOOL *stop) {
-                                [_diagLog addObject:[NSString stringWithFormat:@"  text.attrs[%lu-%lu]=%@",
-                                      (unsigned long)range.location, (unsigned long)(range.location+range.length), attrs]];
-                            }];
-                    }
-                } else {
-                    [_diagLog addObject:[NSString stringWithFormat:@"  text=%@", compText]];
-                }
-            }
-            if ([composition respondsToSelector:@selector(mediaObjects)]) {
-                NSArray *mos = [composition performSelector:@selector(mediaObjects)];
-                [_diagLog addObject:[NSString stringWithFormat:@"  mediaObjects count=%lu", (unsigned long)mos.count]];
-                for (NSUInteger i = 0; i < mos.count; i++) {
-                    id mo = mos[i];
-                    [_diagLog addObject:[NSString stringWithFormat:@"    mo[%lu] class=%@ transferGUID=%@ fileURL=%@",
-                          (unsigned long)i, [mo class],
-                          [mo respondsToSelector:@selector(transferGUID)] ? [mo performSelector:@selector(transferGUID)] : @"N/A",
-                          [mo respondsToSelector:@selector(fileURL)] ? [mo performSelector:@selector(fileURL)] : @"N/A"]];
-                }
-            }
-            if ([composition respondsToSelector:@selector(hasContent)]) {
-                BOOL hc = ((BOOL (*)(id, SEL))objc_msgSend)(composition, @selector(hasContent));
-                [_diagLog addObject:[NSString stringWithFormat:@"  hasContent=%d", hc]];
-            }
-        } @catch (NSException *e) {
-            [_diagLog addObject:[NSString stringWithFormat:@"  comp props error: %@", e.reason]];
-        }
-    } else {
-        [_diagLog addObject:@"composition=nil"];
-    }
+    [_diagLog addObject:[NSString stringWithFormat:@"newComposition=%d", newComposition]];
 
     // Call original
     if (_orig_CKConv_sendMessage_newComposition) {
-        typedef void (*OrigType)(id, SEL, id, id);
-        ((OrigType)_orig_CKConv_sendMessage_newComposition)(self, _cmd, message, composition);
+        typedef void (*OrigType)(id, SEL, id, BOOL);
+        ((OrigType)_orig_CKConv_sendMessage_newComposition)(self, _cmd, message, newComposition);
     }
 }
 
-static void swizzled_CKConv_sendMessage_onService_newComposition(id self, SEL _cmd, id message, id service, id composition) {
+static void swizzled_CKConv_sendMessage_onService_newComposition(
+    id self,
+    SEL _cmd,
+    id message,
+    id service,
+    BOOL newComposition
+) {
     if (!_diagLog) _diagLog = [NSMutableArray array];
     [_diagLog addObject:@"=== SWIZZLE: CKConversation sendMessage:onService:newComposition: ==="];
     [_diagLog addObject:[NSString stringWithFormat:@"service=%@ class=%@", service, service ? [service class] : @"nil"]];
@@ -376,23 +355,17 @@ static void swizzled_CKConv_sendMessage_onService_newComposition(id self, SEL _c
     } else {
         [_diagLog addObject:@"message=nil"];
     }
-    if (composition) {
-        @try {
-            if ([composition respondsToSelector:@selector(expressiveSendStyleID)])
-                [_diagLog addObject:[NSString stringWithFormat:@"composition.expressiveSendStyleID=%@",
-                      [composition performSelector:@selector(expressiveSendStyleID)]]];
-            if ([composition respondsToSelector:@selector(mediaObjects)]) {
-                NSArray *mos = [composition performSelector:@selector(mediaObjects)];
-                [_diagLog addObject:[NSString stringWithFormat:@"composition.mediaObjects count=%lu", (unsigned long)mos.count]];
-            }
-        } @catch (NSException *e) {}
-    } else {
-        [_diagLog addObject:@"composition=nil"];
-    }
+    [_diagLog addObject:[NSString stringWithFormat:@"newComposition=%d", newComposition]];
 
     if (_orig_CKConv_sendMessage_onService_newComposition) {
-        typedef void (*OrigType)(id, SEL, id, id, id);
-        ((OrigType)_orig_CKConv_sendMessage_onService_newComposition)(self, _cmd, message, service, composition);
+        typedef void (*OrigType)(id, SEL, id, id, BOOL);
+        ((OrigType)_orig_CKConv_sendMessage_onService_newComposition)(
+            self,
+            _cmd,
+            message,
+            service,
+            newComposition
+        );
     }
 }
 
@@ -1120,6 +1093,7 @@ static NSDictionary* handleStatus(NSInteger requestId, NSDictionary *params) {
         @"attachment_send_available": @(hasFileTransferCenter),
         @"allowed_chat_locked": @(kAllowedChat.length > 0),
     } mutableCopy];
+
     return successResponse(requestId, result);
 }
 
@@ -1194,6 +1168,28 @@ static NSDictionary* handlePreflightAllowedChat(NSInteger requestId, NSDictionar
         @"helper_process_fingerprint": helperProcessFingerprint(),
         @"helper_generation_fingerprint": kHelperGenerationFingerprint,
     } mutableCopy];
+    id localAccount = activeIMessageAccount();
+    BOOL activeAvailable = NO;
+    BOOL connectedAvailable = NO;
+    BOOL connectingAvailable = NO;
+    BOOL registeredAvailable = NO;
+    result[@"local_account_found"] = @(localAccount != nil);
+    result[@"local_account_active"] = @(
+        boolProperty(localAccount, @selector(isActive), &activeAvailable)
+    );
+    result[@"local_account_active_available"] = @(activeAvailable);
+    result[@"local_account_connected"] = @(
+        boolProperty(localAccount, @selector(isConnected), &connectedAvailable)
+    );
+    result[@"local_account_connected_available"] = @(connectedAvailable);
+    result[@"local_account_connecting"] = @(
+        boolProperty(localAccount, @selector(isConnecting), &connectingAvailable)
+    );
+    result[@"local_account_connecting_available"] = @(connectingAvailable);
+    result[@"local_account_registered"] = @(
+        boolProperty(localAccount, @selector(isRegistered), &registeredAvailable)
+    );
+    result[@"local_account_registered_available"] = @(registeredAvailable);
     if (identityExpectationProvided) {
         NSSet<NSString *> *localAccountFingerprints = activeLocalAccountFingerprints();
         BOOL localAccountMatch = [localAccountFingerprints containsObject:expectedLocalAccountFingerprint];
@@ -1694,14 +1690,7 @@ static NSAttributedString* extensionReplacementText(void) {
     }];
 }
 
-static void sendViaIMChat(id msg, id chat) {
-    SEL sendSel = @selector(sendMessage:);
-    if ([chat respondsToSelector:sendSel]) {
-        [chat performSelector:sendSel withObject:msg];
-    }
-}
-
-static void sendViaCKConversation(id msg, id chat, NSString *replyToGuid) {
+static id ckConversationForChat(id chat) {
     id ckConversation = nil;
     @try { ckConversation = [chat valueForKey:@"conversation"]; } @catch (NSException *e) { }
     if (!ckConversation) {
@@ -1722,14 +1711,89 @@ static void sendViaCKConversation(id msg, id chat, NSString *replyToGuid) {
             }
         } @catch (NSException *e) { }
     }
+    return ckConversation;
+}
+
+static BOOL sendPreparedMessageViaCKConversation(id msg, id chat) {
+    id ckConversation = ckConversationForChat(chat);
     SEL ckSendSel = @selector(sendMessage:newComposition:);
-    if (ckConversation && [ckConversation respondsToSelector:ckSendSel]) {
-        typedef void (*CKSendType)(id, SEL, id, id);
-        ((CKSendType)objc_msgSend)(ckConversation, ckSendSel, msg, nil);
-        return;
+    if (!ckConversation || ![ckConversation respondsToSelector:ckSendSel]) {
+        return NO;
     }
-    // Fallback to IMChat
-    sendViaIMChat(msg, chat);
+    typedef void (*CKSendType)(id, SEL, id, BOOL);
+    ((CKSendType)objc_msgSend)(ckConversation, ckSendSel, msg, NO);
+    return YES;
+}
+
+static id sendComposedMessageViaCKConversation(
+    NSAttributedString *text,
+    id chat,
+    NSString *effect,
+    NSString *thread,
+    NSString *balloonBundleID,
+    NSData *payloadData
+) {
+    id ckConversation = ckConversationForChat(chat);
+    Class compositionClass = NSClassFromString(@"CKComposition");
+    SEL initSelector = @selector(initWithText:subject:shelfPluginPayload:shelfMediaObject:);
+    SEL messagesSelector = @selector(messagesFromCompositionFirstGUIDForMessage:sendingService:);
+    SEL serviceSelector = @selector(sendingService);
+    SEL sendSelector = @selector(sendMessage:onService:newComposition:);
+    if (!ckConversation || !compositionClass
+        || ![compositionClass instancesRespondToSelector:initSelector]
+        || ![ckConversation respondsToSelector:serviceSelector]
+        || ![ckConversation respondsToSelector:sendSelector]) {
+        return nil;
+    }
+
+    id service = ((id (*)(id, SEL))objc_msgSend)(ckConversation, serviceSelector);
+    if (!service) return nil;
+    typedef id (*CompositionInitType)(id, SEL, id, id, id, id);
+    id composition = ((CompositionInitType)objc_msgSend)(
+        [compositionClass alloc],
+        initSelector,
+        text,
+        nil,
+        nil,
+        nil
+    );
+    if (!composition || ![composition respondsToSelector:messagesSelector]) return nil;
+    typedef id (*MessagesFromCompositionType)(id, SEL, id, id);
+    id messages = ((MessagesFromCompositionType)objc_msgSend)(
+        composition,
+        messagesSelector,
+        nil,
+        service
+    );
+    if (![messages isKindOfClass:[NSArray class]] || [messages count] != 1) return nil;
+    id msg = [messages objectAtIndex:0];
+    if (!msg) return nil;
+
+    @try {
+        if (effect) {
+            SEL selector = @selector(setExpressiveSendStyleID:);
+            if (![msg respondsToSelector:selector]) return nil;
+            ((void (*)(id, SEL, id))objc_msgSend)(msg, selector, effect);
+        }
+        if (thread) {
+            SEL selector = @selector(setThreadIdentifier:);
+            if (![msg respondsToSelector:selector]) return nil;
+            ((void (*)(id, SEL, id))objc_msgSend)(msg, selector, thread);
+        }
+    if (!messageHasExtensionPayload(msg, balloonBundleID, payloadData)) return nil;
+    } @catch (NSException *exception) {
+        return nil;
+    }
+
+    typedef void (*CKSendOnServiceType)(id, SEL, id, id, BOOL);
+    ((CKSendOnServiceType)objc_msgSend)(
+        ckConversation,
+        sendSelector,
+        msg,
+        service,
+        YES
+    );
+    return msg;
 }
 
 static NSDictionary* handleSendRichMessage(NSInteger requestId, NSDictionary *params) {
@@ -1851,7 +1915,9 @@ static NSDictionary* handleSendRichMessage(NSInteger requestId, NSDictionary *pa
             NSString *sentGUID = messageGUID(msg);
 
             // Always use CKConversation for attachment sends (matches native UI behavior)
-            sendViaCKConversation(msg, chat, replyToGuid);
+            if (!sendPreparedMessageViaCKConversation(msg, chat)) {
+                return errorResponse(requestId, @"Messages conversation send is unavailable");
+            }
             if (sentGUID) {
                 NSMutableDictionary *result = [@{
                     @"handle": handle,
@@ -1869,18 +1935,16 @@ static NSDictionary* handleSendRichMessage(NSInteger requestId, NSDictionary *pa
         } else {
             // --- TEXT ONLY (with optional effect/reply) ---
             if (!messageText) return errorResponse(requestId, @"Could not construct message text");
-            id msg = createIMMessage(
-                IMMessageClass, messageText, nil, effectId, threadId, balloonBundleID, payloadData);
-            if (!msg) return errorResponse(requestId, @"Failed to create IMMessage");
-            if (hasExtensionPayload && !messageHasExtensionPayload(msg, balloonBundleID, payloadData)) {
-                return errorResponse(requestId, @"Failed to attach extension payload to IMMessage");
-            }
+            id msg = sendComposedMessageViaCKConversation(
+                messageText,
+                chat,
+                effectId,
+                threadId,
+                balloonBundleID,
+                payloadData
+            );
+            if (!msg) return errorResponse(requestId, @"Messages composition send is unavailable");
             NSString *sentGUID = messageGUID(msg);
-            if (replyToGuid || hasExtensionPayload) {
-                sendViaCKConversation(msg, chat, replyToGuid);
-            } else {
-                sendViaIMChat(msg, chat);
-            }
             if (sentGUID) {
                 NSMutableDictionary *result = [@{
                     @"handle": handle,

@@ -34,6 +34,7 @@ public final class MessagesLauncher: @unchecked Sendable {
   private let messagesAppPath = "/System/Applications/Messages.app/Contents/MacOS/Messages"
   private let queue = DispatchQueue(label: "imsg.messages.launcher")
   private let lock = NSLock()
+  private let commandLockTimeout: TimeInterval = 5
 
   /// Path to the dylib to inject
   public var dylibPath: String = ".build/release/imsg-plus-helper.dylib"
@@ -178,11 +179,16 @@ public final class MessagesLauncher: @unchecked Sendable {
 
   /// Send a command synchronously using file-based IPC
   private func sendCommandSync(action: String, params: [String: Any]) throws -> [String: Any] {
-    lock.lock()
+    guard lock.lock(before: Date().addingTimeInterval(commandLockTimeout)) else {
+      throw MessagesLauncherError.socketError("Timed out waiting for the local Messages command channel")
+    }
     defer { lock.unlock() }
 
     do {
-      return try CrossProcessFileLock.withExclusiveLock(at: commandLockFile) {
+      return try CrossProcessFileLock.withExclusiveLock(
+        at: commandLockFile,
+        timeout: commandLockTimeout
+      ) {
         try sendLockedCommandSync(action: action, params: params)
       }
     } catch is CrossProcessFileLockError {

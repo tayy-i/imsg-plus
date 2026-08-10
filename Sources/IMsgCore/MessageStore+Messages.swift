@@ -2,6 +2,43 @@ import Foundation
 import SQLite
 
 extension MessageStore {
+  public func recentOutgoingMessageGUID(
+    chatID: Int64?,
+    guid: String,
+    since: Date
+  ) throws -> String? {
+    guard !guid.isEmpty else {
+      return nil
+    }
+
+    var sql = """
+      SELECT m.guid
+      FROM message m
+      """
+    var bindings: [Binding?] = [guid, MessageStore.appleEpoch(since)]
+    if let chatID {
+      sql += " JOIN chat_message_join cmj ON m.ROWID = cmj.message_id"
+      bindings.append(chatID)
+    }
+    sql += " WHERE m.is_from_me = 1 AND m.guid = ? AND m.date >= ?"
+    if chatID != nil {
+      sql += " AND cmj.chat_id = ?"
+    }
+    sql += " ORDER BY m.ROWID DESC LIMIT 1"
+
+    return try withConnection { db in
+      do {
+        for row in try db.prepare(sql, bindings) {
+          let persistedGUID = stringValue(row[0])
+          return persistedGUID.isEmpty ? nil : persistedGUID
+        }
+      } catch {
+        return nil
+      }
+      return nil
+    }
+  }
+
   public func recentOutgoingExtensionMessageGUID(
     chatID: Int64?,
     balloonBundleID: String,
@@ -63,14 +100,14 @@ extension MessageStore {
     let reactionRevisionColumn =
       hasReactionColumns
       ? """
-        CASE WHEN m.is_from_me = 1 THEN (
-          SELECT IFNULL(MAX(r.ROWID), 0)
-          FROM message r
-          WHERE \(Self.reactionAssociationPredicate)
-            AND r.associated_message_type >= 2000
-            AND r.associated_message_type <= 3006
-        ) ELSE 0 END
-        """
+      CASE WHEN m.is_from_me = 1 THEN (
+        SELECT IFNULL(MAX(r.ROWID), 0)
+        FROM message r
+        WHERE \(Self.reactionAssociationPredicate)
+          AND r.associated_message_type >= 2000
+          AND r.associated_message_type <= 3006
+      ) ELSE 0 END
+      """
       : "0"
     let reactionFilter =
       hasReactionColumns
@@ -137,7 +174,8 @@ extension MessageStore {
         let associatedGuid = stringValue(row[10])
         let associatedType = intValue(row[11])
         let attachments = intValue(row[12]) ?? 0
-        let attachmentRevisionEvidence = attachments > 0
+        let attachmentRevisionEvidence =
+          attachments > 0
           ? try self.attachmentRevisionEvidence(for: rowID)
           : ""
         let body = dataValue(row[13])
@@ -204,14 +242,14 @@ extension MessageStore {
     let reactionRevisionColumn =
       hasReactionColumns
       ? """
-        CASE WHEN m.is_from_me = 1 THEN (
-          SELECT IFNULL(MAX(r.ROWID), 0)
-          FROM message r
-          WHERE \(Self.reactionAssociationPredicate)
-            AND r.associated_message_type >= 2000
-            AND r.associated_message_type <= 3006
-        ) ELSE 0 END
-        """
+      CASE WHEN m.is_from_me = 1 THEN (
+        SELECT IFNULL(MAX(r.ROWID), 0)
+        FROM message r
+        WHERE \(Self.reactionAssociationPredicate)
+          AND r.associated_message_type >= 2000
+          AND r.associated_message_type <= 3006
+      ) ELSE 0 END
+      """
       : "0"
     let reactionFilter =
       hasReactionColumns
@@ -261,7 +299,8 @@ extension MessageStore {
         let associatedGuid = stringValue(row[11])
         let associatedType = intValue(row[12])
         let attachments = intValue(row[13]) ?? 0
-        let attachmentRevisionEvidence = attachments > 0
+        let attachmentRevisionEvidence =
+          attachments > 0
           ? try self.attachmentRevisionEvidence(for: rowID)
           : ""
         let body = dataValue(row[14])
@@ -333,14 +372,14 @@ extension MessageStore {
     let reactionRevisionColumn =
       hasReactionColumns
       ? """
-        CASE WHEN m.is_from_me = 1 THEN (
-          SELECT IFNULL(MAX(r.ROWID), 0)
-          FROM message r
-          WHERE \(Self.reactionAssociationPredicate)
-            AND r.associated_message_type >= 2000
-            AND r.associated_message_type <= 3006
-        ) ELSE 0 END
-        """
+      CASE WHEN m.is_from_me = 1 THEN (
+        SELECT IFNULL(MAX(r.ROWID), 0)
+        FROM message r
+        WHERE \(Self.reactionAssociationPredicate)
+          AND r.associated_message_type >= 2000
+          AND r.associated_message_type <= 3006
+      ) ELSE 0 END
+      """
       : "0"
     let reactionFilter =
       hasReactionColumns
@@ -390,7 +429,8 @@ extension MessageStore {
         let associatedGuid = stringValue(row[11])
         let associatedType = intValue(row[12])
         let attachments = intValue(row[13]) ?? 0
-        let attachmentRevisionEvidence = attachments > 0
+        let attachmentRevisionEvidence =
+          attachments > 0
           ? try self.attachmentRevisionEvidence(for: rowID)
           : ""
         let body = dataValue(row[14])
@@ -459,18 +499,18 @@ extension MessageStore {
     let reactedPredicate =
       hasReactionColumns && reactionReplayAfter != nil
       ? """
-        (
-          m.is_from_me = 1
-          AND m.date >= ?
-          AND EXISTS (
-          SELECT 1
-          FROM message r
-          WHERE \(Self.reactionAssociationPredicate)
-            AND r.associated_message_type >= 2000
-            AND r.associated_message_type <= 3006
-          )
+      (
+        m.is_from_me = 1
+        AND m.date >= ?
+        AND EXISTS (
+        SELECT 1
+        FROM message r
+        WHERE \(Self.reactionAssociationPredicate)
+          AND r.associated_message_type >= 2000
+          AND r.associated_message_type <= 3006
         )
-        """
+      )
+      """
       : "0"
     var sql = """
       SELECT m.ROWID

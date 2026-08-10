@@ -1,3 +1,6 @@
+// The contract cases stay together so shared RPC fixtures remain reviewable.
+// swiftlint:disable file_length
+
 import Foundation
 import SQLite
 import Testing
@@ -141,6 +144,25 @@ private func int64Value(_ value: Any?) -> Int64? {
 }
 
 @Test
+func rpcCapabilitiesAdvertiseCompleteBoundedOperationBudgets() async throws {
+  let output = TestRPCOutput()
+  let server = RPCServer(store: try RPCTestDatabase.makeStore(), verbose: false, output: output)
+
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"capabilities","method":"rpc.capabilities"}"#
+  )
+
+  let result = output.responses.first?["result"] as? [String: Any]
+  let budgets = result?["operation_budgets_ms"] as? [String: Int]
+  #expect(result?["adapter_contract"] as? String == currentRoseMessagesAdapterContract)
+  #expect(budgets?["bridge.preflight"] == 40_000)
+  #expect(budgets?["send"] == 105_000)
+  #expect((budgets?["typing.set"] ?? 0) > 0)
+  #expect((budgets?["messages.markRead"] ?? 0) > 0)
+  #expect((budgets?["watch.subscribe"] ?? 0) > 0)
+}
+
+@Test
 func rpcChatsListReturnsChatPayload() async throws {
   let store = try RPCTestDatabase.makeStore()
   let output = TestRPCOutput()
@@ -192,6 +214,10 @@ func rpcSendResolvesChatID() async throws {
       captured = (handle, text)
       return ["guid": "msg-guid-1"]
     },
+    resolvePersistedSend: { chatID, transientGUID, _, _ in
+      #expect(chatID == 1)
+      return transientGUID
+    },
     bridgeAvailable: true
   )
 
@@ -217,6 +243,11 @@ func rpcSendPassesExtensionPayload() async throws {
     bridgeSendMessage: { handle, _, _, _, _, _, payload in
       captured = (handle, payload)
       return ["guid": "msg-guid-extension"]
+    },
+    resolvePersistedSend: { chatID, transientGUID, payload, _ in
+      #expect(chatID == 1)
+      #expect(payload?.payloadData == payloadData)
+      return transientGUID
     },
     bridgeAvailable: true
   )
@@ -259,6 +290,33 @@ func rpcSendReportsBridgeTimeout() async throws {
   let error = output.errors[0]["error"] as? [String: Any]
   #expect(int64Value(error?["code"]) == -32603)
   #expect((error?["data"] as? String)?.contains("Timeout waiting for response") == true)
+}
+
+@Test
+func rpcSendRejectsAnUnpersistedProviderMessage() async throws {
+  let store = try RPCTestDatabase.makeStore()
+  let output = TestRPCOutput()
+  let server = RPCServer(
+    store: store,
+    verbose: false,
+    autoTyping: false,
+    output: output,
+    bridgeSendMessage: { _, _, _, _, _, _, _ in
+      ["guid": "transient-guid"]
+    },
+    resolvePersistedSend: { _, _, _, _ in nil },
+    bridgeAvailable: true
+  )
+
+  await server.handleLineForTesting(
+    #"{"jsonrpc":"2.0","id":"unpersisted","method":"send","params":{"chat_id":1,"text":"yo"}}"#
+  )
+
+  #expect(output.responses.isEmpty)
+  #expect(output.errors.count == 1)
+  let error = output.errors[0]["error"] as? [String: Any]
+  #expect(int64Value(error?["code"]) == -32603)
+  #expect(error?["data"] as? String == "Messages did not persist the outgoing message")
 }
 
 @Test
@@ -419,6 +477,7 @@ func rpcAllowedChatPreflightsImmediatelyBeforeSend() async throws {
       boundaries.append("send:\(handle)")
       return ["guid": "locked-guid"]
     },
+    resolvePersistedSend: { _, transientGUID, _, _ in transientGUID },
     bridgeAvailable: true,
     allowedChat: "iMessage;+;chat123",
     bridgePreflightAllowedChat: { handle, _, _, _ in
@@ -901,13 +960,14 @@ func rpcWatchPinsBeforeDeliveringAReassociatedChat() async throws {
 }
 
 @Test
-func rpcWatchPinsBeforeDeliveringAfterEnrolledHelperIdentityChanges() async throws {
+func rpcWatchDoesNotSynchronouslyPreflightTheHelperForEveryDeliveredRow() async throws {
   let (store, db) = try RPCTestDatabase.makeMutableStore()
   let output = TestRPCOutput()
   let localAccount = String(repeating: "1", count: 64)
   let helper = String(repeating: "2", count: 64)
   let chat = String(repeating: "3", count: 64)
   let generation = LockedValue(String(repeating: "5", count: 64))
+  let preflightCalls = LockedValue(0)
   let server = RPCServer(
     store: store,
     verbose: false,
@@ -919,7 +979,8 @@ func rpcWatchPinsBeforeDeliveringAfterEnrolledHelperIdentityChanges() async thro
     expectedHelperSHA256: helper,
     expectedChatFingerprint: chat,
     bridgePreflightAllowedChat: { _, _, _, _ in
-      completeEnrolledChatPreflight(
+      preflightCalls.set(preflightCalls.get() + 1)
+      return completeEnrolledChatPreflight(
         localAccount: localAccount,
         helper: helper,
         chat: chat,
@@ -942,7 +1003,15 @@ func rpcWatchPinsBeforeDeliveringAfterEnrolledHelperIdentityChanges() async thro
   try db.run("INSERT INTO chat_message_join(chat_id, message_id) VALUES (1, 6)")
 
   for _ in 0..<50 {
-    if output.notifications.contains(where: { $0["method"] as? String == "error" }) { break }
+    if output.notifications.contains(where: { notification in
+      guard notification["method"] as? String == "message",
+        let params = notification["params"] as? [String: Any],
+        let message = params["message"] as? [String: Any]
+      else { return false }
+      return int64Value(message["id"]) == 6
+    }) {
+      break
+    }
     try await Task.sleep(nanoseconds: 50_000_000)
   }
   let deliveredRowSix = output.notifications.contains { notification in
@@ -952,16 +1021,8 @@ func rpcWatchPinsBeforeDeliveringAfterEnrolledHelperIdentityChanges() async thro
     else { return false }
     return int64Value(message["id"]) == 6
   }
-  let errorText = output.notifications.compactMap { notification -> String? in
-    guard notification["method"] as? String == "error",
-      let params = notification["params"] as? [String: Any],
-      let error = params["error"] as? [String: Any]
-    else { return nil }
-    return error["message"] as? String
-  }.first
-
-  #expect(deliveredRowSix == false)
-  #expect(errorText?.contains("subscription identity changed") == true)
+  #expect(deliveredRowSix == true)
+  #expect(preflightCalls.get() == 1)
 }
 
 @Test
