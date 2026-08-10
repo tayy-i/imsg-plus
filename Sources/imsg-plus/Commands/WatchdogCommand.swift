@@ -6,14 +6,13 @@ enum WatchdogCommand {
   static let launchAgentLabel = "com.imsg-plus.watchdog"
   static let launchAgentPath = NSHomeDirectory() + "/Library/LaunchAgents/\(launchAgentLabel).plist"
   static let logPath = NSHomeDirectory() + "/Library/Logs/imsg-plus-watchdog.log"
+  static let maximumLogBytes: UInt64 = 10 * 1024 * 1024
+  static let incidentScanBytes: UInt64 = 256 * 1024
 
   // Error patterns that indicate Messages.app sync issues
   static let errorPatterns = [
-    "Sandbox restriction",
-    "XPC.*connection.*invalid",
     "Unable to send to server",
     "PSC out of sync",
-    "IMDMessageServicesAgent.*invalid",
   ]
 
   static let spec = CommandSpec(
@@ -30,7 +29,7 @@ enum WatchdogCommand {
         - Show current status
 
       The watchdog runs as a background LaunchAgent that survives reboots.
-      When it detects imagent XPC/sandbox errors, it automatically runs
+      When it detects a specific imagent send or sync failure, it automatically runs
       `imsg-plus launch` to restart Messages.app with proper dylib injection.
       """,
     signature: CommandSignatures.withRuntimeFlags(
@@ -174,6 +173,7 @@ enum WatchdogCommand {
       if !runtime.jsonOutput {
         print("🚀 Starting watchdog...")
       }
+      try truncateOversizedLogBeforeStart()
       try startLaunchAgent()
 
       // Wait a moment for it to start
@@ -264,53 +264,33 @@ enum WatchdogCommand {
 
     let handle = pipe.fileHandleForReading
 
-    // Read line by line
-    while process.isRunning {
-      if let data = try? handle.availableData, !data.isEmpty,
-        let line = String(data: data, encoding: .utf8)
+    for try await line in handle.bytes.lines {
+      guard let pattern = matchingErrorPattern(in: line) else { continue }
+      log("ERROR DETECTED: \(pattern)")
+
+      if let lastRestart = lastRestartTime,
+        Date().timeIntervalSince(lastRestart) < cooldownSeconds
       {
-
-        // Check for error patterns
-        for pattern in errorPatterns {
-          if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
-            regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil
-          {
-
-            log("ERROR DETECTED: \(line.trimmingCharacters(in: .whitespacesAndNewlines))")
-
-            // Check cooldown
-            if let lastRestart = lastRestartTime,
-              Date().timeIntervalSince(lastRestart) < cooldownSeconds
-            {
-              let elapsed = Int(Date().timeIntervalSince(lastRestart))
-              log("SKIP: Cooldown active (\(elapsed)s since last restart)")
-              continue
-            }
-
-            // Restart Messages.app
-            log("RESTARTING: Running imsg-plus launch...")
-
-            let launchProcess = Process()
-            launchProcess.executableURL = URL(fileURLWithPath: "/usr/local/bin/imsg-plus")
-            launchProcess.arguments = ["launch", "--quiet"]
-            try? launchProcess.run()
-            launchProcess.waitUntilExit()
-
-            lastRestartTime = Date()
-
-            if launchProcess.terminationStatus == 0 {
-              log("RESTARTED: Messages.app restarted successfully")
-            } else {
-              log("WARNING: imsg-plus launch exited with status \(launchProcess.terminationStatus)")
-            }
-
-            break
-          }
-        }
+        let elapsed = Int(Date().timeIntervalSince(lastRestart))
+        log("SKIP: Cooldown active (\(elapsed)s since last restart)")
+        continue
       }
 
-      // Small sleep to prevent CPU spin
-      try await Task.sleep(nanoseconds: 100_000_000)
+      log("RESTARTING: Running imsg-plus launch...")
+
+      let launchProcess = Process()
+      launchProcess.executableURL = URL(fileURLWithPath: "/usr/local/bin/imsg-plus")
+      launchProcess.arguments = ["launch", "--quiet"]
+      try? launchProcess.run()
+      launchProcess.waitUntilExit()
+
+      lastRestartTime = Date()
+
+      if launchProcess.terminationStatus == 0 {
+        log("RESTARTED: Messages.app restarted successfully")
+      } else {
+        log("WARNING: imsg-plus launch exited with status \(launchProcess.terminationStatus)")
+      }
     }
 
     log("Watchdog exiting (log stream ended)")
@@ -370,12 +350,42 @@ enum WatchdogCommand {
     return nil
   }
 
-  static func getLastIncident() -> String? {
-    guard FileManager.default.fileExists(atPath: logPath),
-      let content = try? String(contentsOfFile: logPath, encoding: .utf8)
-    else {
+  static func matchingErrorPattern(in line: String) -> String? {
+    for pattern in errorPatterns {
+      guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive)
+      else { continue }
+      if regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil {
+        return pattern
+      }
+    }
+    return nil
+  }
+
+  static func getLastIncident(path: String = logPath) -> String? {
+    guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+    defer { try? handle.close() }
+
+    let data: Data
+    let startedMidFile: Bool
+    do {
+      let end = try handle.seekToEnd()
+      let start = end > incidentScanBytes ? end - incidentScanBytes : 0
+      startedMidFile = start > 0
+      try handle.seek(toOffset: start)
+      data = try handle.readToEnd() ?? Data()
+    } catch {
       return nil
     }
+
+    let boundedData: Data
+    if startedMidFile,
+      let firstNewline = data.firstIndex(of: 0x0A)
+    {
+      boundedData = data[data.index(after: firstNewline)...]
+    } else {
+      boundedData = data
+    }
+    guard let content = String(data: boundedData, encoding: .utf8) else { return nil }
 
     let lines = content.components(separatedBy: "\n")
     for line in lines.reversed() {
@@ -384,6 +394,19 @@ enum WatchdogCommand {
       }
     }
     return nil
+  }
+
+  static func truncateOversizedLogBeforeStart(path: String = logPath) throws {
+    guard
+      let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+      let size = attributes[.size] as? NSNumber,
+      size.uint64Value > maximumLogBytes
+    else {
+      return
+    }
+    guard let handle = FileHandle(forWritingAtPath: path) else { return }
+    defer { try? handle.close() }
+    try handle.truncate(atOffset: 0)
   }
 
   static func installLaunchAgent() throws {
@@ -447,22 +470,9 @@ enum WatchdogCommand {
     process.waitUntilExit()
   }
 
-  static func log(_ message: String) {
+  static func log(_ message: String, to output: FileHandle = .standardOutput) {
     let timestamp = ISO8601DateFormatter().string(from: Date())
     let line = "[\(timestamp)] \(message)"
-    print(line)
-
-    // Also append to log file
-    if let data = (line + "\n").data(using: .utf8) {
-      if FileManager.default.fileExists(atPath: logPath) {
-        if let handle = FileHandle(forWritingAtPath: logPath) {
-          handle.seekToEndOfFile()
-          handle.write(data)
-          handle.closeFile()
-        }
-      } else {
-        FileManager.default.createFile(atPath: logPath, contents: data)
-      }
-    }
+    output.write(Data((line + "\n").utf8))
   }
 }

@@ -184,13 +184,9 @@ extension MessageStore {
         let dateEditedRaw = int64Value(row[16])
         let accountGUID = stringValue(row[17])
         let reactionRevisionEvidence = String(int64Value(row[18]) ?? 0)
-        var resolvedText = text
-        var markdownText: String?
-        if text.isEmpty {
-          let parsed = AttributedBodyParser.parse(body)
-          resolvedText = parsed.plainText
-          markdownText = parsed.markdown != parsed.plainText ? parsed.markdown : nil
-        }
+        let resolvedBody = resolvedMessageBody(text: text, attributedBody: body)
+        var resolvedText = resolvedBody.text
+        var markdownText = resolvedBody.markdown
         if isAudioMessage, let transcription = try audioTranscription(for: rowID) {
           resolvedText = transcription
           markdownText = nil
@@ -309,13 +305,9 @@ extension MessageStore {
         let dateEditedRaw = int64Value(row[17])
         let accountGUID = stringValue(row[18])
         let reactionRevisionEvidence = String(int64Value(row[19]) ?? 0)
-        var resolvedText = text
-        var markdownText: String?
-        if text.isEmpty {
-          let parsed = AttributedBodyParser.parse(body)
-          resolvedText = parsed.plainText
-          markdownText = parsed.markdown != parsed.plainText ? parsed.markdown : nil
-        }
+        let resolvedBody = resolvedMessageBody(text: text, attributedBody: body)
+        var resolvedText = resolvedBody.text
+        var markdownText = resolvedBody.markdown
         if isAudioMessage, let transcription = try audioTranscription(for: rowID) {
           resolvedText = transcription
           markdownText = nil
@@ -439,13 +431,9 @@ extension MessageStore {
         let dateEditedRaw = int64Value(row[17])
         let accountGUID = stringValue(row[18])
         let reactionRevisionEvidence = String(int64Value(row[19]) ?? 0)
-        var resolvedText = text
-        var markdownText: String?
-        if text.isEmpty {
-          let parsed = AttributedBodyParser.parse(body)
-          resolvedText = parsed.plainText
-          markdownText = parsed.markdown != parsed.plainText ? parsed.markdown : nil
-        }
+        let resolvedBody = resolvedMessageBody(text: text, attributedBody: body)
+        var resolvedText = resolvedBody.text
+        var markdownText = resolvedBody.markdown
         if isAudioMessage, let transcription = try audioTranscription(for: rowID) {
           resolvedText = transcription
           markdownText = nil
@@ -582,4 +570,21 @@ extension MessageStore {
       limit: limit
     ).filter { $0.rowID <= rowID }
   }
+}
+
+private func resolvedMessageBody(
+  text: String,
+  attributedBody: Data
+) -> (text: String, markdown: String?) {
+  guard text.isEmpty || text == "\u{FFFD}" else {
+    return (text, nil)
+  }
+  let parsed = AttributedBodyParser.parse(attributedBody)
+  guard !parsed.plainText.isEmpty, parsed.plainText != "\u{FFFD}" else {
+    return (text, nil)
+  }
+  return (
+    parsed.plainText,
+    parsed.markdown != parsed.plainText ? parsed.markdown : nil
+  )
 }
