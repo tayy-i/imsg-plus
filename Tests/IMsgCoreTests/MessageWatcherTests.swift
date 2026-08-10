@@ -25,6 +25,7 @@ private enum WatcherTestDatabase {
         guid TEXT,
         associated_message_guid TEXT,
         associated_message_type INTEGER,
+        balloon_bundle_id TEXT,
         date INTEGER,
         is_from_me INTEGER,
         service TEXT,
@@ -65,6 +66,21 @@ private enum WatcherTestDatabase {
       connection: db, path: ":memory:", hasAttributedBody: false, hasReactionColumns: true)
     return (store, db)
   }
+}
+
+@Test
+func messageWatcherPreservesBalloonBundleIDOnANewProviderRow() async throws {
+  let (store, db) = try WatcherTestDatabase.makeMutableStore()
+  try db.run(
+    "UPDATE message SET balloon_bundle_id = 'com.example.roseview' WHERE ROWID = 1"
+  )
+  let stream = MessageWatcher(store: store).stream(sinceRowID: -1)
+  var iterator = stream.makeAsyncIterator()
+
+  let message = try await iterator.next()
+
+  #expect(message?.balloonBundleID == "com.example.roseview")
+  #expect(message?.isNewProviderRow == true)
 }
 
 @Test

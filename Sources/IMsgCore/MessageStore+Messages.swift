@@ -10,7 +10,6 @@ extension MessageStore {
     guard !guid.isEmpty else {
       return nil
     }
-
     var sql = """
       SELECT m.guid
       FROM message m
@@ -25,7 +24,6 @@ extension MessageStore {
       sql += " AND cmj.chat_id = ?"
     }
     sql += " ORDER BY m.ROWID DESC LIMIT 1"
-
     return try withConnection { db in
       do {
         for row in try db.prepare(sql, bindings) {

@@ -310,6 +310,7 @@ private extension Message {
       threadOriginatorGUID: threadOriginatorGUID,
       threadOriginatorPart: threadOriginatorPart,
       accountGUID: accountGUID,
+      balloonBundleID: balloonBundleID,
       attachmentRevisionEvidence: attachmentRevisionEvidence,
       reactionRevisionEvidence: reactionRevisionEvidence,
       isNewProviderRow: true
@@ -335,6 +336,7 @@ private extension Message {
       threadOriginatorGUID: threadOriginatorGUID,
       threadOriginatorPart: threadOriginatorPart,
       accountGUID: accountGUID,
+      balloonBundleID: balloonBundleID,
       attachmentRevisionEvidence: attachmentRevisionEvidence,
       reactionRevisionEvidence: reactionRevisionEvidence,
       isNewProviderRow: false
