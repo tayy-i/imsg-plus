@@ -6,17 +6,10 @@ on:
   pull_request:
 
 jobs:
-  build:
-    runs-on: macos-latest
+  portable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Swift version
-        run: swift --version
-      - name: Install SwiftLint
-        run: brew install swiftlint
-      - name: Lint
-        run: make lint
-      - name: Test
-        run: make test
-      - name: Build
-        run: make build ARCHES=$(uname -m)
+      - name: Check portable source
+        run: ./scripts/check-portable

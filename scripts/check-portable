@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+while IFS= read -r -d '' script; do
+  bash -n "$script"
+done < <(find scripts -maxdepth 1 -type f -name '*.sh' -print0)
+
+scripts/generate-version.sh
+if ! git diff --exit-code -- \
+  Sources/imsg-plus/Version.swift \
+  Sources/imsg-plus/Resources/Info.plist; then
+  echo "generated version files are stale" >&2
+  exit 1
+fi
+
+echo "imsg-plus portable source checks passed; Swift, Messages, and signing remain in Apple validation"

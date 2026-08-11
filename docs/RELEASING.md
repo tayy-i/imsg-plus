@@ -10,10 +10,10 @@
    - Credit contributors (e.g. `thanks @user`).
    - Update `version.env` to `X.Y.Z`.
    - Run `scripts/generate-version.sh` (also refreshes `Sources/imsg/Resources/Info.plist`).
-2. Ensure CI is green on `main`
-   - `make lint`
-   - `make test`
-   - `make format` (optional, if formatting changes are expected)
+2. Ensure Ubuntu source CI and exact-commit Apple validation are green on `main`
+   - From the clean `rose-dev` workspace containing this exact component commit,
+     run `./scripts/check-apple` and `./scripts/verify-apple-validation.mjs`.
+   - `make format` remains optional when formatting changes are expected.
 3. Build, sign, and notarize
    - Requires `APP_STORE_CONNECT_API_KEY_P8`, `APP_STORE_CONNECT_KEY_ID`, `APP_STORE_CONNECT_ISSUER_ID`.
    - `scripts/sign-and-notarize.sh` (outputs `/tmp/imsg-macos.zip` by default)
@@ -29,5 +29,6 @@
    - `gh release edit vX.Y.Z --notes-file /tmp/release-notes.txt` (if needed)
 
 ## What happens in CI
+- GitHub Actions runs only the portable source check on Ubuntu.
+- Swift tests, the macOS build, signing, and notarization run on the release Mac.
 - Release signing + notarization are done locally via `scripts/sign-and-notarize.sh`.
-- `.github/workflows/release.yml` is only for manual rebuilds, not the primary release path.
