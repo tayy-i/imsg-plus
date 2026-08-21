@@ -69,6 +69,14 @@ public enum MarkdownComposer {
   }
 
   #if canImport(AppKit)
+    private enum TokenKind: Int {
+      case bold
+      case italic
+      case strikethrough
+      case underline
+      case link
+    }
+
     private static func parseMarkdown(_ markdown: String) -> NSAttributedString {
       let result = NSMutableAttributedString()
 
@@ -76,71 +84,55 @@ public enum MarkdownComposer {
       var remaining = markdown
 
       while !remaining.isEmpty {
-        // Bold: **text**
-        if let match = remaining.range(of: "\\*\\*(.+?)\\*\\*", options: .regularExpression) {
-          let before = String(remaining[remaining.startIndex..<match.lowerBound])
-          if !before.isEmpty {
-            result.append(NSAttributedString(string: before))
+        var candidates: [(kind: TokenKind, range: Range<String.Index>)] = []
+        let patterns: [(TokenKind, String)] = [
+          (.bold, "\\*\\*(.+?)\\*\\*"),
+          (.italic, "(?<!\\*)\\*(?!\\*)(.+?)(?<!\\*)\\*(?!\\*)"),
+          (.strikethrough, "~~(.+?)~~"),
+          (.underline, "__(.+?)__"),
+          (.link, "\\[([^\\]]+)\\]\\(([^)]+)\\)"),
+        ]
+        for (kind, pattern) in patterns {
+          if let range = remaining.range(of: pattern, options: .regularExpression) {
+            candidates.append((kind, range))
           }
-          let inner = String(remaining[match]).dropFirst(2).dropLast(2)
+        }
+        guard
+          let next = candidates.min(by: { lhs, rhs in
+            if lhs.range.lowerBound == rhs.range.lowerBound {
+              return lhs.kind.rawValue < rhs.kind.rawValue
+            }
+            return lhs.range.lowerBound < rhs.range.lowerBound
+          })
+        else {
+          result.append(NSAttributedString(string: remaining))
+          break
+        }
+
+        let before = String(remaining[remaining.startIndex..<next.range.lowerBound])
+        if !before.isEmpty {
+          result.append(NSAttributedString(string: before))
+        }
+        let matched = String(remaining[next.range])
+        switch next.kind {
+        case .bold:
+          let inner = matched.dropFirst(2).dropLast(2)
           result.append(
             NSAttributedString(string: String(inner), attributes: [kIMBold: 1]))
-          remaining = String(remaining[match.upperBound...])
-          continue
-        }
-
-        // Italic: *text*
-        if let match = remaining.range(
-          of: "(?<!\\*)\\*(?!\\*)(.+?)(?<!\\*)\\*(?!\\*)", options: .regularExpression)
-        {
-          let before = String(remaining[remaining.startIndex..<match.lowerBound])
-          if !before.isEmpty {
-            result.append(NSAttributedString(string: before))
-          }
-          let inner = String(remaining[match]).dropFirst(1).dropLast(1)
+        case .italic:
+          let inner = matched.dropFirst().dropLast()
           result.append(
             NSAttributedString(string: String(inner), attributes: [kIMItalic: 1]))
-          remaining = String(remaining[match.upperBound...])
-          continue
-        }
-
-        // Strikethrough: ~~text~~
-        if let match = remaining.range(of: "~~(.+?)~~", options: .regularExpression) {
-          let before = String(remaining[remaining.startIndex..<match.lowerBound])
-          if !before.isEmpty {
-            result.append(NSAttributedString(string: before))
-          }
-          let inner = String(remaining[match]).dropFirst(2).dropLast(2)
+        case .strikethrough:
+          let inner = matched.dropFirst(2).dropLast(2)
           result.append(
             NSAttributedString(
               string: String(inner), attributes: [kIMStrikethrough: 1]))
-          remaining = String(remaining[match.upperBound...])
-          continue
-        }
-
-        // Underline: __text__
-        if let match = remaining.range(of: "__(.+?)__", options: .regularExpression) {
-          let before = String(remaining[remaining.startIndex..<match.lowerBound])
-          if !before.isEmpty {
-            result.append(NSAttributedString(string: before))
-          }
-          let inner = String(remaining[match]).dropFirst(2).dropLast(2)
+        case .underline:
+          let inner = matched.dropFirst(2).dropLast(2)
           result.append(
-            NSAttributedString(
-              string: String(inner), attributes: [kIMUnderline: 1]))
-          remaining = String(remaining[match.upperBound...])
-          continue
-        }
-
-        // Link: [text](url)
-        if let match = remaining.range(
-          of: "\\[([^\\]]+)\\]\\(([^)]+)\\)", options: .regularExpression)
-        {
-          let before = String(remaining[remaining.startIndex..<match.lowerBound])
-          if !before.isEmpty {
-            result.append(NSAttributedString(string: before))
-          }
-          let matched = String(remaining[match])
+            NSAttributedString(string: String(inner), attributes: [kIMUnderline: 1]))
+        case .link:
           if let textRange = matched.range(
             of: "(?<=\\[)[^\\]]+(?=\\])", options: .regularExpression),
             let urlRange = matched.range(
@@ -154,14 +146,8 @@ public enum MarkdownComposer {
             }
             result.append(NSAttributedString(string: linkText, attributes: attrs))
           }
-          remaining = String(remaining[match.upperBound...])
-          continue
         }
-
-        // No match found at current position - consume one character
-        let nextChar = String(remaining.prefix(1))
-        result.append(NSAttributedString(string: nextChar))
-        remaining = String(remaining.dropFirst())
+        remaining = String(remaining[next.range.upperBound...])
       }
 
       return result
