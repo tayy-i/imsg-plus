@@ -117,21 +117,16 @@ public enum MarkdownComposer {
         switch next.kind {
         case .bold:
           let inner = matched.dropFirst(2).dropLast(2)
-          result.append(
-            NSAttributedString(string: String(inner), attributes: [kIMBold: 1]))
+          result.append(parseStyledText(String(inner), attribute: kIMBold))
         case .italic:
           let inner = matched.dropFirst().dropLast()
-          result.append(
-            NSAttributedString(string: String(inner), attributes: [kIMItalic: 1]))
+          result.append(parseStyledText(String(inner), attribute: kIMItalic))
         case .strikethrough:
           let inner = matched.dropFirst(2).dropLast(2)
-          result.append(
-            NSAttributedString(
-              string: String(inner), attributes: [kIMStrikethrough: 1]))
+          result.append(parseStyledText(String(inner), attribute: kIMStrikethrough))
         case .underline:
           let inner = matched.dropFirst(2).dropLast(2)
-          result.append(
-            NSAttributedString(string: String(inner), attributes: [kIMUnderline: 1]))
+          result.append(parseStyledText(String(inner), attribute: kIMUnderline))
         case .link:
           if let textRange = matched.range(
             of: "(?<=\\[)[^\\]]+(?=\\])", options: .regularExpression),
@@ -140,16 +135,25 @@ public enum MarkdownComposer {
           {
             let linkText = String(matched[textRange])
             let urlString = String(matched[urlRange])
-            var attrs: [NSAttributedString.Key: Any] = [:]
+            let label = NSMutableAttributedString(attributedString: parseMarkdown(linkText))
             if let url = URL(string: urlString) {
-              attrs[kIMLink] = url
+              label.addAttribute(
+                kIMLink, value: url, range: NSRange(location: 0, length: label.length))
             }
-            result.append(NSAttributedString(string: linkText, attributes: attrs))
+            result.append(label)
           }
         }
         remaining = String(remaining[next.range.upperBound...])
       }
 
+      return result
+    }
+
+    private static func parseStyledText(
+      _ text: String, attribute: NSAttributedString.Key
+    ) -> NSAttributedString {
+      let result = NSMutableAttributedString(attributedString: parseMarkdown(text))
+      result.addAttribute(attribute, value: 1, range: NSRange(location: 0, length: result.length))
       return result
     }
 
